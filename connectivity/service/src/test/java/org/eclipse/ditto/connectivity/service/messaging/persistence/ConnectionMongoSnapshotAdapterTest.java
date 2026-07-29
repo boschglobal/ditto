@@ -24,7 +24,9 @@ import org.eclipse.ditto.connectivity.model.ConnectionLifecycle;
 import org.eclipse.ditto.connectivity.model.ConnectivityModelFactory;
 import org.eclipse.ditto.connectivity.service.config.DefaultFieldsEncryptionConfig;
 import org.eclipse.ditto.connectivity.service.messaging.TestConstants;
+import org.eclipse.ditto.internal.utils.persistence.api.serializer.NeutralSnapshotAdapter;
 import org.eclipse.ditto.internal.utils.persistence.mongo.DittoBsonJson;
+import org.eclipse.ditto.internal.utils.persistence.mongo.MongoSnapshotCodec;
 import org.eclipse.ditto.json.JsonObject;
 import org.junit.Test;
 
@@ -33,24 +35,27 @@ public class ConnectionMongoSnapshotAdapterTest {
     @Test
     public void makeEmptySnapshotsForDeletedConnections() {
         final Config config = ConfigFactory.load("connection-fields-encryption-test");
-        final var underTest = new ConnectionMongoSnapshotAdapter(DefaultFieldsEncryptionConfig.of(config.getConfig("connection")));
+        final var serializer = new ConnectionMongoSnapshotAdapter(DefaultFieldsEncryptionConfig.of(config.getConfig("connection")));
+        // The Mongo BSON envelope is now the injected snapshot codec; the serializer holds only the domain logic.
+        final var underTest = new NeutralSnapshotAdapter<>(serializer, MongoSnapshotCodec.INSTANCE);
         final var deletedSnapshot = (BsonDocument) underTest.toSnapshotStore(
                 TestConstants.createConnection().toBuilder().lifecycle(ConnectionLifecycle.DELETED).build());
         final JsonObject snapshotJson = DittoBsonJson.getInstance().serialize(deletedSnapshot);
-        assertThat(snapshotJson).containsOnly(underTest.getDeletedLifecycleJsonField());
+        assertThat(snapshotJson).containsOnly(serializer.getDeletedLifecycleJsonField());
     }
 
     @Test
     public void encryptDecryptSnapshot() {
         final Config config = ConfigFactory.load("connection-fields-encryption-test");
-        final ConnectionMongoSnapshotAdapter underTest = new ConnectionMongoSnapshotAdapter(DefaultFieldsEncryptionConfig.of(config.getConfig("connection")));
+        final ConnectionMongoSnapshotAdapter serializer = new ConnectionMongoSnapshotAdapter(DefaultFieldsEncryptionConfig.of(config.getConfig("connection")));
+        final var underTest = new NeutralSnapshotAdapter<>(serializer, MongoSnapshotCodec.INSTANCE);
         final Connection connection = TestConstants.createConnection();
         final URI uri = URI.create(connection.getUri());
         final String userInfo = uri.getUserInfo();
 
         final BsonDocument snapshotConnection = (BsonDocument) underTest.toSnapshotStore(connection);
         final Connection encryptedConnection = ConnectivityModelFactory.connectionFromJson(JsonObject.of(snapshotConnection.toJson()));
-        final Connection decryptedConnection = underTest.createJsonifiableFrom(JsonObject.of(snapshotConnection.toJson()));
+        final Connection decryptedConnection = serializer.createJsonifiableFrom(JsonObject.of(snapshotConnection.toJson()));
         final String userInfoAfterDecrypt = URI.create(decryptedConnection.getUri()).getUserInfo();
 
         assertThat(encryptedConnection.getUri()).contains("encrypted_");

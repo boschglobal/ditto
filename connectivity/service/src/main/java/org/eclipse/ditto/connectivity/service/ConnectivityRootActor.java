@@ -50,8 +50,10 @@ import org.eclipse.ditto.internal.utils.health.config.PersistenceConfig;
 import org.eclipse.ditto.internal.utils.namespaces.BlockedNamespaces;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoLoggerFactory;
 import org.eclipse.ditto.internal.utils.persistence.mongo.MongoClientWrapper;
-import org.eclipse.ditto.internal.utils.persistence.mongo.MongoHealthChecker;
-import org.eclipse.ditto.internal.utils.persistence.mongo.streaming.MongoReadJournal;
+import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
+import org.eclipse.ditto.internal.utils.persistence.api.PersistenceBackendProvider;
+import org.eclipse.ditto.internal.utils.persistence.api.PersistenceBackendSelfCheck;
+import org.eclipse.ditto.internal.utils.persistence.api.PersistencePluginConfig;
 import org.eclipse.ditto.internal.utils.persistentactors.PersistencePingActor;
 import org.eclipse.ditto.internal.utils.persistentactors.cleanup.PersistenceCleanupActor;
 import org.eclipse.ditto.internal.utils.pubsubthings.DittoProtocolSub;
@@ -87,10 +89,23 @@ public final class ConnectivityRootActor extends DittoRootActor {
         final var dittoExtensionsConfig = ScopedConfig.dittoExtension(actorSystem.settings().config());
         final var enforcerActorPropsFactory =
                 ConnectionEnforcerActorPropsFactory.get(actorSystem, dittoExtensionsConfig);
+
+        final PersistenceBackendProvider backendProvider =
+                PersistenceBackendProvider.get(actorSystem, ScopedConfig.dittoExtension(actorSystem.settings().config()));
+        // Bootstrap the persistence backend's schema BEFORE the read journal / persistent-actor shard region start.
+        // Mongo is a no-op (default); Postgres creates+verifies its tables and throws on failure, failing boot fast so
+        // the service never serves traffic against a database whose tables are absent and were never bootstrapped.
+        backendProvider.bootstrapSchema();
+        final DittoReadJournal readJournal = backendProvider.getReadJournal();
+        // Boot-time active-backend self-check (switchability proof, layer 2): fail fast if the deployment HOCON wires
+        // a different backend's journal/snapshot plugin classes or read journal than the selected provider's family.
+        PersistenceBackendSelfCheck.verify(actorSystem.settings().config(), backendProvider,
+                ConnectivityService.SERVICE_NAME, readJournal.getClass().getName());
+
         // Create persistence streaming actor (with no cache) and make it known to pubSubMediator.
         final ActorRef persistenceStreamingActor =
                 startChildActor(ConnectionPersistenceStreamingActorCreator.ACTOR_NAME,
-                        ConnectionPersistenceStreamingActorCreator.props());
+                        ConnectionPersistenceStreamingActorCreator.props(readJournal));
         pubSubMediator.tell(DistPubSubAccess.put(persistenceStreamingActor), getSelf());
 
 
@@ -101,38 +116,37 @@ public final class ConnectivityRootActor extends DittoRootActor {
         log.info("Started blocked namespaces replicator <{}>", BlockedNamespaces.of(actorSystem).getReplicator());
         DittoProtocolSub.get(actorSystem);
 
-        final MongoReadJournal mongoReadJournal = MongoReadJournal.newInstance(actorSystem);
-
         final var connectionSupervisorProps =
                 ConnectionSupervisorActor.props(commandForwarder, pubSubMediator, connectivityConfig,
-                        enforcerActorPropsFactory, mongoReadJournal);
+                        enforcerActorPropsFactory, readJournal);
         startClusterSingletonActor(
                 PersistencePingActor.props(
-                        startConnectionShardRegion(actorSystem, connectionSupervisorProps, clusterConfig),
-                        connectivityConfig.getPingConfig(), mongoReadJournal),
+                        startConnectionShardRegion(actorSystem, connectionSupervisorProps, clusterConfig,
+                                backendProvider),
+                        connectivityConfig.getPingConfig(), readJournal),
                 PersistencePingActor.ACTOR_NAME);
         final ConnectionIdsRetrievalConfig connectionIdsRetrievalConfig =
                 connectivityConfig.getConnectionIdsRetrievalConfig();
-        startChildActor(ConnectionIdsRetrievalActor.ACTOR_NAME, ConnectionIdsRetrievalActor.props(mongoReadJournal,
+        startChildActor(ConnectionIdsRetrievalActor.ACTOR_NAME, ConnectionIdsRetrievalActor.props(readJournal,
                 connectionIdsRetrievalConfig));
 
-        final MongoClientWrapper mongoClientWrapper =
-                MongoClientWrapper.newInstance(connectivityConfig.getMongoDbConfig());
-
         startChildActor(ConnectionPersistenceOperationsActor.ACTOR_NAME,
-                ConnectionPersistenceOperationsActor.props(pubSubMediator, mongoClientWrapper,
-                        config, connectivityConfig.getPersistenceOperationsConfig()));
+                ConnectionPersistenceOperationsActor.props(pubSubMediator, backendProvider,
+                        connectivityConfig.getPersistenceOperationsConfig()));
 
-        optionallyStartEncryptionMigrationSingleton(actorSystem, connectivityConfig, mongoClientWrapper);
+        // The encryption-migration singleton intentionally retains its own Mongo client (out of scope for the
+        // pluggable-persistence refactor); the client is built lazily — ONLY when encryption-migration actually
+        // starts — so no Mongo connection pool is opened on the default (encryption-disabled) deployment.
+        optionallyStartEncryptionMigrationSingleton(actorSystem, connectivityConfig);
 
         RootChildActorStarter.get(actorSystem, ScopedConfig.dittoExtension(config)).execute(getContext());
 
 
         final var cleanupConfig = connectivityConfig.getConnectionConfig().getCleanupConfig();
-        final var cleanupActorProps = PersistenceCleanupActor.props(cleanupConfig, mongoReadJournal, CLUSTER_ROLE);
+        final var cleanupActorProps = PersistenceCleanupActor.props(cleanupConfig, readJournal, CLUSTER_ROLE);
         startChildActor(PersistenceCleanupActor.ACTOR_NAME, cleanupActorProps);
 
-        final ActorRef healthCheckingActor = getHealthCheckingActor(connectivityConfig);
+        final ActorRef healthCheckingActor = getHealthCheckingActor(connectivityConfig, backendProvider);
         bindHttpStatusRoute(connectivityConfig.getHttpConfig(), healthCheckingActor);
     }
 
@@ -160,9 +174,13 @@ public final class ConnectivityRootActor extends DittoRootActor {
     }
 
     private void optionallyStartEncryptionMigrationSingleton(final ActorSystem actorSystem,
-            final ConnectivityConfig connectivityConfig, final MongoClientWrapper mongoClient) {
+            final ConnectivityConfig connectivityConfig) {
         final var encryptionConfig = connectivityConfig.getConnectionConfig().getFieldsEncryptionConfig();
         if (encryptionConfig.isEncryptionEnabled() || encryptionConfig.getOldSymmetricalKey().isPresent()) {
+            // Build the Mongo client only here, inside the if-branch, so no connection pool is opened when
+            // encryption-migration is disabled (the default deployment).
+            final MongoClientWrapper mongoClient =
+                    MongoClientWrapper.newInstance(connectivityConfig.getMongoDbConfig());
             final String managerName = EncryptionMigrationActor.ACTOR_NAME + "Singleton";
             final ActorRef singletonManager = startClusterSingletonActor(
                     EncryptionMigrationActor.props(connectivityConfig, mongoClient), managerName);
@@ -179,7 +197,8 @@ public final class ConnectivityRootActor extends DittoRootActor {
         return ClusterUtil.startSingleton(getContext(), CLUSTER_ROLE, name, props);
     }
 
-    private ActorRef getHealthCheckingActor(final ConnectivityConfig connectivityConfig) {
+    private ActorRef getHealthCheckingActor(final ConnectivityConfig connectivityConfig,
+            final PersistenceBackendProvider backendProvider) {
         final HealthCheckConfig healthCheckConfig = connectivityConfig.getHealthCheckConfig();
         final HealthCheckingActorOptions.Builder hcBuilder =
                 HealthCheckingActorOptions.getBuilder(healthCheckConfig.isEnabled(), healthCheckConfig.getInterval());
@@ -191,7 +210,7 @@ public final class ConnectivityRootActor extends DittoRootActor {
 
         return startChildActor(DefaultHealthCheckingActorFactory.ACTOR_NAME,
                 DefaultHealthCheckingActorFactory.props(healthCheckingActorOptions,
-                        MongoHealthChecker.props()
+                        backendProvider.healthCheck()
                 ));
     }
 
@@ -202,16 +221,41 @@ public final class ConnectivityRootActor extends DittoRootActor {
     }
 
     private static ActorRef startConnectionShardRegion(final ActorSystem actorSystem,
-            final Props connectionSupervisorProps, final ClusterConfig clusterConfig) {
+            final Props connectionSupervisorProps, final ClusterConfig clusterConfig,
+            final PersistenceBackendProvider backendProvider) {
 
-        final ClusterShardingSettings shardingSettings = ClusterShardingSettings.create(actorSystem)
-                .withRole(ConnectivityMessagingConstants.CLUSTER_ROLE);
+        final ClusterShardingSettings shardingSettings = rememberEntitiesShardingSettings(actorSystem,
+                backendProvider.pluginConfig().getRememberStorePluginIds(ConnectivityMessagingConstants.SHARD_REGION));
 
         return ClusterSharding.get(actorSystem)
                 .start(ConnectivityMessagingConstants.SHARD_REGION,
                         connectionSupervisorProps,
                         shardingSettings,
                         ShardRegionExtractor.of(clusterConfig.getNumberOfShards(), actorSystem));
+    }
+
+    /**
+     * Builds the {@link ClusterShardingSettings} for the connection shard region, programmatically setting the
+     * cluster-sharding {@code remember-entities} event-sourced store's journal/snapshot plugin IDs from the active
+     * persistence backend's provider (the single source of truth — never hardcoded here).
+     * <p>
+     * The setters are called unconditionally: on Mongo they carry the dedicated {@code *-remember-*} plugin IDs
+     * (behaviour-identical to the previously HOCON-only configuration), while on the Postgres profile — where
+     * {@code pekko.cluster.sharding.remember-entities-store = ddata} uses DistributedData rather than the
+     * event-sourced journal/snapshot — these plugin IDs are simply ignored. They therefore feed Pekko's
+     * {@code EventSourcedRememberEntitiesShardStore} only in the eventsourced mode and are harmless otherwise.
+     *
+     * @param actorSystem the actor system.
+     * @param rememberStorePluginIds the remember-store journal/snapshot plugin IDs from the persistence provider.
+     * @return the sharding settings carrying the provider's remember-store plugin IDs.
+     */
+    static ClusterShardingSettings rememberEntitiesShardingSettings(final ActorSystem actorSystem,
+            final PersistencePluginConfig.RememberStorePluginIds rememberStorePluginIds) {
+
+        return ClusterShardingSettings.create(actorSystem)
+                .withRole(ConnectivityMessagingConstants.CLUSTER_ROLE)
+                .withJournalPluginId(rememberStorePluginIds.journalPluginId())
+                .withSnapshotPluginId(rememberStorePluginIds.snapshotPluginId());
     }
 
 }

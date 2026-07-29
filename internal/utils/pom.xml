@@ -38,6 +38,10 @@
         <module>json</module>
         <module>jwt</module>
         <module>namespaces</module>
+        <module>persistence-api</module>
+        <module>persistence-r2dbc</module>
+        <module>persistence-r2dbc-extension</module>
+        <module>persistence-bench</module>
         <module>persistence</module>
         <module>pubsub</module>
         <module>pubsub-policies</module>
