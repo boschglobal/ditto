@@ -1,0 +1,9 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Ditto (Postgres)" type="CompoundRunConfigurationType">
+    <toRun name="PoliciesService (Postgres)" type="Application" />
+    <toRun name="ThingsService (Postgres)" type="Application" />
+    <toRun name="ConnectivityService (Postgres)" type="Application" />
+    <toRun name="GatewayService (Postgres)" type="Application" />
+    <method v="2" />
+  </configuration>
+</component>

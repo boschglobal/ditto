@@ -19,7 +19,7 @@ import org.eclipse.ditto.connectivity.model.ConnectionLifecycle;
 import org.eclipse.ditto.connectivity.service.config.DittoConnectivityConfig;
 import org.eclipse.ditto.connectivity.service.config.FieldsEncryptionConfig;
 import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
-import org.eclipse.ditto.internal.utils.persistence.mongo.AbstractMongoSnapshotAdapter;
+import org.eclipse.ditto.internal.utils.persistence.api.serializer.SnapshotSerializer;
 import org.eclipse.ditto.json.JsonField;
 import org.eclipse.ditto.json.JsonObject;
 import org.eclipse.ditto.json.JsonPointer;
@@ -32,9 +32,15 @@ import com.typesafe.config.Config;
 import org.apache.pekko.actor.ActorSystem;
 
 /**
- * SnapshotAdapter for {@link String}s persisted to/from MongoDB.
+ * The {@link SnapshotSerializer} for a {@link Connection}: the pure domain&harr;{@code JsonObject} logic, including the
+ * connection fields encrypt/decrypt hooks. It is backend-neutral; the storage envelope (Mongo BSON / Postgres JSONB) is
+ * supplied separately by the active backend's {@code SnapshotCodec} and combined with this serializer in
+ * {@code org.eclipse.ditto.internal.utils.persistence.api.serializer.NeutralSnapshotAdapter}.
+ * <p>
+ * The {@code MongoSnapshotAdapter} name is retained for config-compatibility (it is still referenced as the Mongo-default
+ * {@code snapshot-serializer}); it is now purely a serializer and no longer carries any BSON-specific code.
  */
-public final class ConnectionMongoSnapshotAdapter extends AbstractMongoSnapshotAdapter<Connection> {
+public final class ConnectionMongoSnapshotAdapter extends SnapshotSerializer<Connection> {
 
     public static final Logger LOGGER = LoggerFactory.getLogger(ConnectionMongoSnapshotAdapter.class);
     private final FieldsEncryptionConfig encryptionConfig;

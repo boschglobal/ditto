@@ -24,7 +24,7 @@ import org.eclipse.ditto.internal.utils.pekko.PingCommand;
 import org.eclipse.ditto.internal.utils.pekko.PingCommandResponse;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoLoggerFactory;
 import org.eclipse.ditto.internal.utils.pekko.logging.ThreadSafeDittoLoggingAdapter;
-import org.eclipse.ditto.internal.utils.persistence.mongo.streaming.MongoReadJournal;
+import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
 import org.eclipse.ditto.internal.utils.persistentactors.config.PingConfig;
 import org.eclipse.ditto.internal.utils.persistentactors.config.RateConfig;
 import org.eclipse.ditto.json.JsonValue;
@@ -76,7 +76,7 @@ public final class PersistencePingActor extends AbstractActor {
 
     @SuppressWarnings("unused")
     private PersistencePingActor(final ActorRef persistenceActorShardRegion, final PingConfig pingConfig,
-            final MongoReadJournal readJournal) {
+            final DittoReadJournal readJournal) {
 
         this.persistenceActorShardRegion = persistenceActorShardRegion;
         this.pingConfig = pingConfig;
@@ -111,7 +111,7 @@ public final class PersistencePingActor extends AbstractActor {
      * @return the Pekko configuration Props object.
      */
     public static Props props(final ActorRef persistenceActorShardRegion, final PingConfig pingConfig,
-            final MongoReadJournal readJournal) {
+            final DittoReadJournal readJournal) {
 
         return Props.create(PersistencePingActor.class, persistenceActorShardRegion, pingConfig, readJournal);
     }

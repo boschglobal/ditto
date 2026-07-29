@@ -53,7 +53,7 @@ import org.eclipse.ditto.internal.utils.cacheloaders.AskWithRetry;
 import org.eclipse.ditto.internal.utils.cluster.ShardRegionProxyActorFactory;
 import org.eclipse.ditto.internal.utils.cluster.StopShardedActor;
 import org.eclipse.ditto.internal.utils.namespaces.BlockedNamespaces;
-import org.eclipse.ditto.internal.utils.persistence.mongo.streaming.MongoReadJournal;
+import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
 import org.eclipse.ditto.internal.utils.persistentactors.AbstractPersistenceSupervisor;
 import org.eclipse.ditto.internal.utils.persistentactors.TargetActorWithMessage;
 import org.eclipse.ditto.internal.utils.pubsub.DistributedPub;
@@ -126,9 +126,9 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
             @Nullable final ActorRef thingPersistenceActorRef,
             @Nullable final BlockedNamespaces blockedNamespaces,
             final PolicyEnforcerProvider policyEnforcerProvider,
-            final MongoReadJournal mongoReadJournal) {
+            final DittoReadJournal readJournal) {
 
-        super(blockedNamespaces, mongoReadJournal, thingsConfig.getThingConfig().getSupervisorConfig());
+        super(blockedNamespaces, readJournal, thingsConfig.getThingConfig().getSupervisorConfig());
 
         this.pubSubMediator = pubSubMediator;
         this.thingsConfig = thingsConfig;
@@ -207,11 +207,11 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
             final ThingPersistenceActorPropsFactory propsFactory,
             @Nullable final BlockedNamespaces blockedNamespaces,
             final PolicyEnforcerProvider policyEnforcerProvider,
-            final MongoReadJournal mongoReadJournal) {
+            final DittoReadJournal readJournal) {
 
         return Props.create(ThingSupervisorActor.class, pubSubMediator, thingsConfig, enforcementConfig, null,
                 distributedPubThingEventsForTwin, liveSignalPub, propsFactory, null, blockedNamespaces,
-                policyEnforcerProvider, mongoReadJournal);
+                policyEnforcerProvider, readJournal);
     }
 
     /**
@@ -226,11 +226,11 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
             final ThingPersistenceActorPropsFactory propsFactory,
             @Nullable final BlockedNamespaces blockedNamespaces,
             final PolicyEnforcerProvider policyEnforcerProvider,
-            final MongoReadJournal mongoReadJournal) {
+            final DittoReadJournal readJournal) {
 
         return Props.create(ThingSupervisorActor.class, pubSubMediator, thingsConfig, enforcementConfig,
                 policiesShardRegion, distributedPubThingEventsForTwin, liveSignalPub, propsFactory, null,
-                blockedNamespaces, policyEnforcerProvider, mongoReadJournal);
+                blockedNamespaces, policyEnforcerProvider, readJournal);
     }
 
     /**
@@ -245,11 +245,11 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
             final ActorRef thingsPersistenceActor,
             @Nullable final BlockedNamespaces blockedNamespaces,
             final PolicyEnforcerProvider policyEnforcerProvider,
-            final MongoReadJournal mongoReadJournal) {
+            final DittoReadJournal readJournal) {
 
         return Props.create(ThingSupervisorActor.class, pubSubMediator, thingsConfig, enforcementConfig,
                 policiesShardRegion, distributedPubThingEventsForTwin, liveSignalPub, null, thingsPersistenceActor,
-                blockedNamespaces, policyEnforcerProvider, mongoReadJournal);
+                blockedNamespaces, policyEnforcerProvider, readJournal);
     }
 
     @Override
@@ -421,7 +421,7 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
     @Override
     protected Props getPersistenceActorProps(final ThingId entityId) {
         assert thingPersistenceActorPropsFactory != null;
-        return thingPersistenceActorPropsFactory.props(entityId, mongoReadJournal, thingsConfig.getThingConfig(),
+        return thingPersistenceActorPropsFactory.props(entityId, readJournal, thingsConfig.getThingConfig(),
                 distributedPubThingEventsForTwin, searchShardRegionProxy, policyEnforcerProvider);
     }
 

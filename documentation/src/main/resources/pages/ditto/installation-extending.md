@@ -150,6 +150,110 @@ connectivity:
     - ./gateway-extension.jar:/opt/ditto/extensions/gateway-extension.jar
 ```
 
+### PostgreSQL persistence backend
+
+By default, Ditto stores Things, Policies, and Connectivity data in MongoDB.
+You can switch any service to a PostgreSQL backend by dropping in a single shaded extension JAR and mounting a service-specific activation config.
+MongoDB remains the default — this is strictly opt-in.
+
+#### 1. Provide the extension JAR
+
+The extension JAR is **not** included in the default Ditto images.
+Build it from the `ditto-internal-utils-persistence-r2dbc-extension` Maven module (it is a shaded uber-JAR that bundles the R2DBC driver and connection pool) and drop it into the extensions directory:
+
+```bash
+# build the shaded JAR (from the ditto repo root)
+mvn -pl :ditto-internal-utils-persistence-r2dbc-extension -am -DskipTests package
+
+# copy into the container (or use a volume mount — see docker-compose example below)
+docker cp \
+  internal/utils/persistence-r2dbc-extension/target/ditto-internal-utils-persistence-r2dbc-extension-<version>.jar \
+  container_id:/opt/ditto/extensions/
+```
+
+#### 2. Create a service activation config
+
+Create a HOCON overlay file (e.g. `things-postgres.conf`) for each service you want to migrate.
+The top-level `include` statement is **required outside any `ditto {}` block** because the Postgres persistence config ships its own top-level Pekko plugin blocks that Pekko must see at the config root.
+
+```hocon
+# things-postgres.conf
+# Injected via: HOSTING_ENVIRONMENT=filebased
+#               HOSTING_ENVIRONMENT_FILE_LOCATION=/opt/ditto/things-postgres.conf
+
+# 1. Re-include the service base settings (filebased replaces the normal environment layer)
+include classpath("things-dev")
+
+# 2. TOP-LEVEL include — NOT inside ditto {} — because ditto-postgres-persistence.conf ships its
+#    own top-level Pekko plugin blocks (ditto-postgres-things-journal { }, ...) that Pekko must
+#    see at the config root. This single include wires the provider selection, the per-entity
+#    Pekko plugin blocks, AND the ditto.postgresql.* client/pool/SSL defaults (the client config
+#    used to live in a separate ditto-postgresql.conf; it is now folded into this one file).
+include classpath("ditto-postgres-persistence")
+
+# Narrow Pekko's auto-start lists to this service's own entity. ditto-postgres-persistence.conf
+# defaults these lists to all 4 entities (things/policies/connections/wot), which only boots where
+# every entity's plugin-dispatcher is defined (an all-in-one config). A single-entity service such
+# as things only defines the thing-* dispatchers, and Pekko resolves every auto-started plugin's
+# dispatcher eagerly at Persistence-extension init — an un-narrowed list crashes the first
+# persistent actor on a missing dispatcher for the other entities. This narrowing step is REQUIRED
+# for every service overlay, not optional.
+pekko.persistence.journal.auto-start-journals               = [ "ditto-postgres-things-journal" ]
+pekko.persistence.snapshot-store.auto-start-snapshot-stores = [ "ditto-postgres-things-snapshots" ]
+
+# Placeholder Mongo collection names so Mongo-era ops actors construct harmlessly
+ditto-postgres-things-journal.overrides   { journal-collection = "things_journal"; metadata-collection = "things_metadata" }
+ditto-postgres-things-snapshots.overrides { snaps-collection = "things_snaps" }
+```
+
+This overlay also activates the Postgres persistence backend provider via:
+
+```hocon
+ditto.extensions.persistence-backend-provider {
+  extension-class = org.eclipse.ditto.internal.utils.persistence.postgres.PostgresPersistenceBackendProvider
+}
+```
+
+That key is already set inside `ditto-postgres-persistence.conf` (shipped inside the extension JAR); you do not need to repeat it unless you want to override it.
+
+Snapshot encoding switches automatically when the Postgres backend is active — no per-service snapshot adapter override is needed.
+
+#### 3. Set environment variables
+
+| Variable | Purpose | Example value |
+|---|---|---|
+| `HOSTING_ENVIRONMENT` | Switches Ditto's config loader to file-based mode | `filebased` |
+| `HOSTING_ENVIRONMENT_FILE_LOCATION` | Path to the overlay config inside the container | `/opt/ditto/things-postgres.conf` |
+| `POSTGRES_URI` | R2DBC connection URI | `r2dbc:postgresql://postgres:5432/ditto` |
+| `POSTGRES_USER` | Database user | `ditto` |
+| `POSTGRES_PASSWORD` | Database password | `ditto` |
+| `POSTGRES_SSL_MODE` | TLS mode (`disable`, `require`, `verify-full`) | `disable` (dev) / `verify-full` (prod) |
+
+Schema tables are created automatically on first boot.
+
+#### 4. Docker Compose volume mount example
+
+```yaml
+things:
+  image: docker.io/eclipse/ditto-things:${DITTO_VERSION:-latest}
+  environment:
+    - HOSTING_ENVIRONMENT=filebased
+    - HOSTING_ENVIRONMENT_FILE_LOCATION=/opt/ditto/things-postgres.conf
+    - POSTGRES_URI=r2dbc:postgresql://postgres:5432/ditto
+    - POSTGRES_USER=ditto
+    - POSTGRES_PASSWORD=ditto
+    - POSTGRES_SSL_MODE=disable   # or verify-full in production with a CA cert
+  volumes:
+    # 1. Drop-in extension JAR (NOT in the default image — must be provided by the operator)
+    - ./ditto-internal-utils-persistence-r2dbc-extension.jar:/opt/ditto/extensions/ditto-internal-utils-persistence-r2dbc-extension.jar
+    # 2. Activation overlay config
+    - ./things-postgres.conf:/opt/ditto/things-postgres.conf
+```
+
+Repeat the same pattern for the Policies and Connectivity services, substituting the appropriate plugin IDs, overlay conf name, and collection name overrides for each service.
+
+{% include note.html content="Data migration from MongoDB is the operator's responsibility. No automated migration tooling is provided." %}
+
 ## Further reading
 
 * [Operating - Configuration](operating-configuration.html)
