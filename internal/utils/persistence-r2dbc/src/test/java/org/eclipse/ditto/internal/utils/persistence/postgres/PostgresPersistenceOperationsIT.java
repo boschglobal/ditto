@@ -12,6 +12,11 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
@@ -20,12 +25,12 @@ import java.util.concurrent.TimeUnit;
 
 import org.eclipse.ditto.base.model.entity.id.EntityId;
 import org.eclipse.ditto.base.model.entity.type.EntityType;
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournalOps;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresEntitiesPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresNamespacePersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.snapshot.PostgresSnapshotStoreOps;
 import org.junit.AfterClass;
 import org.junit.Assume;
@@ -79,7 +84,7 @@ public final class PostgresPersistenceOperationsIT {
             Assume.assumeNoException("Docker/Testcontainers unavailable — skipping PostgresPersistenceOperationsIT", t);
         }
         final ConnectionFactory factory = POSTGRES.newConnectionFactory();
-        PostgresSchemaManager.of(factory).bootstrap();
+        PostgresSchemaManager.of(factory, PostgresSchema.descriptor()).bootstrap();
 
         system = ActorSystem.create("PostgresPersistenceOperationsIT");
         mat = SystemMaterializer.get(system).materializer();

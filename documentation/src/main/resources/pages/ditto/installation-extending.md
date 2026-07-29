@@ -153,23 +153,36 @@ connectivity:
 ### PostgreSQL persistence backend
 
 By default, Ditto stores Things, Policies, and Connectivity data in MongoDB.
-You can switch any service to a PostgreSQL backend by dropping in a single shaded extension JAR and mounting a service-specific activation config.
+You can switch any service to a PostgreSQL backend by dropping in the extension JARs and mounting a service-specific activation config.
 MongoDB remains the default — this is strictly opt-in.
 
-#### 1. Provide the extension JAR
+#### 1. Provide the extension JARs
 
-The extension JAR is **not** included in the default Ditto images.
-Build it from the `ditto-internal-utils-persistence-r2dbc-extension` Maven module (it is a shaded uber-JAR that bundles the R2DBC driver and connection pool) and drop it into the extensions directory:
+The extension JARs are **not** included in the default Ditto images.
+The PostgreSQL backend ships as **layered drop-in JARs** built from three Maven modules — a shared **base** JAR carrying all third-party runtime (R2DBC driver/pool, reactor, netty, scram) and **thin** backend JARs carrying only Ditto implementation classes:
+
+| Module / JAR | Contents | Mounted by |
+|---|---|---|
+| `ditto-postgres-client-extension` (base) | shared `postgres-client` infra + ALL third-party (r2dbc-postgresql, r2dbc-pool, reactor, netty incl. resolver-dns, scram) | every Postgres service |
+| `ditto-postgres-persistence-extension` (thin) | only the event-sourcing persistence classes | things / policies / connectivity |
+| `ditto-postgres-search-extension` (thin) | only the thing-search classes | thing-search (only if search runs on Postgres — see the search section below) |
+
+A persistence service therefore mounts **two** JARs: the base plus the matching thin JAR. Build them (from the ditto repo root) and drop them into the extensions directory:
 
 ```bash
-# build the shaded JAR (from the ditto repo root)
-mvn -pl :ditto-internal-utils-persistence-r2dbc-extension -am -DskipTests package
+# build the base + the persistence thin JAR (each is a shaded JAR; the thin one rides on top of the base)
+mvn -pl :ditto-postgres-client-extension,:ditto-postgres-persistence-extension -am -DskipTests package
 
-# copy into the container (or use a volume mount — see docker-compose example below)
+# copy BOTH into the container (or use a volume mount — see docker-compose example below)
 docker cp \
-  internal/utils/persistence-r2dbc-extension/target/ditto-internal-utils-persistence-r2dbc-extension-<version>.jar \
+  internal/utils/postgres-client-extension/target/ditto-postgres-client-extension-<version>.jar \
+  container_id:/opt/ditto/extensions/
+docker cp \
+  internal/utils/postgres-persistence-extension/target/ditto-postgres-persistence-extension-<version>.jar \
   container_id:/opt/ditto/extensions/
 ```
+
+{% include note.html content="All mounted PostgreSQL extension JARs **must come from the same Ditto release**. A boot self-check (a version marker in each JAR) fails fast on a version mismatch, and a thin JAR mounted without its base fails fast with an actionable *requires base `ditto-postgres-client-extension`* error." %}
 
 #### 2. Create a service activation config
 
@@ -244,8 +257,9 @@ things:
     - POSTGRES_PASSWORD=ditto
     - POSTGRES_SSL_MODE=disable   # or verify-full in production with a CA cert
   volumes:
-    # 1. Drop-in extension JAR (NOT in the default image — must be provided by the operator)
-    - ./ditto-internal-utils-persistence-r2dbc-extension.jar:/opt/ditto/extensions/ditto-internal-utils-persistence-r2dbc-extension.jar
+    # 1. Drop-in extension JARs (NOT in the default image — must be provided by the operator; base + persistence thin JAR)
+    - ./ditto-postgres-client-extension.jar:/opt/ditto/extensions/ditto-postgres-client-extension.jar
+    - ./ditto-postgres-persistence-extension.jar:/opt/ditto/extensions/ditto-postgres-persistence-extension.jar
     # 2. Activation overlay config
     - ./things-postgres.conf:/opt/ditto/things-postgres.conf
 ```
@@ -253,6 +267,84 @@ things:
 Repeat the same pattern for the Policies and Connectivity services, substituting the appropriate plugin IDs, overlay conf name, and collection name overrides for each service.
 
 {% include note.html content="Data migration from MongoDB is the operator's responsibility. No automated migration tooling is provided." %}
+
+### PostgreSQL search backend
+
+Thing-search can **optionally** run its search index on PostgreSQL instead of MongoDB, independently of which backend the persistence services use. MongoDB remains the default search backend — this is strictly opt-in and only affects the `things-search` service.
+
+#### 1. Provide the extension JARs
+
+Running search on Postgres mounts **two** JARs: the SAME shared `ditto-postgres-client-extension` base the persistence services use, plus the thin `ditto-postgres-search-extension` (search read/write/aggregation classes only):
+
+```bash
+mvn -pl :ditto-postgres-client-extension,:ditto-postgres-search-extension -am -DskipTests package
+
+docker cp \
+  internal/utils/postgres-client-extension/target/ditto-postgres-client-extension-<version>.jar \
+  container_id:/opt/ditto/extensions/
+docker cp \
+  internal/utils/postgres-search-extension/target/ditto-postgres-search-extension-<version>.jar \
+  container_id:/opt/ditto/extensions/
+```
+
+#### 2. Create the search activation config
+
+Create a HOCON overlay (e.g. `search-postgres.conf`) with two top-level includes — the search service defaults, then the opt-in Postgres search profile which swaps the `search-persistence-provider` extension and pulls in the shared `ditto.postgresql.*` client/pool/SSL defaults:
+
+```hocon
+# search-postgres.conf
+# Injected via: HOSTING_ENVIRONMENT=filebased
+#               HOSTING_ENVIRONMENT_FILE_LOCATION=/opt/ditto/search-postgres.conf
+
+# 1. Re-include the search service base settings (Mongo search backend by default)
+include classpath("search")
+
+# 2. TOP-LEVEL include — opt-in PostgreSQL search backend + shared client/pool/SSL defaults.
+#    Swaps ditto.extensions.search-persistence-provider to the PostgreSQL provider; search.conf's own
+#    ditto.mongodb defaults legitimately remain present (the overlay only swaps the one extension key).
+include classpath("ditto-postgres-search")
+```
+
+Environment variables are the same `POSTGRES_*` set as for the persistence backend (`POSTGRES_URI`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_SSL_MODE`). Compose mount:
+
+```yaml
+things-search:
+  image: docker.io/eclipse/ditto-things-search:${DITTO_VERSION:-latest}
+  environment:
+    - HOSTING_ENVIRONMENT=filebased
+    - HOSTING_ENVIRONMENT_FILE_LOCATION=/opt/ditto/search-postgres.conf
+    - POSTGRES_URI=r2dbc:postgresql://postgres:5432/ditto
+    - POSTGRES_USER=ditto
+    - POSTGRES_PASSWORD=ditto
+    - POSTGRES_SSL_MODE=disable   # or verify-full in production with a CA cert
+  volumes:
+    # base + search thin JAR (both from the same Ditto release)
+    - ./ditto-postgres-client-extension.jar:/opt/ditto/extensions/ditto-postgres-client-extension.jar
+    - ./ditto-postgres-search-extension.jar:/opt/ditto/extensions/ditto-postgres-search-extension.jar
+    - ./search-postgres.conf:/opt/ditto/search-postgres.conf
+```
+
+#### Operational tunables
+
+The PostgreSQL search backend adds a small set of search-specific knobs on top of the shared client block. All have safe defaults; override them only if a deployment needs to.
+
+| Config path | Default | Env override | Purpose |
+|---|---|---|---|
+| `ditto.postgresql.search.reaper.interval` | `30s` | `POSTGRES_SEARCH_REAPER_INTERVAL` | How often the `delete_at` reaper attempts a tick (Postgres has no TTL index; the reaper replaces Mongo's TTL deletion). |
+| `ditto.postgresql.search.reaper.batch-size` | `1000` | `POSTGRES_SEARCH_REAPER_BATCH_SIZE` | Rows deleted per reap batch (`DELETE … FOR UPDATE SKIP LOCKED` LIMIT), bounding one statement's lock footprint. |
+| `ditto.postgresql.search.reaper.max-batches-per-tick` | `50` | `POSTGRES_SEARCH_REAPER_MAX_BATCHES_PER_TICK` | Safety valve: at most this many batches per tick, so one tick's transaction is never held open against an arbitrarily large backlog. |
+| `ditto.postgresql.force-custom-plan` | `true` (for search) | `POSTGRES_SEARCH_FORCE_CUSTOM_PLAN` | Binds `plan_cache_mode=force_custom_plan` on the search JVM's pool so `wpath`-parameterized read statements re-plan against their actual bound path instead of latching onto a generic plan. |
+
+Pool sizing, SSL and credentials are **not** search-specific — they come from the shared `ditto.postgresql.*` client block (the same one the persistence backend uses), tuned via `POSTGRES_URI` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DDL_*` and `POSTGRES_SSL_MODE`.
+
+#### Prerequisites, migration and known limitations
+
+* **`pg_trgm` extension:** the search schema requires the `pg_trgm` extension (used for `like`/`ilike` trigram indexes). It is a *trusted* extension on PostgreSQL ≥ 13, so `CREATE EXTENSION IF NOT EXISTS pg_trgm` on the target database succeeds for the DDL role without superuser; the schema bootstrap fails with an actionable error if the role is not permitted to create it.
+* **Migration = re-index only:** the search index is a rebuildable projection of the things data, so the cutover to Postgres is simply to point search at an empty PostgreSQL database and let the background-sync stream regenerate the index. There is no copy tooling and none is needed. Search results are incomplete until the initial re-index (background sync) finishes — plan this re-index window into the cutover.
+* **`like`/`ilike` performance caveat:** sub-3-character `like`/`ilike` patterns and high-cardinality-path `ilike` cannot be fully served by the trigram index and degrade to a scan — mirroring MongoDB's own unanchored-regex degradation. The slow-query log catches abuse. Per-path scoped trigram indexes are under evaluation as a possible future mitigation but are not part of this release.
+* **Mongo-only search knobs:** search settings specific to MongoDB (e.g. per-metric MongoDB index hints, custom MongoDB search indexes) are ignored (logged with a WARN) when the PostgreSQL search backend is active.
+
+{% include note.html content="A `search-update-mapper` custom extension implementation must be re-typed to the backend-neutral write model to work with this release — see the release notes for the `SearchUpdateMapper` breaking change and migration guide. Custom `search-update-observer` implementations need no change." %}
 
 ## Further reading
 

@@ -15,7 +15,9 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.schema;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.PostgresDbResource;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
 import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -57,7 +59,7 @@ public final class PostgresSchemaManagerIT {
 
     @Test
     public void bootstrapCreatesAllTablesAndIsIdempotent() {
-        PostgresSchemaManager.of(connectionFactory).bootstrap();
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
 
         // every entity's three tables exist
         for (final String entity : PostgresSchema.ENTITIES) {
@@ -68,9 +70,9 @@ public final class PostgresSchemaManagerIT {
         assertThat(tableExists("schema_version")).isTrue();
 
         // re-run is idempotent (IF NOT EXISTS + checksum match)
-        PostgresSchemaManager.of(connectionFactory).bootstrap();
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
         assertThat(scalar("SELECT checksum FROM schema_version WHERE component = '"
-                + PostgresSchema.COMPONENT + "'")).isEqualTo(SchemaChecksum.current());
+                + PostgresSchema.COMPONENT + "'")).isEqualTo(PostgresSchemaManager.checksum(PostgresSchema.descriptor()));
     }
 
     @Test
@@ -83,7 +85,7 @@ public final class PostgresSchemaManagerIT {
                 + "manifest TEXT, tags TEXT[], event JSONB, written_at TIMESTAMPTZ, "
                 + "PRIMARY KEY (pid, sn, written_at))");
 
-        assertThatThrownBy(() -> PostgresSchemaManager.of(connectionFactory).bootstrap())
+        assertThatThrownBy(() -> PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap())
                 .isInstanceOf(SchemaBootException.class)
                 .hasMessageContaining("divergent primary key");
 
@@ -99,7 +101,7 @@ public final class PostgresSchemaManagerIT {
         runDdl("CREATE SCHEMA IF NOT EXISTS decoy");
         runDdl("CREATE TABLE IF NOT EXISTS decoy.things_journal (wrong BIGINT PRIMARY KEY)");
         try {
-            PostgresSchemaManager.of(connectionFactory).bootstrap();
+            PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
         } finally {
             // cleanup so repeated runs against the same container stay deterministic.
             runDdl("DROP SCHEMA IF EXISTS decoy CASCADE");

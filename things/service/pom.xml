@@ -325,7 +325,8 @@
                                 <bannedDependencies>
                                     <excludes>
                                         <exclude>org.eclipse.ditto:ditto-internal-utils-persistence-r2dbc</exclude>
-                                        <exclude>org.eclipse.ditto:ditto-internal-utils-persistence-r2dbc-extension</exclude>
+                                        <!-- The shared Postgres client/schema infra (carries r2dbc) must be equally banned from the allinone. -->
+                                        <exclude>org.eclipse.ditto:ditto-internal-utils-postgres-client</exclude>
                                         <!-- The driver coordinates themselves: a TRANSITIVE r2dbc/postgres driver must also
                                              fail the build, not only the Ditto backend artifacts (the ArchUnit rule checks
                                              code references, not shaded-jar contents). -->

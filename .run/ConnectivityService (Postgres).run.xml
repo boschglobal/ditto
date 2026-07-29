@@ -3,6 +3,10 @@
     <envs>
       <env name="CLEANUP_HISTORY_RETENTION_DURATION" value="6d" />
       <env name="CONNECTION_EVENT_HISTORICAL_HEADERS_TO_PERSIST.0" value="ditto-originator" />
+      <!-- docker-compose sets this for the containerized service only; without it the connection-log
+           publisher stays off and ConnectivityLogPublishingIT sees no records. Fluency's default host
+           (localhost:24224) already reaches the published fluentbit port from the host. -->
+      <env name="CONNECTIVITY_LOGGER_PUBLISHER_ENABLED" value="true" />
       <env name="DITTO_TRACING_ENABLED" value="true" />
       <env name="LOG_LEVEL_APPLICATION" value="INFO" />
       <env name="DITTO_TRACING_SAMPLER" value="always" />

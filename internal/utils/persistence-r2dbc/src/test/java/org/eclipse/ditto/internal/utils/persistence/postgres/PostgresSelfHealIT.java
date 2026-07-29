@@ -19,11 +19,16 @@ import java.util.List;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.PostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSchemaHealer;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSqlStates;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournalOps;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assume;
@@ -95,7 +100,7 @@ public final class PostgresSelfHealIT {
     @Before
     public void ensureSchema() {
         // Restore a fully-created schema before each test (idempotent), so a prior test's DROP does not leak.
-        PostgresSchemaManager.of(ddlFactory).bootstrap();
+        PostgresSchemaManager.of(ddlFactory, PostgresSchema.descriptor()).bootstrap();
     }
 
     @After
@@ -162,7 +167,11 @@ public final class PostgresSelfHealIT {
                 + "}";
         final PostgresConfig config = DefaultPostgresConfig.of(ConfigFactory.parseString(hocon).getConfig("ditto"));
         assertThat(config.isSchemaSelfHealEnabled()).isEqualTo(selfHeal);
-        return DittoPostgresClient.newInstance(config, PostgresSchemaHealer.of(config));
+        final PostgresSchemaHealer healer = PostgresSchemaHealer.of(config);
+        // In production the persistence bootstrap registers the descriptor (PostgresPersistenceBackendProvider);
+        // this test builds the healer directly, so register it here.
+        healer.registerDescriptor(PostgresSchema.descriptor());
+        return DittoPostgresClient.newInstance(config, healer);
     }
 
     private static AtomicWrite write(final String pid, final long sn, final String json) {

@@ -20,6 +20,9 @@ import java.util.Set;
 
 import javax.annotation.concurrent.Immutable;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaDescriptor;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.TableContract;
+
 /**
  * The canonical, programmatic DDL definition of the PostgreSQL persistence schema.
  * <p>
@@ -45,9 +48,14 @@ import javax.annotation.concurrent.Immutable;
  * transaction so the high-churn journal and snapshot tables are vacuumed aggressively.
  * </p>
  * <p>
- * The {@link #ddlStatements()} list is the single source of truth for both the bootstrap (executed verbatim) and the
- * {@link SchemaChecksum checksum} (computed over the concatenated, whitespace-normalised statement text), so the
- * checksum can never drift away from what is actually executed.
+ * The {@link #ddlStatements()} list holds this component's own tables/indexes (the shared {@code schema_version} table
+ * is owned by {@code PostgresSchemaManager} and prepended by it); together they are the single source of truth for both
+ * the bootstrap (executed verbatim) and the {@code SchemaChecksum} (computed over the concatenated, whitespace-normalised
+ * statement text), so the checksum can never drift away from what is actually executed.
+ * </p>
+ * <p>
+ * Implements the backend-agnostic {@link PostgresSchemaDescriptor} (via {@link #descriptor()}) so the generic
+ * {@code PostgresSchemaManager} can bootstrap it without any hard dependency on this concrete class.
  * </p>
  */
 @Immutable
@@ -110,12 +118,42 @@ public final class PostgresSchema {
     }
 
     /**
-     * @return the full ordered list of DDL statements (CREATE TABLE / CREATE INDEX / ALTER TABLE … autovacuum) plus the
-     * {@code schema_version} table. Order is stable so the checksum is deterministic.
+     * @return this component as a backend-agnostic {@link PostgresSchemaDescriptor}, for the generic
+     * {@code PostgresSchemaManager}.
+     */
+    public static PostgresSchemaDescriptor descriptor() {
+        return DESCRIPTOR;
+    }
+
+    private static final PostgresSchemaDescriptor DESCRIPTOR = new PostgresSchemaDescriptor() {
+        @Override
+        public String component() {
+            return COMPONENT;
+        }
+
+        @Override
+        public int version() {
+            return VERSION;
+        }
+
+        @Override
+        public List<String> ddlStatements() {
+            return PostgresSchema.ddlStatements();
+        }
+
+        @Override
+        public List<TableContract> tableContracts() {
+            return PostgresSchema.tableContracts();
+        }
+    };
+
+    /**
+     * @return this component's own ordered list of DDL statements (CREATE TABLE / CREATE INDEX / ALTER TABLE …
+     * autovacuum), <strong>excluding</strong> the shared {@code schema_version} table (owned by
+     * {@code PostgresSchemaManager}). Order is stable so the checksum is deterministic.
      */
     public static List<String> ddlStatements() {
         final List<String> statements = new ArrayList<>();
-        statements.add(createSchemaVersionTable());
         for (final String entity : ENTITIES) {
             statements.add(createJournalTable(entity));
             statements.add(createJournalTagsIndex(entity));
@@ -146,14 +184,6 @@ public final class PostgresSchema {
                     COLLATED_PID_COLUMNS));
         }
         return List.copyOf(contracts);
-    }
-
-    private static String createSchemaVersionTable() {
-        return "CREATE TABLE IF NOT EXISTS schema_version ("
-                + "component TEXT PRIMARY KEY, "
-                + "version INT NOT NULL, "
-                + "checksum TEXT NOT NULL"
-                + ")";
     }
 
     private static String createJournalTable(final String entity) {
@@ -218,22 +248,6 @@ public final class PostgresSchema {
             columns.put(nameTypePairs[i], nameTypePairs[i + 1]);
         }
         return Map.copyOf(columns);
-    }
-
-    /**
-     * The live-catalog contract for a single table: its expected primary-key definition (as returned by
-     * {@code pg_get_constraintdef}), its expected column → {@code data_type} map, and the columns required to carry
-     * {@link #PID_COLLATION} (which {@code data_type} alone cannot express, since every text column reports
-     * {@code text}).
-     */
-    @Immutable
-    public record TableContract(String tableName, String primaryKeyDef, Map<String, String> columns,
-            Set<String> collatedColumns) {
-
-        public TableContract {
-            columns = Map.copyOf(columns);
-            collatedColumns = Set.copyOf(collatedColumns);
-        }
     }
 
 }

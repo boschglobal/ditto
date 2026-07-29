@@ -12,6 +12,11 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
@@ -23,11 +28,11 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournalOps;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonObject;
 import org.junit.AfterClass;
@@ -120,7 +125,7 @@ public final class JsonbCanonicalizationIT {
             Assume.assumeNoException("Docker/Testcontainers unavailable — skipping JsonbCanonicalizationIT", t);
         }
         ddlFactory = POSTGRES.newConnectionFactory();
-        PostgresSchemaManager.of(ddlFactory).bootstrap();
+        PostgresSchemaManager.of(ddlFactory, PostgresSchema.descriptor()).bootstrap();
 
         system = ActorSystem.create("JsonbCanonicalizationIT");
         mat = SystemMaterializer.get(system).materializer();

@@ -12,11 +12,15 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import javax.annotation.Nullable;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonValue;
 import org.junit.AfterClass;
@@ -70,7 +74,7 @@ public final class PostgresPluginLifecycleIT {
             Assume.assumeNoException("Docker/Testcontainers unavailable — skipping PostgresPluginLifecycleIT", t);
         }
         final ConnectionFactory ddlFactory = POSTGRES.newConnectionFactory();
-        PostgresSchemaManager.of(ddlFactory).bootstrap();
+        PostgresSchemaManager.of(ddlFactory, PostgresSchema.descriptor()).bootstrap();
 
         // Boot an ActorSystem on the Postgres persistence profile: the two `things` plugin blocks point at the Postgres
         // plugin classes and carry the `entity` prefix their (Config) constructors read; ditto.postgresql.* is the

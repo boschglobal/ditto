@@ -16,7 +16,7 @@ import org.eclipse.ditto.internal.utils.persistence.operations.AbstractPersisten
 import org.eclipse.ditto.internal.utils.persistence.api.operations.NamespacePersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.operations.PersistenceOperationsConfig;
 import org.eclipse.ditto.thingsearch.model.ThingSearchConstants;
-import org.eclipse.ditto.thingsearch.service.persistence.write.ThingsSearchUpdaterPersistence;
+import org.eclipse.ditto.thingsearch.persistence.api.ThingsSearchUpdaterPersistence;
 
 import org.apache.pekko.actor.ActorRef;
 import org.apache.pekko.actor.Props;

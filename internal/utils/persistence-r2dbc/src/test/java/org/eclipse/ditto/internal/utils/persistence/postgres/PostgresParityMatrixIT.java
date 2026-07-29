@@ -12,6 +12,9 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -27,14 +30,15 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.ditto.internal.utils.persistence.api.DeleteOutcome;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournalOps;
-import org.eclipse.ditto.internal.utils.persistence.postgres.monitoring.PostgresMetrics;
-import org.eclipse.ditto.internal.utils.persistence.postgres.monitoring.PostgresMetricsRecorder;
-import org.eclipse.ditto.internal.utils.persistence.postgres.monitoring.R2dbcMetricsListener;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.monitoring.PostgresMetrics;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.monitoring.PostgresMetricsRecorder;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.monitoring.R2dbcMetricsListener;
 import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
 import org.eclipse.ditto.internal.utils.persistence.postgres.snapshot.PostgresSnapshotStoreOps;
 import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonObject;
@@ -75,7 +79,7 @@ import scala.jdk.javaapi.CollectionConverters;
  * Testcontainers parity matrix against a real PostgreSQL (PG 16) — the scenarios not already
  * covered by {@link PostgresPersistenceIT} (which holds the high-water-mark, priority-ordering, snapshot-criteria and
  * idempotency happy paths) and
- * {@link org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManagerIT} (bootstrap idempotency
+ * {@link org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManagerIT} (bootstrap idempotency
  * and the divergent-primary-key refuse-to-boot case).
  * <p>
  * Each test owns its own pids so they are order-independent against one shared, bootstrapped database. Docker
@@ -111,7 +115,7 @@ public final class PostgresParityMatrixIT {
             Assume.assumeNoException("Docker/Testcontainers unavailable — skipping PostgresParityMatrixIT", t);
         }
         ddlFactory = POSTGRES.newConnectionFactory();
-        PostgresSchemaManager.of(ddlFactory).bootstrap();
+        PostgresSchemaManager.of(ddlFactory, PostgresSchema.descriptor()).bootstrap();
 
         system = ActorSystem.create("PostgresParityMatrixIT");
         mat = SystemMaterializer.get(system).materializer();
@@ -398,13 +402,13 @@ public final class PostgresParityMatrixIT {
                 + "VALUES ('ditto-postgres-persistence', 1, 'POISONED-CHECKSUM') "
                 + "ON CONFLICT (component) DO UPDATE SET checksum = 'POISONED-CHECKSUM'");
         try {
-            assertThatThrownBy(() -> PostgresSchemaManager.of(POSTGRES.newConnectionFactory()).bootstrap())
-                    .isInstanceOf(org.eclipse.ditto.internal.utils.persistence.postgres.schema.SchemaBootException.class)
+            assertThatThrownBy(() -> PostgresSchemaManager.of(POSTGRES.newConnectionFactory(), PostgresSchema.descriptor()).bootstrap())
+                    .isInstanceOf(org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException.class)
                     .hasMessageContaining("checksum");
         } finally {
             // restore the correct checksum so later runs / re-bootstraps are clean.
             runDdl("UPDATE schema_version SET checksum = '"
-                    + org.eclipse.ditto.internal.utils.persistence.postgres.schema.SchemaChecksum.current()
+                    + PostgresSchemaManager.checksum(PostgresSchema.descriptor())
                     + "' WHERE component = 'ditto-postgres-persistence'");
         }
     }
@@ -431,7 +435,7 @@ public final class PostgresParityMatrixIT {
                     ready.countDown();
                     try {
                         go.await();
-                        PostgresSchemaManager.of(raceFactory(raceDb)).bootstrap();
+                        PostgresSchemaManager.of(raceFactory(raceDb), PostgresSchema.descriptor()).bootstrap();
                     } catch (final Throwable e) {
                         errors.get(idx).set(e);
                     }

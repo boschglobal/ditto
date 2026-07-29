@@ -20,6 +20,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaVerifier;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.TableContract;
 import org.junit.Test;
 
 /**
@@ -30,23 +33,23 @@ import org.junit.Test;
  */
 public final class SchemaVerifierTest {
 
-    private static final PostgresSchema.TableContract JOURNAL = new PostgresSchema.TableContract(
+    private static final TableContract JOURNAL = new TableContract(
             "things_journal", "PRIMARY KEY (pid, sn)",
             Map.of("pid", "text", "sn", "bigint", "event", "jsonb"), Set.of("pid"));
 
     @Test
     public void firstBootPasses() {
-        SchemaVerifier.verifyChecksum("abc", 2, null, null); // no throw
+        SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, null, null); // no throw
     }
 
     @Test
     public void sameVersionSameChecksumPasses() {
-        SchemaVerifier.verifyChecksum("abc", 2, "abc", 2); // no throw
+        SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, "abc", 2); // no throw
     }
 
     @Test
     public void sameVersionDifferentChecksumThrows() {
-        assertThatThrownBy(() -> SchemaVerifier.verifyChecksum("abc", 2, "xyz", 2))
+        assertThatThrownBy(() -> SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, "xyz", 2))
                 .isInstanceOf(SchemaBootException.class).hasMessageContaining("drift");
     }
 
@@ -54,12 +57,12 @@ public final class SchemaVerifierTest {
     public void olderStoredVersionPasses() {
         // rolling upgrade: this node carries version 3, the row still says version 2 — allowed;
         // the caller re-runs the additive DDL and advances the row.
-        SchemaVerifier.verifyChecksum("abc", 3, "old-checksum", 2); // no throw
+        SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 3, "old-checksum", 2); // no throw
     }
 
     @Test
     public void newerStoredVersionThrows() {
-        assertThatThrownBy(() -> SchemaVerifier.verifyChecksum("abc", 2, "newer", 3))
+        assertThatThrownBy(() -> SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, "newer", 3))
                 .isInstanceOf(SchemaBootException.class).hasMessageContaining("downgrade");
     }
 
@@ -182,7 +185,7 @@ public final class SchemaVerifierTest {
         final Map<String, String> pks = new HashMap<>();
         final Map<String, Map<String, String>> columns = new HashMap<>();
         final Map<String, Map<String, String>> collations = new HashMap<>();
-        for (final PostgresSchema.TableContract c : contracts) {
+        for (final TableContract c : contracts) {
             pks.put(c.tableName(), c.primaryKeyDef());
             columns.put(c.tableName(), c.columns());
             final Map<String, String> tableCollations = new HashMap<>();
@@ -202,7 +205,7 @@ public final class SchemaVerifierTest {
     public void verifyAllTablesCoversEveryCanonicalContract() {
         // The canonical contracts must include every entity's three tables.
         assertThat(PostgresSchema.tableContracts())
-                .extracting(PostgresSchema.TableContract::tableName)
+                .extracting(TableContract::tableName)
                 .contains("things_journal", "things_journal_seq", "things_snaps",
                         "policies_journal", "connections_journal", "wot_snaps");
     }

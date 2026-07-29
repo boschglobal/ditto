@@ -25,6 +25,12 @@
     <name>Eclipse Ditto :: Internal :: Utils :: Persistence R2DBC</name>
 
     <dependencies>
+        <!-- Shared backend-agnostic Postgres client/schema infrastructure (pool, DDL, health, metrics,
+             descriptor-parameterised schema manager) extracted from this module. -->
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-internal-utils-postgres-client</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.eclipse.ditto</groupId>
             <artifactId>ditto-internal-utils-config</artifactId>
@@ -126,6 +132,13 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- The shared Testcontainers PostgresDbResource fixture, published by postgres-client as a test-jar. -->
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-internal-utils-postgres-client</artifactId>
+            <type>test-jar</type>
             <scope>test</scope>
         </dependency>
     </dependencies>

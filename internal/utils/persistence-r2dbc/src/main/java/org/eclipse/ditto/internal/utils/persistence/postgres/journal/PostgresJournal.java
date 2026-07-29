@@ -19,8 +19,8 @@ import java.util.function.Consumer;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.DittoPostgresClient;
-import org.eclipse.ditto.internal.utils.persistence.postgres.PostgresClientExtension;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresClientExtension;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 
 import org.apache.pekko.persistence.AtomicWrite;

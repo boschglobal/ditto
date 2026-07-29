@@ -21,8 +21,8 @@ import java.util.Optional;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.DittoPostgresClient;
-import org.eclipse.ditto.internal.utils.persistence.postgres.PostgresSqlStates;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSqlStates;
 
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.Result;

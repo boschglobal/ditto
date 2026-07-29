@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
 import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotFilter;
-import org.eclipse.ditto.internal.utils.persistence.postgres.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.JournalRow;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.RecordingConnectionFactory;

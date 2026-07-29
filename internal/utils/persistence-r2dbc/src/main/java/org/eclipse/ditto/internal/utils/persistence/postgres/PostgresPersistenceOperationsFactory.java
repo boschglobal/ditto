@@ -23,6 +23,8 @@ import org.eclipse.ditto.internal.utils.persistence.api.PersistenceOperationsFac
 import org.eclipse.ditto.internal.utils.persistence.api.operations.EntityPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.api.operations.NamespacePersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.api.streaming.NoOpCloseable;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresClientExtension;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresEntitiesPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresNamespacePersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;

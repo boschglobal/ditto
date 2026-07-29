@@ -1,0 +1,157 @@
+/*
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ */
+package org.eclipse.ditto.internal.utils.persistence.postgres.search;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+import org.junit.AfterClass;
+import org.junit.Assume;
+import org.junit.BeforeClass;
+import org.junit.Test;
+
+import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.ConnectionFactory;
+import io.r2dbc.spi.Result;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+/**
+ * Integration test for the search-schema bootstrap (the descriptor-driven {@link PostgresSchemaManager} applied to
+ * {@link PostgresSearchSchema}) against a real PostgreSQL (PG 16) via Testcontainers.
+ * <p>
+ * Runs under the failsafe phase ({@code *IT}); skipped offline / when no Docker daemon is reachable (the
+ * {@link #startContainer() Assume} guard turns an unreachable Docker into a skip, not a failure).
+ * </p>
+ */
+public final class PostgresSearchSchemaManagerIT {
+
+    private static final PostgresDbResource POSTGRES = new PostgresDbResource();
+    private static ConnectionFactory connectionFactory;
+
+    @BeforeClass
+    public static void startContainer() {
+        try {
+            POSTGRES.start();
+        } catch (final Throwable t) {
+            Assume.assumeNoException("Docker/Testcontainers unavailable — skipping PostgresSearchSchemaManagerIT", t);
+        }
+        connectionFactory = POSTGRES.newConnectionFactory();
+    }
+
+    @AfterClass
+    public static void stopContainer() {
+        POSTGRES.stop();
+    }
+
+    @Test
+    public void bootstrapCreatesAllTablesAndIndexesAndIsIdempotent() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+
+        assertThat(tableExists("search_things")).isTrue();
+        assertThat(tableExists("search_flat")).isTrue();
+        assertThat(tableExists("search_sync")).isTrue();
+        assertThat(tableExists("schema_version")).isTrue();
+
+        // all declared indexes are present
+        for (final String index : new String[] {
+                "st_namespace", "st_global_read", "st_policy", "st_referenced_pols", "st_delete_at", "st_modified",
+                "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm"}) {
+            assertThat(indexExists(index)).as("index %s exists", index).isTrue();
+        }
+
+        // re-run is idempotent (IF NOT EXISTS + checksum match)
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+        assertThat(scalar("SELECT checksum FROM schema_version WHERE component = '"
+                + PostgresSearchSchema.COMPONENT + "'"))
+                .isEqualTo(PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor()));
+    }
+
+    @Test
+    public void trgmIndexCarriesTheCUtf8CollationOverride() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+
+        final String indexDef = scalar("SELECT indexdef FROM pg_indexes WHERE indexname = 'sf_trgm'");
+        assertThat(indexDef)
+                .as("sf_trgm must build the trigram GIN on (val_text COLLATE \"C.utf8\")")
+                .contains("gin_trgm_ops")
+                .contains("C.utf8");
+    }
+
+    @Test
+    public void divergentPreExistingPrimaryKeyRefusesToBoot() {
+        reset();
+        // Pre-create search_sync with a divergent PK; CREATE TABLE IF NOT EXISTS keeps it, so the live-catalog check
+        // must detect the mismatch and refuse to boot.
+        runDdl("CREATE TABLE search_sync (id TEXT, ts TIMESTAMPTZ, tag TEXT, PRIMARY KEY (id, ts))");
+
+        assertThatThrownBy(() ->
+                PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap())
+                .isInstanceOf(SchemaBootException.class)
+                .hasMessageContaining("divergent primary key");
+    }
+
+    @Test
+    public void checksumMismatchAtSameVersionRefusesToBoot() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+
+        // Tamper the stored checksum for this component at the SAME version -> drift -> refuse to boot.
+        runDdl("UPDATE schema_version SET checksum = 'deadbeef' WHERE component = '"
+                + PostgresSearchSchema.COMPONENT + "'");
+
+        assertThatThrownBy(() ->
+                PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap())
+                .isInstanceOf(SchemaBootException.class)
+                .hasMessageContaining("checksum mismatch");
+    }
+
+    private static void reset() {
+        runDdl("DROP TABLE IF EXISTS search_flat, search_things, search_sync, schema_version CASCADE");
+    }
+
+    private static boolean tableExists(final String table) {
+        return Boolean.parseBoolean(scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" + table + "')"));
+    }
+
+    private static boolean indexExists(final String index) {
+        return Boolean.parseBoolean(scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = '" + index + "')"));
+    }
+
+    private static String scalar(final String sql) {
+        return Mono.usingWhen(Mono.from(connectionFactory.create()),
+                        conn -> Flux.from(conn.createStatement(sql).execute())
+                                .flatMap(result -> result.map((row, meta) -> String.valueOf(row.get(0))))
+                                .next(),
+                        Connection::close)
+                .block();
+    }
+
+    private static void runDdl(final String sql) {
+        Mono.usingWhen(Mono.from(connectionFactory.create()),
+                        conn -> Flux.from(conn.createStatement(sql).execute())
+                                .flatMap(Result::getRowsUpdated)
+                                .then(),
+                        Connection::close)
+                .block();
+    }
+
+}

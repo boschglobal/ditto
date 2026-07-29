@@ -12,6 +12,8 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 

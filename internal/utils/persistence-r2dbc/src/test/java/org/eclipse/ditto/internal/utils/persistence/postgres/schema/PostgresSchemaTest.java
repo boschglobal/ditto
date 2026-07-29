@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.junit.Test;
 
 /**
@@ -27,7 +28,9 @@ import org.junit.Test;
  */
 public final class PostgresSchemaTest {
 
-    private static final List<String> DDL = PostgresSchema.ddlStatements();
+    // The effective DDL = the manager-owned shared schema_version table + this component's own statements, i.e. exactly
+    // what the bootstrap executes (schema_version is no longer folded into PostgresSchema.ddlStatements() itself).
+    private static final List<String> DDL = PostgresSchemaManager.effectiveDdl(PostgresSchema.descriptor());
 
     @Test
     public void everyStatementIsIdempotent() {

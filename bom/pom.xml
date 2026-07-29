@@ -80,6 +80,12 @@
         <r2dbc-postgresql.version>1.0.7.RELEASE</r2dbc-postgresql.version>
         <r2dbc-pool.version>1.0.2.RELEASE</r2dbc-pool.version>
         <r2dbc-proxy.version>1.1.5.RELEASE</r2dbc-proxy.version>
+        <!--
+            PostgreSQL JDBC driver — test-scope only, used by the benchmark harnesses
+            (internal/utils/persistence-bench and the search-r2dbc Phase-0 bench) for
+            CopyManager-based bulk loading. NOT used by the production r2dbc-based
+            PostgreSQL persistence backend.
+        -->
         <postgresql-jdbc.version>42.7.7</postgresql-jdbc.version>
         <!--
             reactor-core is pinned to EXACTLY 3.5.20 so that all allinone jars carry a version that
@@ -333,7 +339,10 @@
                 <artifactId>postgresql</artifactId>
                 <version>${testcontainers.version}</version>
             </dependency>
-            <!-- persistence-bench (test scope only): plain JDBC + sync Mongo drivers for the driver-level benchmark. -->
+            <!--
+                Test scope only: plain JDBC + sync Mongo drivers for the driver-level benchmark
+                harnesses — persistence-bench, and the search-r2dbc Phase-0 COPY loader.
+            -->
             <dependency>
                 <groupId>org.postgresql</groupId>
                 <artifactId>postgresql</artifactId>
@@ -776,12 +785,40 @@
             </dependency>
             <dependency>
                 <groupId>org.eclipse.ditto</groupId>
-                <artifactId>ditto-internal-utils-persistence-r2dbc</artifactId>
+                <artifactId>ditto-internal-utils-postgres-client</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.eclipse.ditto</groupId>
-                <artifactId>ditto-internal-utils-persistence-r2dbc-extension</artifactId>
+                <artifactId>ditto-internal-utils-postgres-client</artifactId>
+                <version>${project.version}</version>
+                <type>test-jar</type>
+            </dependency>
+            <dependency>
+                <groupId>org.eclipse.ditto</groupId>
+                <artifactId>ditto-internal-utils-persistence-r2dbc</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <!-- Layered Postgres drop-in extension jars (§6 D2): base client + thin persistence + thin search.
+                 These are deployment artifacts (dropped into /opt/ditto/extensions/), not dependencies of any service. -->
+            <dependency>
+                <groupId>org.eclipse.ditto</groupId>
+                <artifactId>ditto-postgres-client-extension</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.eclipse.ditto</groupId>
+                <artifactId>ditto-postgres-persistence-extension</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.eclipse.ditto</groupId>
+                <artifactId>ditto-postgres-search-extension</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.eclipse.ditto</groupId>
+                <artifactId>ditto-internal-utils-search-r2dbc</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
@@ -868,6 +905,11 @@
             <dependency>
                 <groupId>org.eclipse.ditto</groupId>
                 <artifactId>ditto-thingsearch-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.eclipse.ditto</groupId>
+                <artifactId>ditto-thingsearch-persistence-api</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

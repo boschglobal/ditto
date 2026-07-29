@@ -12,8 +12,8 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres.ops;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.DittoPostgresClient;
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 
 import com.typesafe.config.ConfigFactory;
 

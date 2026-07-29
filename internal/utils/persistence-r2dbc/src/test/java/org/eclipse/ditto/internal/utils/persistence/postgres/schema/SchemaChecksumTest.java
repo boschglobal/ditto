@@ -16,6 +16,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaChecksum;
 import org.junit.Test;
 
 /**
@@ -25,12 +27,12 @@ public final class SchemaChecksumTest {
 
     @Test
     public void checksumIsDeterministic() {
-        assertThat(SchemaChecksum.current()).isEqualTo(SchemaChecksum.current());
+        assertThat(PostgresSchemaManager.checksum(PostgresSchema.descriptor())).isEqualTo(PostgresSchemaManager.checksum(PostgresSchema.descriptor()));
     }
 
     @Test
     public void checksumIsAHex64Sha256() {
-        assertThat(SchemaChecksum.current()).matches("[0-9a-f]{64}");
+        assertThat(PostgresSchemaManager.checksum(PostgresSchema.descriptor())).matches("[0-9a-f]{64}");
     }
 
     @Test
@@ -70,8 +72,8 @@ public final class SchemaChecksumTest {
         // The live canonical DDL declares COLLATE "C" on every pid column; recomputing the checksum over a copy of the
         // DDL with the collation stripped must differ from the current checksum — i.e. the collation is part of the
         // checksummed schema, not cosmetic.
-        final String current = SchemaChecksum.current();
-        final List<String> stripped = PostgresSchema.ddlStatements().stream()
+        final String current = PostgresSchemaManager.checksum(PostgresSchema.descriptor());
+        final List<String> stripped = PostgresSchemaManager.effectiveDdl(PostgresSchema.descriptor()).stream()
                 .map(s -> s.replace(" COLLATE \"C\"", ""))
                 .toList();
         assertThat(SchemaChecksum.compute(stripped)).isNotEqualTo(current);

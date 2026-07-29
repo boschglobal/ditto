@@ -12,6 +12,12 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
@@ -20,10 +26,10 @@ import java.util.List;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournalOps;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -106,7 +112,7 @@ public final class PgBouncerTransactionPoolingIT {
 
         final ConnectionFactory factory = throughPgBouncer();
         // bootstrap (transaction-scoped advisory-lock DDL) through PgBouncer transaction pooling — must succeed.
-        PostgresSchemaManager.of(factory).bootstrap();
+        PostgresSchemaManager.of(factory, PostgresSchema.descriptor()).bootstrap();
 
         final ConnectionPool pool = new ConnectionPool(ConnectionPoolConfiguration.builder(factory)
                 .name("pgbouncer-pool").maxSize(8).build());

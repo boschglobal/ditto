@@ -12,6 +12,11 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
@@ -19,10 +24,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations.JournalInsert;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -80,7 +85,7 @@ public final class JournalWrittenAtClockTimestampIT {
             Assume.assumeNoException("Docker/Testcontainers unavailable — skipping JournalWrittenAtClockTimestampIT", t);
         }
         ddlFactory = POSTGRES.newConnectionFactory();
-        PostgresSchemaManager.of(ddlFactory).bootstrap();
+        PostgresSchemaManager.of(ddlFactory, PostgresSchema.descriptor()).bootstrap();
 
         final ConnectionPool pool = new ConnectionPool(ConnectionPoolConfiguration.builder(ddlFactory)
                 .name("written-at-pool").maxSize(4).build());

@@ -20,7 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.RecordingConnectionFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.StubClientSupport;

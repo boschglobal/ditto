@@ -2,12 +2,20 @@
 
 ## Overview
 
-The PostgreSQL persistence backend is delivered as a single drop-in extension JAR
-(`ditto-internal-utils-persistence-r2dbc-extension`, shaded) plus a HOCON overlay file.
-That combination is all that is needed to switch a Ditto service from MongoDB to PostgreSQL:
+The PostgreSQL persistence backend is delivered as **two layered drop-in extension JARs** — the shared
+base `ditto-postgres-client-extension` (all third-party runtime: r2dbc driver/pool, reactor, netty,
+scram) plus the thin `ditto-postgres-persistence-extension` (event-sourcing classes only) — plus a
+HOCON overlay file. That combination is all that is needed to switch a Ditto service from MongoDB to
+PostgreSQL:
 
-* The extension JAR provides the Pekko persistence plugin (journal + snapshot-store), the R2DBC
-  connection pool, the JSONB snapshot codec, and the schema bootstrap manager.
+* The extension JAR pair provides the Pekko persistence plugin (journal + snapshot-store), the R2DBC
+  connection pool, the JSONB snapshot codec, and the schema bootstrap manager. Both JARs **must come
+  from the same Ditto release** — a boot self-check (a version marker in each JAR) fails fast on a
+  mismatch, and the thin JAR mounted without its base fails fast with an actionable
+  "requires base `ditto-postgres-client-extension`" error. (A thing-search service optionally running
+  its search index on PostgreSQL mounts `ditto-postgres-client-extension` +
+  `ditto-postgres-search-extension` instead — out of scope for this guide; see the
+  "PostgreSQL search backend" section of `documentation/src/main/resources/pages/ditto/installation-extending.md`.)
 * The HOCON overlay activates the backend and supplies runtime connection parameters.
 * Snapshot serialization is **automatic** — `AbstractPersistenceActor` composes the service's own
   snapshot serializer with the JSONB codec resolved from the `persistence-backend-provider`.
@@ -25,9 +33,9 @@ This key is set by the `ditto-postgres-persistence.conf` profile included in the
 
 ## Prerequisites
 
-1. **Extension JAR on the classpath** — place `ditto-internal-utils-persistence-r2dbc-extension-<version>-shaded.jar`
-   into `/opt/ditto/extensions/`. The Ditto process scans that directory at boot and adds all JARs to
-   the classpath automatically.
+1. **Extension JARs on the classpath** — place BOTH `ditto-postgres-client-extension-<version>.jar`
+   (base) and `ditto-postgres-persistence-extension-<version>.jar` (thin) into `/opt/ditto/extensions/`.
+   The Ditto process scans that directory at boot and adds all JARs to the classpath automatically.
 2. **Reachable PostgreSQL instance** — version 14 or later is supported. The `POSTGRES_URI` env var
    must point at it (R2DBC URI format: `r2dbc:postgresql://host:5432/dbname`).
 3. **DDL privileges** — on first boot `PostgresSchemaManager` creates the journal, snapshot, and
@@ -168,11 +176,12 @@ The Ditto Helm chart (`deployment/helm/ditto/`) supports opt-in PostgreSQL activ
 `extraVolumes`, `extraVolumeMounts`, and `extraInitContainers` on each service.
 **Default Mongo deployments are NOT affected** — these keys are null (off) by default.
 
-### Step 1: stage the extension JAR via an initContainer
+### Step 1: stage the extension JARs via an initContainer
 
-The `ditto-internal-utils-persistence-r2dbc-extension` shaded JAR must reach
-`/opt/ditto/extensions/` inside the Things/Policies/Connectivity pods.
-A portable approach is to have an initContainer download or copy the JAR into an `emptyDir` volume
+The `ditto-postgres-client-extension` (base) and `ditto-postgres-persistence-extension` (thin) JARs —
+both from the same Ditto release — must reach `/opt/ditto/extensions/` inside the
+Things/Policies/Connectivity pods.
+A portable approach is to have an initContainer download or copy the JARs into an `emptyDir` volume
 that is then mounted at `/opt/ditto/extensions/`.
 
 Add the following to your `values.yaml` override (shown for `things`; repeat the same pattern under
@@ -187,8 +196,10 @@ things:
         - sh
         - -c
         - |
-          curl -fL -o /extensions/ditto-internal-utils-persistence-r2dbc-extension.jar \
-            "https://your-artifact-host/path/to/ditto-internal-utils-persistence-r2dbc-extension-<version>.jar"
+          curl -fL -o /extensions/ditto-postgres-client-extension.jar \
+            "https://your-artifact-host/path/to/ditto-postgres-client-extension-<version>.jar"
+          curl -fL -o /extensions/ditto-postgres-persistence-extension.jar \
+            "https://your-artifact-host/path/to/ditto-postgres-persistence-extension-<version>.jar"
       volumeMounts:
         - name: ditto-extensions
           mountPath: /extensions

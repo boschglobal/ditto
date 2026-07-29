@@ -31,13 +31,18 @@ import org.eclipse.ditto.internal.utils.persistence.api.PersistencePluginConfig;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotCodec;
 import org.eclipse.ditto.internal.utils.persistence.api.streaming.NoOpCloseable;
 import org.eclipse.ditto.internal.utils.persistence.api.streaming.SnapshotStreamingActor;
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.DefaultPostgresConfig;
-import org.eclipse.ditto.internal.utils.persistence.postgres.config.PostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresClientExtension;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresHealthChecker;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournal;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresTableNames;
 import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
-import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
 import org.eclipse.ditto.internal.utils.persistence.postgres.snapshot.PostgresSnapshotStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -135,6 +140,10 @@ public final class PostgresPersistenceBackendProvider implements PersistenceBack
     public PostgresPersistenceBackendProvider(final ActorSystem actorSystem, final Config extensionConfig) {
         this.actorSystem = Objects.requireNonNull(actorSystem, "actorSystem");
         this.extensionConfig = Objects.requireNonNull(extensionConfig, "extensionConfig");
+        // Layered-extension self-check (§6 D2): the thin persistence jar requires the base client jar alongside it, and
+        // both must be the same Ditto release. Delegated to the verification-clean helper so the missing-base case
+        // yields an actionable error rather than a bare NoClassDefFoundError on a base type used elsewhere here.
+        PostgresPersistenceExtensionSelfCheck.verify();
     }
 
     @Override
@@ -278,7 +287,7 @@ public final class PostgresPersistenceBackendProvider implements PersistenceBack
      * guarantee that the required tables exist; a failure throws and fails boot fast.
      * </p>
      *
-     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.schema.SchemaBootException on a checksum mismatch or
+     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException on a checksum mismatch or
      * a live-catalog divergence.
      * @throws org.eclipse.ditto.internal.utils.config.DittoConfigError if the SSL configuration is unsafe.
      */
@@ -290,10 +299,14 @@ public final class PostgresPersistenceBackendProvider implements PersistenceBack
                 ddlRoleConfigured ? "configured -> dedicated DDL role" : "empty -> reusing runtime role");
         final ConnectionFactory ddlConnectionFactory = ConnectionPoolFactory.createDdlConnectionFactory(config);
         try {
-            PostgresSchemaManager.of(ddlConnectionFactory).bootstrap();
+            PostgresSchemaManager.of(ddlConnectionFactory, PostgresSchema.descriptor()).bootstrap();
         } finally {
             disposeQuietly(ddlConnectionFactory);
         }
+        // Register the persistence schema with the shared client's runtime self-heal: a statement hitting a missing
+        // table (42P01) then recreates exactly this descriptor's tables and retries. Registration is here, after a
+        // successful bootstrap and before the plugins issue runtime statements.
+        PostgresClientExtension.get(actorSystem).getClient().registerSchemaDescriptor(PostgresSchema.descriptor());
     }
 
     private static void disposeQuietly(final ConnectionFactory ddlConnectionFactory) {

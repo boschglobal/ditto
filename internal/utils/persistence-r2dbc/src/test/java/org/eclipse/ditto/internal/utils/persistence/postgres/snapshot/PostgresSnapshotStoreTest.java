@@ -23,7 +23,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.DittoPostgresClient;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.RecordingConnectionFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.StubClientSupport;
