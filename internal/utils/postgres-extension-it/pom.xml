@@ -32,18 +32,70 @@
           (b) base + search resolves the Postgres search provider,
           (c) a thin extension jar WITHOUT the base fails with an actionable error naming the missing base jar.
 
-        The three extension jars are NOT declared as dependencies (that would put their provider/base classes on the test
-        app class loader and defeat the isolation) — they are copied into target/extensions by maven-dependency-plugin
-        from the reactor/local repo, so this module MUST build after the extension modules (it is listed after them in
-        internal/utils/pom.xml) and the ITs require the extensions to have been installed (mvn install). No docker.
+        The three extension jars are NOT declared as class path dependencies (that would put their provider/base classes
+        on the test app class loader and defeat the isolation) — they are copied into target/extensions by
+        maven-dependency-plugin from the reactor/local repo. This module therefore MUST build after the extension
+        modules, which is enforced by the ordering-only "pom"-type dependencies below (declaration order in
+        internal/utils/pom.xml does NOT order a parallel -T build). No docker.
     -->
 
     <properties>
         <!-- forked-classpath-only ITs, no external services -->
         <ditto.postgres.extensions.dir>${project.build.directory}/extensions</ditto.postgres.extensions.dir>
+        <!-- Mirror failsafe's skip semantics for the jar staging below: when no IT runs there is nothing to stage.
+             CLI -D values win over these defaults, so -Dmaven.test.skip / -DskipTests / -DskipITs each skip the copy. -->
+        <maven.test.skip>false</maven.test.skip>
+        <skipTests>${maven.test.skip}</skipTests>
+        <skipITs>${skipTests}</skipITs>
     </properties>
 
     <dependencies>
+        <!-- ORDERING ONLY — NOT classpath entries: the three extension jars are consumed as artifactItems (see the
+             maven-dependency-plugin below); putting them on the class path would defeat the child-loader isolation.
+             Reactor declaration order alone only orders a SERIAL build: a parallel build (-T, as used by the image
+             build pipelines) schedules purely by the dependency graph, so without these edges this module runs its
+             copy before the extension modules are built and the copy fails with "Could not find artifact
+             org.eclipse.ditto:ditto-postgres-<...>-extension". Type "pom" is never added to a class path and the
+             wildcard exclusion keeps the extensions' transitives (which DO carry the provider classes) off it too,
+             so these dependencies buy build order and nothing else. Versions are explicit because the bom manages
+             these artifacts as type "jar". -->
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-postgres-client-extension</artifactId>
+            <version>${project.version}</version>
+            <type>pom</type>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-postgres-persistence-extension</artifactId>
+            <version>${project.version}</version>
+            <type>pom</type>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-postgres-search-extension</artifactId>
+            <version>${project.version}</version>
+            <type>pom</type>
+            <exclusions>
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
         <!-- The "service allinone-like" PARENT classpath the child extension class loaders delegate to: the neutral
              SPI interfaces the provider classes implement, plus the pekko/config types their signatures reference. -->
         <dependency>
@@ -93,6 +145,8 @@
                             <goal>copy</goal>
                         </goals>
                         <configuration>
+                            <!-- nothing to stage when the ITs are skipped (image builds run -DskipTests -DskipITs) -->
+                            <skip>${skipITs}</skip>
                             <outputDirectory>${ditto.postgres.extensions.dir}</outputDirectory>
                             <stripVersion>true</stripVersion>
                             <overWriteReleases>true</overWriteReleases>
