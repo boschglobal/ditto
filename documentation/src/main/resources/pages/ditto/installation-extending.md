@@ -341,6 +341,14 @@ Pool sizing, SSL and credentials are **not** search-specific — they come from 
 
 * **`pg_trgm` extension:** the search schema requires the `pg_trgm` extension (used for `like`/`ilike` trigram indexes). It is a *trusted* extension on PostgreSQL ≥ 13, so `CREATE EXTENSION IF NOT EXISTS pg_trgm` on the target database succeeds for the DDL role without superuser; the schema bootstrap fails with an actionable error if the role is not permitted to create it.
 * **Migration = re-index only:** the search index is a rebuildable projection of the things data, so the cutover to Postgres is simply to point search at an empty PostgreSQL database and let the background-sync stream regenerate the index. There is no copy tooling and none is needed. Search results are incomplete until the initial re-index (background sync) finishes — plan this re-index window into the cutover.
+* **Speeding up very large re-indexes (optional):** every row written during the initial re-index pays incremental maintenance on the `sf_trgm` trigram GIN index, and a bulk GIN build after the data is loaded is much faster than the same work done insert-by-insert. For very large populations an operator may `DROP INDEX sf_trgm` before starting the backfill and recreate it once the re-index has caught up:
+
+  ```sql
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS sf_trgm ON search_flat
+      USING gin ((val_text COLLATE "C.utf8") gin_trgm_ops) WHERE val_text IS NOT NULL;
+  ```
+
+  While the index is absent, `like`/`ilike` queries fall back to scans — everything else is unaffected. Recreate it **before** the next search-service restart: the schema bootstrap re-runs `CREATE INDEX IF NOT EXISTS sf_trgm` at every start, so a restart would otherwise rebuild it as a plain (blocking, non-concurrent) build against the by-then-populated table. This is purely an optimisation — by default GIN's `fastupdate` pending list amortises per-insert cost, and the re-index works fine with the index in place.
 * **`like`/`ilike` performance caveat:** sub-3-character `like`/`ilike` patterns and high-cardinality-path `ilike` cannot be fully served by the trigram index and degrade to a scan — mirroring MongoDB's own unanchored-regex degradation. The slow-query log catches abuse. Per-path scoped trigram indexes are under evaluation as a possible future mitigation but are not part of this release.
 * **Mongo-only search knobs:** search settings specific to MongoDB (e.g. per-metric MongoDB index hints, custom MongoDB search indexes) are ignored (logged with a WARN) when the PostgreSQL search backend is active.
 

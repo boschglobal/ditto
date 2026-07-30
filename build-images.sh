@@ -59,6 +59,27 @@ build_docker_image() {
   if [ -n "$NO_DOCKER_CACHE" ]; then
     no_cache_option=--no-cache
   fi;
+
+  # Always (re)create the extensions staging dir the dockerfile COPYs; populate it with the Postgres
+  # extension JARs (must come from the same reactor build as the allinone JARs — a boot self-check
+  # fails fast on mismatch) when BAKE_POSTGRES_EXTENSIONS=true.
+  extensions_dir="$SCRIPTDIR/$module_name_base/service/target/extensions"
+  rm -rf "$extensions_dir"
+  mkdir -p "$extensions_dir"
+  if [[ "$BAKE_POSTGRES_EXTENSIONS" == "true" ]]; then
+    case "$module_name_base" in
+      policies|things|connectivity)
+        cp "$SCRIPTDIR/internal/utils/postgres-client-extension/target/ditto-postgres-client-extension-$SERVICE_VERSION.jar" \
+          "$SCRIPTDIR/internal/utils/postgres-persistence-extension/target/ditto-postgres-persistence-extension-$SERVICE_VERSION.jar" \
+          "$extensions_dir/"
+        ;;
+      thingsearch)
+        cp "$SCRIPTDIR/internal/utils/postgres-client-extension/target/ditto-postgres-client-extension-$SERVICE_VERSION.jar" \
+          "$SCRIPTDIR/internal/utils/postgres-search-extension/target/ditto-postgres-search-extension-$SERVICE_VERSION.jar" \
+          "$extensions_dir/"
+        ;;
+    esac
+  fi
   printf "\nBuilding Docker image <%s> for service module <%s> with jvm_args <%s>\n" \
     "$image_tag" \
     "$module_name" \

@@ -93,16 +93,20 @@ start_pg_service() { # name allinone-jar main-class overlay-file extra-env-assig
 }
 
 start_dev_service() { # name allinone-jar main-class extra-env...
+  # -cp + explicit main class (NOT -jar): keeps the launch style identical to start_pg_service, so jps lists
+  # every service by its main class instead of showing the gateway as a jar file name.
   local name="$1" jar="$2" main="$3"; shift 3
   ( for kv in "$@"; do export "$kv"; done
-    exec java --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED \
-      -Xms512m -Xmx512m -jar "$jar" "$main" 2>/dev/null || \
     exec java --add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.util=ALL-UNNAMED \
       -Xms512m -Xmx512m -cp "$jar" "$main"
   ) > "/tmp/${name}-pg.log" 2>&1 &
   echo "  ${name} pid $! -> /tmp/${name}-pg.log"
 }
 
+# All services start concurrently: every dev profile seeds on pekko://ditto-cluster@127.0.0.1:2552 (Policies'
+# artery port). Policies is the FIRST entry in its own seed list, so it self-joins and founds ditto-cluster;
+# the others retry that seed until it answers (shutdown-after-unsuccessful-join-seed-nodes = 60s, far longer
+# than a local Policies boot) — no staged waits needed.
 echo "Starting Policies (Postgres) ..."
 # No snapshot-adapter override: AbstractPersistenceActor composes the per-service snapshot-serializer with the
 # Postgres provider's JSONB snapshot codec automatically once the Postgres persistence profile is included.
@@ -110,9 +114,6 @@ start_pg_service policies \
   "policies/service/target/ditto-policies-service-0-SNAPSHOT-allinone.jar" \
   org.eclipse.ditto.policies.service.starter.PoliciesService \
   "${OVERLAY_DIR}/policies-postgres.conf"
-
-echo "Waiting for Policies cluster to form (founder) ..."
-sleep 20
 
 echo "Starting Things (Postgres) ..."
 # No snapshot-adapter override: the Postgres provider's JSONB snapshot codec is selected automatically.
