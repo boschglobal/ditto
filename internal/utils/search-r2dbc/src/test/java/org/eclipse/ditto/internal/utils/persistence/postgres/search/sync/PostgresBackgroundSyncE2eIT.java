@@ -86,7 +86,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
- * Background-sync end-to-end IT against the REAL Postgres search backend (plan Phase G, bullet 2): five scenarios
+ * Background-sync end-to-end IT against the REAL Postgres search backend (plan Phase G, bullet 2): six scenarios
  * proving that the production sync machinery detects and repairs index inconsistencies on a real PG 16 container.
  * <p>
  * The pipeline under test is the production one — the REAL {@link BackgroundSyncStream} (thingsearch/service MAIN
@@ -121,7 +121,9 @@ import reactor.core.publisher.Mono;
  *     <li>imported-policy staleness: detected from the FULL referenced policy tags (id+revision) that
  *     {@code sudoStreamMetadata} rebuilds from the {@code referenced_policies} column (C2/C3 adjudication);</li>
  *     <li>force-update: a bit-wrong but revision-equal row is INVISIBLE to the normal comparison (pinned) and is
- *     rewritten by the force route's unconditional upsert.</li>
+ *     rewritten by the force route's unconditional upsert;</li>
+ *     <li>tolerance window: index rows modified inside the window are skipped on both index-side branches; zero
+ *     window flags them all.</li>
  * </ol>
  * <p>
  * NOTE (scenarios 3 &amp; 4): the REPAIRED write model these scenarios re-index is hand-authored in the test (the
@@ -416,6 +418,46 @@ public final class PostgresBackgroundSyncE2eIT {
     }
 
     // ================================================================================================================
+    // scenario 6 — tolerance window on the Postgres-provided t_modified
+    // ================================================================================================================
+
+    /**
+     * {@code background-sync.tolerance-window} is applied by the shared {@link BackgroundSyncStream} to
+     * {@code Metadata.getModified()} of the INDEXED entry. On Postgres that value is {@code search_things.t_modified},
+     * written by {@link PostgresSearchUpdaterFlow} from the thing's {@code _modified} and rebuilt by
+     * {@code sudoStreamMetadata} — this scenario proves the round trip feeds the window check on the two gates that
+     * read the index-side timestamp — the equal-IDs gate (revision / policy-id / policies mismatches) and the
+     * indexed-but-not-persisted gate; the persisted-but-not-indexed gate reads the things-side snapshot timestamp and
+     * is backend-independent by construction, hence not exercised here.
+     */
+    @Test
+    public void indexEntriesModifiedInsideTheToleranceWindowAreSkippedOnPostgres() {
+        final PolicyId policy = PolicyId.of(NS, "sync-policy-tolerance");
+        final ThingId recentStale = ThingId.of(NS, "sync-j-recent-stale");
+        final ThingId oldStale = ThingId.of(NS, "sync-k-old-stale");
+        final ThingId recentOrphan = ThingId.of(NS, "sync-l-recent-orphan");
+        final Instant justNow = Instant.now();
+
+        // index side: all three rows at revision 1; ONLY t_modified differs (just now vs. 2020).
+        index(doc(recentStale, 1L, policy, 1L, refs(policy, 1L), "red", List.of("s1"), justNow));
+        index(doc(oldStale, 1L, policy, 1L, refs(policy, 1L), "red", List.of("s1"), OLD_MODIFIED));
+        index(doc(recentOrphan, 1L, policy, 1L, refs(policy, 1L), "red", List.of("s1"), justNow));
+        // things side: the two "stale" things moved on to revision 2; the orphan does not exist there at all.
+        final List<Metadata> thingsSide = List.of(
+                thingsSideMetadata(recentStale, 2L, policy),
+                thingsSideMetadata(oldStale, 2L, policy));
+        final Map<PolicyId, Policy> policies = policies(policyOf(policy, 1L));
+
+        // 5-minute window: the rows modified just now are left alone (the equal-IDs gate and the
+        // indexed-but-not-persisted gate both consult the index-side t_modified); the 2020 row is flagged as usual.
+        assertThat(thingIds(runSync(policies, thingsSide, TOLERANCE))).containsExactly(oldStale.toString());
+
+        // zero window, same rows: all three are flagged — the window gated them, not the data.
+        assertThat(thingIds(runSync(policies, thingsSide, Duration.ZERO)))
+                .containsExactly(recentStale.toString(), oldStale.toString(), recentOrphan.toString());
+    }
+
+    // ================================================================================================================
     // sync-run plumbing
     // ================================================================================================================
 
@@ -424,10 +466,15 @@ public final class PostgresBackgroundSyncE2eIT {
      * {@code sudoStreamMetadata} search-side stream, policy lookups answered by the stub policies shard.
      */
     private List<Metadata> runSync(final Map<PolicyId, Policy> policies, final List<Metadata> thingsSide) {
+        return runSync(policies, thingsSide, TOLERANCE);
+    }
+
+    private List<Metadata> runSync(final Map<PolicyId, Policy> policies, final List<Metadata> thingsSide,
+            final Duration toleranceWindow) {
         final ActorRef policiesShardStub = system.actorOf(PoliciesShardStub.props(policies));
         try {
             final BackgroundSyncStream syncStream = BackgroundSyncStream.of(policiesShardStub,
-                    Duration.ofSeconds(10), TOLERANCE, 100, Duration.ofSeconds(1),
+                    Duration.ofSeconds(10), toleranceWindow, 100, Duration.ofSeconds(1),
                     DefaultNamespacePoliciesConfig.of(ConfigFactory.empty()));
             return run(syncStream.filterForInconsistencies(
                     Source.from(thingsSide), persistence.sudoStreamMetadata(fromStart())));
@@ -550,6 +597,14 @@ public final class PostgresBackgroundSyncE2eIT {
     private static SearchIndexDocument doc(final ThingId thingId, final long revision, final PolicyId policyId,
             final long policyRevision, final Set<PolicyTag> referencedPolicies, final String color,
             final List<String> readSubjects) {
+        return doc(thingId, revision, policyId, policyRevision, referencedPolicies, color, readSubjects,
+                OLD_MODIFIED);
+    }
+
+    /** Same document, with an explicit {@code _modified} (what the Postgres writer stores as {@code t_modified}). */
+    private static SearchIndexDocument doc(final ThingId thingId, final long revision, final PolicyId policyId,
+            final long policyRevision, final Set<PolicyTag> referencedPolicies, final String color,
+            final List<String> readSubjects, final Instant modified) {
         final JsonObjectBuilder grants = JsonObject.newBuilder();
         for (final String subject : readSubjects) {
             grants.set(subject, JsonObject.empty());
@@ -558,7 +613,7 @@ public final class PostgresBackgroundSyncE2eIT {
                 .set("thingId", thingId.toString())
                 .set("_namespace", thingId.getNamespace())
                 .set("_revision", (int) revision)
-                .set("_modified", OLD_MODIFIED.toString())
+                .set("_modified", modified.toString())
                 .set("attributes", JsonObject.newBuilder().set("color", color).build())
                 .build();
         return SearchIndexDocument.newBuilder(thingId)

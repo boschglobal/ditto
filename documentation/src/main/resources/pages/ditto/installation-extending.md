@@ -354,6 +354,26 @@ Pool sizing, SSL and credentials are **not** search-specific — they come from 
 
 {% include note.html content="A `search-update-mapper` custom extension implementation must be re-typed to the backend-neutral write model to work with this release — see the release notes for the `SearchUpdateMapper` breaking change and migration guide. Custom `search-update-observer` implementations need no change." %}
 
+#### Background-sync and updater-stream settings — identical on PostgreSQL
+
+The `ditto.search.updater` settings listed below are consumed by the backend-neutral service layer
+(`SearchUpdaterRootActor`, `BackgroundSyncActor`, `ThingUpdater`, `PolicyModificationForwarder`, `EnforcementFlow`)
+and therefore behave exactly the same whether the index lives in MongoDB or PostgreSQL. The `ditto-postgres-search`
+profile does not define or override any `ditto.search.*` key, so the usual environment overrides keep working
+unchanged. (`stream.persistence.with-acks-writeConcern` is a MongoDB write concern and has no effect on PostgreSQL.)
+
+| Setting (`ditto.search.updater.…`) | Env override | On PostgreSQL |
+|---|---|---|
+| `event-processing-active` | `EVENT_PROCESSING_ACTIVE` | identical (service-level flag, not backend-specific) |
+| `background-sync.enabled` | `BACKGROUND_SYNC_ENABLED` | identical — gates the background-sync actor's wake-up |
+| `background-sync.quiet-period` | `BACKGROUND_SYNC_QUIET_PERIOD` | identical — start-up delay and bookmark interval; the bookmark is the single row of the `search_sync` table (the MongoDB capped-collection equivalent) |
+| `background-sync.tolerance-window` | `BACKGROUND_SYNC_TOLERANCE_WINDOW` | identical — compares against the thing's `_modified` timestamp, which the PostgreSQL backend stores in `search_things.t_modified` (`timestamptz`, microsecond precision) |
+| `stream.write-interval` | `THINGS_SEARCH_UPDATER_STREAM_WRITE_INTERVAL` | identical — the per-thing write tick lives in the updater actor; both backends receive one write per tick |
+| `stream.policy-cache.retry-delay`, `stream.thing-cache.retry-delay` | `THINGS_SEARCH_UPDATER_STREAM_POLICY_CACHE_RETRY_DELAY`, `THINGS_SEARCH_UPDATER_STREAM_THING_CACHE_RETRY_DELAY` | identical — enforcer-cache retry back-off in the shared enforcement flow (the policy-cache delay is parsed but currently not consumed; only the thing-cache delay drives the retry) |
+
+The only PostgreSQL-specific search tunables are the ones listed under *Operational tunables* above; there is no
+Postgres-side override of any background-sync or stream setting.
+
 ## Further reading
 
 * [Operating - Configuration](operating-configuration.html)

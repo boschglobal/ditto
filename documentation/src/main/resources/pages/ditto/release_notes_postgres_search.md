@@ -76,6 +76,22 @@ Search configuration specific to MongoDB — for example per-metric MongoDB inde
 search indexes — is **ignored (logged with a WARN)** when the PostgreSQL search backend is active. These knobs have no
 PostgreSQL analog and are safely left in place for Mongo-search deployments.
 
+## Background-sync and updater-stream settings — unchanged on PostgreSQL
+
+The `ditto.search.updater.*` settings listed here (`event-processing-active`, `background-sync.enabled` /
+`quiet-period` / `tolerance-window`, `stream.write-interval`, the `policy-cache` / `thing-cache` `retry-delay`s) are
+consumed by the backend-neutral updater layer and behave identically on PostgreSQL; the `ditto-postgres-search`
+profile defines no `ditto.search.*` key. The background-sync bookmark is persisted as a single row in the
+`search_sync` table and the tolerance-window comparison uses the thing's `_modified` timestamp stored in
+`search_things.t_modified`. `stream.persistence.with-acks-writeConcern` is a MongoDB write concern and has no effect
+on PostgreSQL.
+
+Independent of the backend, `search.conf` now binds `THINGS_SEARCH_UPDATER_STREAM_THING_CACHE_RETRY_DELAY` to
+`ditto.search.updater.stream.thing-cache.retry-delay`; previously that environment variable was silently ignored
+(the `policy-cache` counterpart was already bound). Note that `stream.policy-cache.retry-delay` is parsed but not
+consumed by the enforcement flow (only the thing-cache delay is), and `event-processing-active=false` only logs a
+warning — both are long-standing service-level behaviours, unrelated to the storage backend.
+
 ## Write-acknowledgement divergence for no-change re-writes
 
 One behavioral divergence is scoped to **write acknowledgements only and never affects query results**: when a thing
