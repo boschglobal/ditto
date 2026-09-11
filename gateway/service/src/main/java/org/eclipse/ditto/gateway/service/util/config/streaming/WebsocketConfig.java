@@ -41,11 +41,21 @@ public interface WebsocketConfig {
     /**
      * Returns the max buffer size of how many outstanding command responses and events a single web socket client
      * can have.
-     * Additional command responses and events are dropped if this size is reached.
+     * When the buffer is full, further command responses and events wait for buffer space, see
+     * {@link #getPublisherMaxPendingOffers()}.
      *
      * @return the buffer size.
      */
     int getPublisherBackpressureBufferSize();
+
+    /**
+     * Returns how many command responses and events may wait for space in the publisher buffer of a single web
+     * socket client.
+     * Additional command responses and events are dropped if this number is reached.
+     *
+     * @return the maximum number of pending offers.
+     */
+    int getPublisherMaxPendingOffers();
 
     /**
      * Returns the factor of maximum throughput at which rejections were sent.
@@ -73,6 +83,7 @@ public interface WebsocketConfig {
                 getSubscriberBackpressureQueueSize());
         map.put(WebsocketConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getConfigPath(),
                 getPublisherBackpressureBufferSize());
+        map.put(WebsocketConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getConfigPath(), getPublisherMaxPendingOffers());
         map.put(WebsocketConfigValue.THROTTLING_REJECTION_FACTOR.getConfigPath(), getThrottlingRejectionFactor());
         return ConfigFactory.parseMap(map)
                 .withFallback(getThrottlingConfig().render())
@@ -94,6 +105,12 @@ public interface WebsocketConfig {
          * The max buffer size of how many outstanding command responses and events a single web socket client can have.
          */
         PUBLISHER_BACKPRESSURE_BUFFER_SIZE("publisher.backpressure-buffer-size", 200),
+
+        /**
+         * How many command responses and events may wait for space in the publisher buffer of a single web socket
+         * client before further ones are dropped.
+         */
+        PUBLISHER_MAX_PENDING_OFFERS("publisher.max-pending-offers", 1000),
 
         /**
          * The factor of maximum throughput at which rejections were sent.

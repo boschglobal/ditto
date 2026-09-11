@@ -106,6 +106,8 @@ public final class StreamingSessionActorTest {
     public static final DittoTracingInitResource DITTO_TRACING_INIT_RESOURCE =
             DittoTracingInitResource.disableDittoTracing();
 
+    private static final int MAX_PENDING_OFFERS = 1000;
+
     private static AuthorizationContext authorizationContext;
 
     @Rule
@@ -629,6 +631,7 @@ public final class StreamingSessionActorTest {
 
     private Connect getConnect(final Set<AcknowledgementLabel> declaredAcks) {
         return new Connect(sourceQueue,
+                MAX_PENDING_OFFERS,
                 testName.getMethodName(),
                 "WS",
                 JsonSchemaVersion.LATEST,

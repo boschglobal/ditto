@@ -36,6 +36,7 @@ import org.eclipse.ditto.gateway.service.streaming.actors.SessionedJsonifiable;
 public final class Connect {
 
     private final SourceQueueWithComplete<SessionedJsonifiable> eventAndResponsePublisher;
+    private final int maxPendingOffers;
     private final String connectionCorrelationId;
     private final String type;
     private final JsonSchemaVersion jsonSchemaVersion;
@@ -50,6 +51,8 @@ public final class Connect {
      * Constructs a new {@link Connect} instance.
      *
      * @param eventAndResponsePublisher a source queue to push events and responses into.
+     * @param maxPendingOffers how many events and responses may wait for space in the buffer of
+     * {@code eventAndResponsePublisher} before further ones are dropped.
      * @param connectionCorrelationId the correlationId of the connection/session.
      * @param type the type of the "streaming" connection to establish.
      * @param jsonSchemaVersion schema version of the request for the streaming session.
@@ -61,6 +64,7 @@ public final class Connect {
      * @param killSwitch the kill switch to terminate the streaming session.
      */
     public Connect(final SourceQueueWithComplete<SessionedJsonifiable> eventAndResponsePublisher,
+            final int maxPendingOffers,
             final CharSequence connectionCorrelationId,
             final String type,
             final JsonSchemaVersion jsonSchemaVersion,
@@ -71,6 +75,7 @@ public final class Connect {
             final List<String> namespaces,
             @Nullable final KillSwitch killSwitch) {
         this.eventAndResponsePublisher = eventAndResponsePublisher;
+        this.maxPendingOffers = maxPendingOffers;
         this.connectionCorrelationId = checkNotNull(connectionCorrelationId, "connectionCorrelationId")
                 .toString();
         this.type = type;
@@ -85,6 +90,16 @@ public final class Connect {
 
     public SourceQueueWithComplete<SessionedJsonifiable> getEventAndResponsePublisher() {
         return eventAndResponsePublisher;
+    }
+
+    /**
+     * Returns how many events and responses may wait for space in the buffer of the event and response publisher
+     * before further ones are dropped.
+     *
+     * @return the maximum number of pending offers.
+     */
+    public int getMaxPendingOffers() {
+        return maxPendingOffers;
     }
 
     public String getConnectionCorrelationId() {
@@ -133,6 +148,7 @@ public final class Connect {
         }
         final Connect connect = (Connect) o;
         return Objects.equals(eventAndResponsePublisher, connect.eventAndResponsePublisher) &&
+                maxPendingOffers == connect.maxPendingOffers &&
                 Objects.equals(connectionCorrelationId, connect.connectionCorrelationId) &&
                 Objects.equals(type, connect.type) &&
                 Objects.equals(sessionExpirationTime, connect.sessionExpirationTime) &&
@@ -145,14 +161,16 @@ public final class Connect {
 
     @Override
     public int hashCode() {
-        return Objects.hash(eventAndResponsePublisher, connectionCorrelationId, type, sessionExpirationTime,
-                declaredAcknowledgementLabels, connectionAuthContext, connectionHeaders, namespaces, killSwitch);
+        return Objects.hash(eventAndResponsePublisher, maxPendingOffers, connectionCorrelationId, type,
+                sessionExpirationTime, declaredAcknowledgementLabels, connectionAuthContext, connectionHeaders,
+                namespaces, killSwitch);
     }
 
     @Override
     public String toString() {
         return getClass().getSimpleName() + " [" +
                 "eventAndResponsePublisher=" + eventAndResponsePublisher +
+                ", maxPendingOffers=" + maxPendingOffers +
                 ", connectionCorrelationId=" + connectionCorrelationId +
                 ", type=" + type +
                 ", sessionExpirationTime=" + sessionExpirationTime +

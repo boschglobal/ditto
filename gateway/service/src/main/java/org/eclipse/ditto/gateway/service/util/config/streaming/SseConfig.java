@@ -34,18 +34,32 @@ public interface SseConfig {
 
     /**
      * Returns the max buffer size of how many outstanding events a single SSE client can have.
-     * When the buffer is full, the upstream is backpressured.
+     * When the buffer is full, further events wait for buffer space, see {@link #getPublisherMaxPendingOffers()}.
      *
      * @return the buffer size.
      */
     int getPublisherBackpressureBufferSize();
+
+    /**
+     * Returns how many events may wait for space in the publisher buffer of a single SSE client.
+     * Additional events are dropped if this number is reached.
+     *
+     * @return the maximum number of pending offers.
+     */
+    int getPublisherMaxPendingOffers();
 
     enum SseConfigValue implements KnownConfigValue {
 
         /**
          * The max buffer size of how many outstanding events a single SSE client can have.
          */
-        PUBLISHER_BACKPRESSURE_BUFFER_SIZE("publisher.backpressure-buffer-size", 100);
+        PUBLISHER_BACKPRESSURE_BUFFER_SIZE("publisher.backpressure-buffer-size", 100),
+
+        /**
+         * How many events may wait for space in the publisher buffer of a single SSE client before further ones are
+         * dropped.
+         */
+        PUBLISHER_MAX_PENDING_OFFERS("publisher.max-pending-offers", 1000);
 
         private final String path;
         private final Object defaultValue;

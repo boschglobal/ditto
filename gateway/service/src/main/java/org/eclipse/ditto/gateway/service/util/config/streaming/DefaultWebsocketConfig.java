@@ -30,6 +30,7 @@ final class DefaultWebsocketConfig implements WebsocketConfig {
 
     private final int subscriberBackpressureQueueSize;
     private final int publisherBackpressureBufferSize;
+    private final int publisherMaxPendingOffers;
     private final double throttlingRejectionFactor;
     private final ThrottlingConfig throttlingConfig;
 
@@ -38,6 +39,8 @@ final class DefaultWebsocketConfig implements WebsocketConfig {
                 scopedConfig.getPositiveIntOrThrow(WebsocketConfigValue.SUBSCRIBER_BACKPRESSURE_QUEUE_SIZE);
         publisherBackpressureBufferSize =
                 scopedConfig.getPositiveIntOrThrow(WebsocketConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE);
+        publisherMaxPendingOffers =
+                scopedConfig.getPositiveIntOrThrow(WebsocketConfigValue.PUBLISHER_MAX_PENDING_OFFERS);
         throttlingRejectionFactor =
                 scopedConfig.getNonNegativeDoubleOrThrow(WebsocketConfigValue.THROTTLING_REJECTION_FACTOR);
         throttlingConfig = ThrottlingConfig.of(scopedConfig);
@@ -66,6 +69,11 @@ final class DefaultWebsocketConfig implements WebsocketConfig {
     }
 
     @Override
+    public int getPublisherMaxPendingOffers() {
+        return publisherMaxPendingOffers;
+    }
+
+    @Override
     public double getThrottlingRejectionFactor() {
         return throttlingRejectionFactor;
     }
@@ -86,6 +94,7 @@ final class DefaultWebsocketConfig implements WebsocketConfig {
         final DefaultWebsocketConfig that = (DefaultWebsocketConfig) o;
         return subscriberBackpressureQueueSize == that.subscriberBackpressureQueueSize &&
                 publisherBackpressureBufferSize == that.publisherBackpressureBufferSize &&
+                publisherMaxPendingOffers == that.publisherMaxPendingOffers &&
                 Double.compare(throttlingRejectionFactor, that.throttlingRejectionFactor) == 0 &&
                 Objects.equals(throttlingConfig, that.throttlingConfig);
     }
@@ -93,7 +102,7 @@ final class DefaultWebsocketConfig implements WebsocketConfig {
     @Override
     public int hashCode() {
         return Objects.hash(subscriberBackpressureQueueSize, publisherBackpressureBufferSize,
-                throttlingRejectionFactor, throttlingConfig);
+                publisherMaxPendingOffers, throttlingRejectionFactor, throttlingConfig);
     }
 
     @Override
@@ -101,6 +110,7 @@ final class DefaultWebsocketConfig implements WebsocketConfig {
         return getClass().getSimpleName() + " [" +
                 "subscriberBackpressureQueueSize=" + subscriberBackpressureQueueSize +
                 ", publisherBackpressureBufferSize=" + publisherBackpressureBufferSize +
+                ", publisherMaxPendingOffers=" + publisherMaxPendingOffers +
                 ", throttlingRejectionFactor=" + throttlingRejectionFactor +
                 ", throttlingConfig=" + throttlingConfig +
                 "]";

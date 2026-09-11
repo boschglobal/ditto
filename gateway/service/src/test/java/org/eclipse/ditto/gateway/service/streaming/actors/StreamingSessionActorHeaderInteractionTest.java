@@ -194,7 +194,7 @@ public final class StreamingSessionActorHeaderInteractionTest {
 
     private ActorRef createStreamingSessionActor() {
         final Connect connect =
-                new Connect(sourceQueue, "connectionCorrelationId", "ws",
+                new Connect(sourceQueue, 1000, "connectionCorrelationId", "ws",
                         JsonSchemaVersion.V_2, null, Set.of(), AuthorizationModelFactory.emptyAuthContext(),
                         DittoHeaders.empty(),
                         List.of(),

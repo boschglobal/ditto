@@ -575,7 +575,9 @@ public final class WebSocketRoute implements WebSocketRouteBuilder {
                         withQueue -> {
                             webSocketSupervisor.supervise(withQueue.getSupervisedStream(), connectionCorrelationId,
                                     additionalHeaders);
-                            return new Connect(withQueue.getSourceQueue(), connectionCorrelationId, STREAMING_TYPE_WS,
+                            return new Connect(withQueue.getSourceQueue(),
+                                    websocketConfig.getPublisherMaxPendingOffers(),
+                                    connectionCorrelationId, STREAMING_TYPE_WS,
                                     version, optJsonWebToken.map(JsonWebToken::getExpirationTime).orElse(null),
                                     readDeclaredAcknowledgementLabels(additionalHeaders), connectionAuthContext,
                                     additionalHeaders,

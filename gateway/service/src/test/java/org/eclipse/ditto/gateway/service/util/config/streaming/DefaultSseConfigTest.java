@@ -53,6 +53,9 @@ public final class DefaultSseConfigTest {
         softly.assertThat(underTest.getPublisherBackpressureBufferSize())
                 .as(SseConfig.SseConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getConfigPath())
                 .isEqualTo(SseConfig.SseConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getDefaultValue());
+        softly.assertThat(underTest.getPublisherMaxPendingOffers())
+                .as(SseConfig.SseConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getConfigPath())
+                .isEqualTo(SseConfig.SseConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getDefaultValue());
     }
 
     @Test
@@ -62,6 +65,9 @@ public final class DefaultSseConfigTest {
         softly.assertThat(underTest.getPublisherBackpressureBufferSize())
                 .as(SseConfig.SseConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getConfigPath())
                 .isEqualTo(77);
+        softly.assertThat(underTest.getPublisherMaxPendingOffers())
+                .as(SseConfig.SseConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getConfigPath())
+                .isEqualTo(7777);
         softly.assertThat(underTest.getThrottlingConfig().getInterval())
                 .as("throttling.interval")
                 .isEqualTo(Duration.ofSeconds(8L));
