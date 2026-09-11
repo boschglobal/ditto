@@ -2629,8 +2629,13 @@ gateway:
       # publisher contains the configuration for sending/publishing data via the websocket
       publisher:
         # backpressureBufferSize is the max buffer size of how many outstanding CommandResponses and Events a single
-        #  websocket client can have - additional CommandResponses and Events are dropped if this size is reached
+        #  websocket client can have
         backpressureBufferSize: 200
+        # maxPendingOffers is how many additional CommandResponses and Events may wait for buffer space before
+        #  further CommandResponses and Events are dropped - each waiting element retains its whole message, so a
+        #  session whose client stopped consuming holds up to
+        #  (backpressureBufferSize + maxPendingOffers) * message size
+        maxPendingOffers: 1000
       # throttling contains the throttling configuration of a single websocket session
       throttling:
         # enabled whether throttling message consumption via a single websocket session is enabled
@@ -2644,9 +2649,12 @@ gateway:
     sse:
       # publisher contains the configuration for sending/publishing data via SSE
       publisher:
-        # backpressureBufferSize is the max buffer size of how many outstanding events a single SSE client can have -
-        #  when the buffer is full, the upstream is backpressured (no events are dropped)
+        # backpressureBufferSize is the max buffer size of how many outstanding events a single SSE client can have
         backpressureBufferSize: 100
+        # maxPendingOffers is how many additional events may wait for buffer space before further events are
+        #  dropped - each waiting element retains its whole message, so a session whose client stopped consuming
+        #  holds up to (backpressureBufferSize + maxPendingOffers) * message size
+        maxPendingOffers: 1000
       # throttling contains the throttling configuration of a single SSE session (only applies for search via SSE)
       throttling:
         # enabled whether throttling message publishing via a single websocket session is enabled

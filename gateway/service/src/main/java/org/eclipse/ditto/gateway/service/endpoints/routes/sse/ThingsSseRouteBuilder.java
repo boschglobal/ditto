@@ -456,7 +456,9 @@ public final class ThingsSseRouteBuilder extends RouteDirectives implements SseR
                                             .orElse(JsonSchemaVersion.LATEST);
                                     sseConnectionSupervisor.supervise(withQueue.getSupervisedStream(),
                                             connectionCorrelationId, dittoHeaders);
-                                    final var connect = new Connect(withQueue.getSourceQueue(), connectionCorrelationId,
+                                    final var connect = new Connect(withQueue.getSourceQueue(),
+                                            streamingConfig.getSseConfig().getPublisherMaxPendingOffers(),
+                                            connectionCorrelationId,
                                             STREAMING_TYPE_SSE, jsonSchemaVersion, null, Set.of(),
                                             authorizationContext, dittoHeaders, namespaces, null);
                                     Patterns.ask(streamingActor, connect, LOCAL_ASK_TIMEOUT)
@@ -533,7 +535,10 @@ public final class ThingsSseRouteBuilder extends RouteDirectives implements SseR
                                                 connectionCorrelationId, dittoHeaders);
                                         final var authorizationContext = dittoHeaders.getAuthorizationContext();
                                         final var connect =
-                                                new Connect(withQueue.getSourceQueue(), connectionCorrelationId,
+                                                new Connect(withQueue.getSourceQueue(),
+                                                        streamingConfig.getSseConfig()
+                                                                .getPublisherMaxPendingOffers(),
+                                                        connectionCorrelationId,
                                                         STREAMING_TYPE_SSE, jsonSchemaVersion, null, Set.of(),
                                                         authorizationContext, dittoHeaders, namespaces, null);
                                         final String resourcePathRqlStatement;

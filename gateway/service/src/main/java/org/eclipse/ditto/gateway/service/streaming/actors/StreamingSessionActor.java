@@ -18,9 +18,11 @@ import java.util.Collection;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.annotation.Nullable;
 
@@ -92,6 +94,8 @@ import org.eclipse.ditto.gateway.service.streaming.signals.RefreshSession;
 import org.eclipse.ditto.gateway.service.streaming.signals.StartStreaming;
 import org.eclipse.ditto.gateway.service.streaming.signals.StopStreaming;
 import org.eclipse.ditto.gateway.service.util.config.streaming.StreamingConfig;
+import org.eclipse.ditto.internal.utils.metrics.DittoMetrics;
+import org.eclipse.ditto.internal.utils.metrics.instruments.counter.Counter;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoLoggerFactory;
 import org.eclipse.ditto.internal.utils.pekko.logging.ThreadSafeDittoLoggingAdapter;
 import org.eclipse.ditto.internal.utils.pubsub.StreamingType;
@@ -133,6 +137,14 @@ final class StreamingSessionActor extends AbstractActorWithTimers {
      */
     private static final Duration MAX_SESSION_TIMEOUT = Duration.ofDays(100L);
 
+    private static final String STREAMING_MESSAGES_METRIC = "streaming_messages";
+
+    /**
+     * Elements dropped by the publisher queue are logged at WARN level for the first one and for every n-th one
+     * afterwards; the remaining ones are logged at DEBUG level only.
+     */
+    private static final long DROPPED_WARN_INTERVAL = 1000L;
+
     private final JsonSchemaVersion jsonSchemaVersion;
     private final String connectionCorrelationId;
     private final String type;
@@ -151,6 +163,9 @@ final class StreamingSessionActor extends AbstractActorWithTimers {
     private final ThreadSafeDittoLoggingAdapter logger;
     private final Map<String, NamespaceAccessValidator> namespaceAccessValidatorsByType;
     private final DittoHeaders connectionHeaders;
+    private final int publisherMaxPendingOffers;
+    private final Counter droppedPublisherMessagesCounter;
+    private final AtomicLong droppedPublisherMessages = new AtomicLong();
     private AuthorizationContext authorizationContext;
     private List<String> namespaces;
 
@@ -173,7 +188,16 @@ final class StreamingSessionActor extends AbstractActorWithTimers {
         connectionCorrelationId = connect.getConnectionCorrelationId();
         type = connect.getType();
         this.dittoProtocolSub = dittoProtocolSub;
-        eventAndResponsePublisher = connect.getEventAndResponsePublisher();
+        // the logger is used by the overflow callback below, which escapes this constructor
+        logger = DittoLoggerFactory.getThreadSafeDittoLoggingAdapter(this)
+                .withCorrelationId(connectionCorrelationId);
+        publisherMaxPendingOffers = connect.getMaxPendingOffers();
+        droppedPublisherMessagesCounter = DittoMetrics.counter(STREAMING_MESSAGES_METRIC)
+                .tag("type", type.toLowerCase(Locale.ENGLISH))
+                .tag("direction", "out-dropped");
+        // the fire-and-forget offers below would lose elements under bursts, see SequentialSourceQueue
+        eventAndResponsePublisher = SequentialSourceQueue.of(connect.getEventAndResponsePublisher(),
+                publisherMaxPendingOffers, this::publisherOverflow);
         this.commandForwarder = commandForwarder;
         this.streamingConfig = streamingConfig;
         this.jwtValidator = jwtValidator;
@@ -210,14 +234,32 @@ final class StreamingSessionActor extends AbstractActorWithTimers {
                         ThingCommandResponseAcknowledgementProvider.getInstance(),
                         MessageCommandResponseAcknowledgementProvider.getInstance()
                 ));
-        logger = DittoLoggerFactory.getThreadSafeDittoLoggingAdapter(this)
-                .withCorrelationId(connectionCorrelationId);
         connect.getSessionExpirationTime().ifPresent(this::startSessionTimeout);
         subscriptionManager = getContext().actorOf(subscriptionManagerProps, SubscriptionManager.ACTOR_NAME);
         streamingSubscriptionManager = getContext().actorOf(streamingSubscriptionManagerProps,
                 StreamingSubscriptionManager.ACTOR_NAME);
         declaredAcks = connect.getDeclaredAcknowledgementLabels();
         startSubscriptionRefreshTimer();
+    }
+
+    /**
+     * Called by the publisher queue for each element it drops because the client does not consume fast enough.
+     *
+     * @param dropped the element which is not published.
+     */
+    private void publisherOverflow(final SessionedJsonifiable dropped) {
+        droppedPublisherMessagesCounter.increment();
+        final long droppedInSession = droppedPublisherMessages.incrementAndGet();
+        if (1L == droppedInSession || 0L == droppedInSession % DROPPED_WARN_INTERVAL) {
+            logger.warning("Dropping <{}> in <{}> session because more than <{}> messages are waiting to be " +
+                            "published - the client does not consume fast enough; <{}> messages were dropped in " +
+                            "this session so far.",
+                    dropped.getJsonifiable().getClass().getSimpleName(), type, publisherMaxPendingOffers,
+                    droppedInSession);
+        } else if (logger.isDebugEnabled()) {
+            logger.debug("Dropping <{}> in <{}> session; <{}> messages were dropped in this session so far.",
+                    dropped.getJsonifiable().getClass().getSimpleName(), type, droppedInSession);
+        }
     }
 
     /**

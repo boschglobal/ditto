@@ -59,6 +59,9 @@ public final class DefaultWebsocketConfigTest {
         softly.assertThat(underTest.getPublisherBackpressureBufferSize())
                 .as(WebsocketConfig.WebsocketConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getConfigPath())
                 .isEqualTo(WebsocketConfig.WebsocketConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getDefaultValue());
+        softly.assertThat(underTest.getPublisherMaxPendingOffers())
+                .as(WebsocketConfig.WebsocketConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getConfigPath())
+                .isEqualTo(WebsocketConfig.WebsocketConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getDefaultValue());
         softly.assertThat(underTest.getThrottlingRejectionFactor())
                 .as(WebsocketConfig.WebsocketConfigValue.THROTTLING_REJECTION_FACTOR.getConfigPath())
                 .isCloseTo((Double) WebsocketConfig.WebsocketConfigValue.THROTTLING_REJECTION_FACTOR.getDefaultValue(),
@@ -75,6 +78,9 @@ public final class DefaultWebsocketConfigTest {
         softly.assertThat(underTest.getPublisherBackpressureBufferSize())
                 .as(WebsocketConfig.WebsocketConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE.getConfigPath())
                 .isEqualTo(42);
+        softly.assertThat(underTest.getPublisherMaxPendingOffers())
+                .as(WebsocketConfig.WebsocketConfigValue.PUBLISHER_MAX_PENDING_OFFERS.getConfigPath())
+                .isEqualTo(4242);
         softly.assertThat(underTest.getThrottlingRejectionFactor())
                 .as(WebsocketConfig.WebsocketConfigValue.THROTTLING_REJECTION_FACTOR.getConfigPath())
                 .isCloseTo(1.875, Percentage.withPercentage(1.0));

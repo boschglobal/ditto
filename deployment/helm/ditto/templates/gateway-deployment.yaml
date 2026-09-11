@@ -261,6 +261,8 @@ spec:
               value: "{{ .Values.gateway.config.websocket.subscriber.backpressureQueueSize }}"
             - name: WS_PUBLISHER_BACKPRESSURE
               value: "{{ .Values.gateway.config.websocket.publisher.backpressureBufferSize }}"
+            - name: WS_PUBLISHER_MAX_PENDING_OFFERS
+              value: "{{ .Values.gateway.config.websocket.publisher.maxPendingOffers }}"
             - name: GATEWAY_WEBSOCKET_THROTTLING_ENABLED
               value: "{{ .Values.gateway.config.websocket.throttling.enabled }}"
             - name: GATEWAY_WEBSOCKET_THROTTLING_INTERVAL
@@ -269,6 +271,8 @@ spec:
               value: "{{ .Values.gateway.config.websocket.throttling.limit }}"
             - name: GATEWAY_SSE_PUBLISHER_BACKPRESSURE
               value: "{{ .Values.gateway.config.sse.publisher.backpressureBufferSize }}"
+            - name: GATEWAY_SSE_PUBLISHER_MAX_PENDING_OFFERS
+              value: "{{ .Values.gateway.config.sse.publisher.maxPendingOffers }}"
             - name: GATEWAY_SSE_THROTTLING_ENABLED
               value: "{{ .Values.gateway.config.sse.throttling.enabled }}"
             - name: GATEWAY_SSE_THROTTLING_INTERVAL

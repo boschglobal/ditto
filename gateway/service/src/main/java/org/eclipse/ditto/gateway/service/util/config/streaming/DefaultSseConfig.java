@@ -30,11 +30,14 @@ final class DefaultSseConfig implements SseConfig {
 
     private final ThrottlingConfig throttlingConfig;
     private final int publisherBackpressureBufferSize;
+    private final int publisherMaxPendingOffers;
 
     private DefaultSseConfig(final ScopedConfig scopedConfig) {
         throttlingConfig = ThrottlingConfig.of(scopedConfig);
         publisherBackpressureBufferSize =
                 scopedConfig.getPositiveIntOrThrow(SseConfigValue.PUBLISHER_BACKPRESSURE_BUFFER_SIZE);
+        publisherMaxPendingOffers =
+                scopedConfig.getPositiveIntOrThrow(SseConfigValue.PUBLISHER_MAX_PENDING_OFFERS);
     }
 
     /**
@@ -60,17 +63,23 @@ final class DefaultSseConfig implements SseConfig {
     }
 
     @Override
+    public int getPublisherMaxPendingOffers() {
+        return publisherMaxPendingOffers;
+    }
+
+    @Override
     public boolean equals(final Object o) {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         final DefaultSseConfig that = (DefaultSseConfig) o;
         return publisherBackpressureBufferSize == that.publisherBackpressureBufferSize &&
+                publisherMaxPendingOffers == that.publisherMaxPendingOffers &&
                 Objects.equals(throttlingConfig, that.throttlingConfig);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(throttlingConfig, publisherBackpressureBufferSize);
+        return Objects.hash(throttlingConfig, publisherBackpressureBufferSize, publisherMaxPendingOffers);
     }
 
     @Override
@@ -78,6 +87,7 @@ final class DefaultSseConfig implements SseConfig {
         return getClass().getSimpleName() + " [" +
                 "throttlingConfig=" + throttlingConfig +
                 ", publisherBackpressureBufferSize=" + publisherBackpressureBufferSize +
+                ", publisherMaxPendingOffers=" + publisherMaxPendingOffers +
                 "]";
     }
 
