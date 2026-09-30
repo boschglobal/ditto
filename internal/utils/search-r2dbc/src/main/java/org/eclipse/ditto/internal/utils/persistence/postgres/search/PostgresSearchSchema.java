@@ -85,6 +85,12 @@ public final class PostgresSearchSchema {
      */
     public static final String COLLATION = "C";
 
+    /**
+     * The libc collation of the {@code sf_trgm} trigram index expression {@code (val_text COLLATE "C.utf8")}. A
+     * {@code like}/{@code ilike} clause must match under exactly this collation for the planner to use the index.
+     */
+    public static final String TRIGRAM_INDEX_COLLATION = "C.utf8";
+
     private static final Map<String, String> SEARCH_THINGS_COLUMNS = orderedColumns(
             "thing_id", "text",
             "namespace", "text",
@@ -190,7 +196,8 @@ public final class PostgresSearchSchema {
         // Trigram GIN on (val_text COLLATE "C.utf8"): the collation override restores non-ASCII case folding for ILIKE
         // (Mongo $options:"i" parity) while eq/range/sort keep the plain COLLATE "C" column + sf_text (plan §3.2).
         statements.add("CREATE INDEX IF NOT EXISTS sf_trgm ON search_flat "
-                + "USING gin ((val_text COLLATE \"C.utf8\") gin_trgm_ops) WHERE val_text IS NOT NULL");
+                + "USING gin ((val_text COLLATE \"" + TRIGRAM_INDEX_COLLATION + "\") gin_trgm_ops) "
+                + "WHERE val_text IS NOT NULL");
 
         statements.add(createSearchSyncTable());
 

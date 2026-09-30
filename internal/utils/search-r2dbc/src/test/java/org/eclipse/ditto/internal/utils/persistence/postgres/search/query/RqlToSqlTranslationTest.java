@@ -15,6 +15,7 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.search.query;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.math.BigDecimal;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -172,6 +173,7 @@ public final class RqlToSqlTranslationTest {
     @Test
     public void likeBuildsNativeLikePatternFromWildcards() {
         final RenderedSql r = sudo(cf.fieldCriteria(fef.filterByAttribute("name"), cf.like("a*b?c")));
+        // no run of three literal letters/digits ⇒ plain predicate (see trigramLessLikeKeepsThePlainCollationPredicate)
         assertThat(r.sql()).isEqualTo("EXISTS (SELECT 1 FROM search_flat sf WHERE "
                 + "(sf.thing_id = st.thing_id AND sf.wpath = $1 AND sf.val_text LIKE $2 ESCAPE '\\'))");
         assertThat(r.bindValues()).containsExactly("/attributes/name", "a%b_c");
@@ -180,8 +182,105 @@ public final class RqlToSqlTranslationTest {
     @Test
     public void likeEscapesSqlWildcardCharacters() {
         final RenderedSql r = sudo(cf.fieldCriteria(fef.filterByAttribute("name"), cf.like("50%_x\\y")));
-        // literal % _ \ are backslash-escaped; there are no * or ? so nothing becomes a wildcard.
+        // literal % _ \ are backslash-escaped; there are no * or ? so nothing becomes a wildcard (and the pattern,
+        // having no wildcard at all, keeps the plain predicate).
         assertThat(r.bindValues().get(1)).isEqualTo("50\\%\\_x\\\\y");
+        assertThat(r.sql()).contains("sf.val_text LIKE $2 ESCAPE '\\'").doesNotContain("COLLATE");
+    }
+
+    @Test
+    public void prefixOnlyLikeKeepsThePlainCollationPredicate() {
+        // Prefix-only (no wildcard except a trailing run of *; also no wildcard at all): the plain COLLATE "C" column
+        // lets sf_text (wpath, val_text) serve the prefix as a range scan and keeps sf_trgm out of reach.
+        final Map<String, String> prefixOnly = Map.of(
+                "47*", "47%",
+                "47**", "47%%",
+                "47", "47",
+                "", "",
+                "*", "%",
+                "50%_*", "50\\%\\_%",
+                "a\\*", "a\\\\%", // RQL has no wildcard escape: a literal backslash, then the trailing wildcard
+                "building-7*", "building-7%");
+        prefixOnly.forEach((wildcards, sqlPattern) -> {
+            final RenderedSql r = sudo(cf.fieldCriteria(fef.filterByAttribute("zip"), cf.like(wildcards)));
+            assertThat(r.sql()).as(wildcards).isEqualTo("EXISTS (SELECT 1 FROM search_flat sf WHERE "
+                    + "(sf.thing_id = st.thing_id AND sf.wpath = $1 AND sf.val_text LIKE $2 ESCAPE '\\'))");
+            assertThat(r.bindValues()).as(wildcards).containsExactly("/attributes/zip", sqlPattern);
+        });
+    }
+
+    @Test
+    public void trigramLessLikeKeepsThePlainCollationPredicate() {
+        // Not prefix-only, but without a run of three consecutive literal letters/digits there is no guaranteed
+        // trigram ("trigram-less" here): unanchored short runs (*ab*, ?????) yield none, so sf_trgm could only be read
+        // in full (GIN_SEARCH_MODE_ALL) — a scan the planner mis-costs and picks on large paths; short runs at the
+        // pattern's start or end (*47, 47?, 4?*, ab?cd, *a_b*) may yield padded, typically unselective trigrams.
+        // These keep the plain predicate and, with it, the wpath-bounded plan they had before.
+        final Map<String, String> trigramLess = new LinkedHashMap<>();
+        trigramLess.put("*ab*", "%ab%");
+        trigramLess.put("?????", "_____");
+        trigramLess.put("*?", "%_");
+        trigramLess.put("*47", "%47");
+        trigramLess.put("47?", "47_");
+        trigramLess.put("4?*", "4_%");
+        trigramLess.put("ab?cd", "ab_cd");
+        trigramLess.put("*---*", "%---%");                // three literal characters, but no word characters
+        trigramLess.put("*a_b*", "%a\\_b%");              // a literal _ separates words for pg_trgm too
+        trigramLess.put("*\u00df*", "%\u00df%");           // *ß*
+        trigramLess.put("*\u65e5\u672c*", "%\u65e5\u672c%"); // *日本*
+        trigramLess.forEach((wildcards, sqlPattern) -> {
+            final RenderedSql r = sudo(cf.fieldCriteria(fef.filterByAttribute("name"), cf.like(wildcards)));
+            assertThat(r.sql()).as(wildcards).isEqualTo("EXISTS (SELECT 1 FROM search_flat sf WHERE "
+                    + "(sf.thing_id = st.thing_id AND sf.wpath = $1 AND sf.val_text LIKE $2 ESCAPE '\\'))");
+            assertThat(r.bindValues()).as(wildcards).containsExactly("/attributes/name", sqlPattern);
+        });
+    }
+
+    @Test
+    public void trigramBearingLikeMatchesUnderTrigramCollation() {
+        // Not prefix-only and with at least one run of three literal letters/digits (which always yields a trigram):
+        // matched under the sf_trgm index's collation, because the planner only uses an index whose collation equals
+        // the clause's, so the plain COLLATE "C" column can never reach sf_trgm. C and C.utf8 are both deterministic,
+        // so the matched rows are the same.
+        final Map<String, String> trigramBearing = new LinkedHashMap<>();
+        trigramBearing.put("*uildin*", "%uildin%");
+        trigramBearing.put("*abc*", "%abc%");            // exactly three: the boundary
+        trigramBearing.put("*147", "%147");
+        trigramBearing.put("?erlin", "_erlin");
+        trigramBearing.put("?uildin?", "_uildin_");
+        trigramBearing.put("47*123", "47%123");
+        trigramBearing.put("*ding-5000", "%ding-5000");
+        trigramBearing.put("*a\u00dfe", "%a\u00dfe");                    // *aße
+        trigramBearing.put("*\u65e5\u672c\u8a9e*", "%\u65e5\u672c\u8a9e%"); // *日本語*
+        trigramBearing.put("*\ud83d\ude42abc", "%\ud83d\ude42abc");     // astral code point, then abc
+        trigramBearing.forEach((wildcards, sqlPattern) -> {
+            final RenderedSql r = sudo(cf.fieldCriteria(fef.filterByAttribute("name"), cf.like(wildcards)));
+            assertThat(r.sql()).as(wildcards).isEqualTo("EXISTS (SELECT 1 FROM search_flat sf WHERE "
+                    + "(sf.thing_id = st.thing_id AND sf.wpath = $1 AND "
+                    + "sf.val_text COLLATE \"C.utf8\" LIKE $2 ESCAPE '\\'))");
+            assertThat(r.bindValues()).as(wildcards).containsExactly("/attributes/name", sqlPattern);
+        });
+    }
+
+    @Test
+    public void wildcardFeatureInfixLikeKeepsSameFeatureAuthCoupling() {
+        // features/* keeps its per-f_id shape: value and auth coupled to the SAME row a; only the like leaf changes.
+        final RenderedSql r = render(GetFilterSqlVisitor.apply(fef.filterByFeatureProperty("*", "prop0"),
+                new CreateSqlPredicateVisitor(List.of()).visitLikeWithWildcards("*uildin*"), SUBJECTS));
+        assertThat(r.sql()).startsWith("EXISTS (SELECT 1 FROM search_flat a WHERE "
+                + "(a.thing_id = st.thing_id AND a.wpath = $1 AND a.val_text COLLATE \"C.utf8\" LIKE $2 ESCAPE '\\' "
+                + "AND ");
+        assertThat(r.sql()).contains("jsonb_extract_path(st.features_auth, a.f_id");
+        assertThat(r.bindValues().get(0)).isEqualTo("/features/*/properties/prop0");
+        assertThat(r.bindValues().get(1)).isEqualTo("%uildin%");
+    }
+
+    @Test
+    public void rootMappedLikeKeepsThePlainColumnPredicate() {
+        // search_things.thing_id/namespace carry no trigram index: the column form stays plain for every pattern.
+        final RenderedSql r = sudo(cf.fieldCriteria(fef.filterByThingId(), cf.like("*scalars*")));
+        assertThat(r.sql()).isEqualTo("st.thing_id LIKE $1 ESCAPE '\\'");
+        assertThat(r.bindValues()).containsExactly("%scalars%");
     }
 
     @Test

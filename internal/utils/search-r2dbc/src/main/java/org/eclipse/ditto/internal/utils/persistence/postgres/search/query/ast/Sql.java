@@ -250,6 +250,12 @@ public final class Sql {
         return new Like(left, pattern, false, null);
     }
 
+    /** @return {@code left [COLLATE "c"] LIKE pattern ESCAPE '\'}. */
+    public static SqlExpression like(final SqlExpression left, final SqlExpression pattern,
+            @Nullable final String collation) {
+        return new Like(left, pattern, false, collation);
+    }
+
     /** @return {@code left [COLLATE "c"] ILIKE pattern ESCAPE '\'}. */
     public static SqlExpression ilike(final SqlExpression left, final SqlExpression pattern,
             @Nullable final String collation) {
