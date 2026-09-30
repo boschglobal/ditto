@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
@@ -31,12 +32,14 @@ import org.junit.Test;
 
 import io.r2dbc.spi.R2dbcBadGrammarException;
 import io.r2dbc.spi.R2dbcNonTransientResourceException;
+import io.r2dbc.spi.R2dbcTransientResourceException;
 
 import org.apache.pekko.actor.ActorRef;
 import org.apache.pekko.persistence.AtomicWrite;
 import org.apache.pekko.persistence.PersistentRepr;
 
 import reactor.core.publisher.Mono;
+import reactor.pool.PoolAcquirePendingLimitException;
 
 /**
  * Unit tests pinning the SPI-correct write-error classification of {@link PostgresJournalOps}: transient/unclassified
@@ -62,6 +65,27 @@ public final class PostgresJournalOpsErrorMappingTest {
                 journalOps.writeMessages(List.of(atomicWrite("{\"k\":1}")));
         assertThatThrownBy(() -> result.toCompletableFuture().get(5, TimeUnit.SECONDS))
                 .hasCauseInstanceOf(R2dbcNonTransientResourceException.class);
+    }
+
+    @Test
+    public void poolPendingAcquireLimitIsClassifiedAsPoolOverloadAndFailsTheFuture() {
+        // PoolAcquirePendingLimitException is not an R2dbcException; without an explicit branch it would be logged as
+        // an "unclassified store error". It must fail the future (lost write -> actor stop, never a rejection) with a
+        // classified pool-overload error that keeps the pool's exception as its cause.
+        final PoolAcquirePendingLimitException pendingLimit = new PoolAcquirePendingLimitException(200);
+        when(operations.insertEvents(any())).thenReturn(Mono.error(pendingLimit));
+
+        final CompletionStage<Iterable<Optional<Exception>>> result =
+                journalOps.writeMessages(List.of(atomicWrite("{\"k\":1}")));
+
+        assertThatThrownBy(() -> result.toCompletableFuture().get(5, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(PostgresPoolOverloadException.class)
+                .isInstanceOf(R2dbcTransientResourceException.class)
+                .hasMessageContaining("pool overload")
+                .hasMessageContaining("pending-acquire-max-size=200")
+                .hasCause(pendingLimit);
     }
 
     @Test

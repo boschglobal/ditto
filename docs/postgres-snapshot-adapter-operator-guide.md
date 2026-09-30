@@ -108,6 +108,10 @@ Two `include` rules are load-bearing:
 | `POSTGRES_DDL_PASSWORD` | no | *(reuse runtime)* | DDL role password |
 | `POSTGRES_SSL_MODE` | no | `verify-full` | SSL verification mode; use `disable` for local plaintext |
 | `POSTGRES_POOL_MAX_SIZE` | no | `100` | Maximum connections in the R2DBC pool |
+| `POSTGRES_POOL_MAX_ACQUIRE_TIME` | no | `4s` | Maximum wait for a pooled connection. Keep `(1 + acquire-retry) × max-acquire-time` below the 5 s caller deadline, or a write can commit after its caller was told it failed |
+| `POSTGRES_POOL_ACQUIRE_RETRY` | no | `0` | Acquire retries; each re-runs the full `max-acquire-time`. Keep `0` |
+| `POSTGRES_POOL_PENDING_ACQUIRE_MAX_SIZE` | no | *(2 × max-size)* | Borrowers allowed to wait once the pool is full; beyond it they fail immediately ("pool overload"). `-1` = unbounded (discouraged) |
+| `POSTGRES_CONNECT_TIMEOUT` | no | `2s` | TCP/TLS connect timeout; keep below `max-acquire-time` |
 | `POSTGRES_READ_JOURNAL_ENTITY` | no | *(service default)* | Override the read-journal entity binding |
 
 ---

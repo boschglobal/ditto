@@ -72,6 +72,7 @@ public final class ConnectionPoolFactory {
         }
 
         logPoolerModeCrossCheck(config);
+        logAcquireBudgetCrossCheck(config);
 
         final ConnectionFactory driverFactory = ConnectionFactories.get(buildOptions(config));
         // Wrap the driver factory with r2dbc-proxy so command timers + acquire-latency feed the neutral
@@ -165,7 +166,7 @@ public final class ConnectionPoolFactory {
         // directly via the r2dbc SPI option (Duration-typed). Interacts with pool.max-acquire-time: a borrow that has
         // to open a fresh physical connection can wait up to connect-timeout for the TCP/TLS handshake WITHIN the
         // max-acquire-time budget — keep connect-timeout < max-acquire-time so the acquire surfaces the connect failure
-        // rather than a generic acquire timeout.
+        // rather than a generic acquire timeout (checked at startup by logAcquireBudgetCrossCheck).
         builder.option(ConnectionFactoryOptions.CONNECT_TIMEOUT, config.getConnectTimeout());
 
         // Bind statement_timeout as an r2dbc "options" STARTUP parameter (a GUC name->value Map) rather than a plain
@@ -239,18 +240,31 @@ public final class ConnectionPoolFactory {
         return options;
     }
 
-    private static ConnectionPoolConfiguration buildPoolConfiguration(final ConnectionFactory connectionFactory,
+    static ConnectionPoolConfiguration buildPoolConfiguration(final ConnectionFactory connectionFactory,
             final PostgresConfig config) {
         final PostgresConfig.PoolConfig poolConfig = config.getPoolConfig();
+        final int pendingAcquireMaxSize = poolConfig.getPendingAcquireMaxSize();
         final ConnectionPoolConfiguration.Builder builder = ConnectionPoolConfiguration.builder(connectionFactory)
                 // Distinct, role-bearing pool name: with the shared-pool topology a service builds exactly one pool
                 // (shared across journal+snapshot+read-journal), tagged pool=shared on its gauges (round-2 finding H-9).
                 .name(POOL_NAME)
                 .initialSize(poolConfig.getInitialSize())
                 .maxSize(poolConfig.getMaxSize())
-                // A pool-acquire-timeout fails the write Future, which STOPS the persistent actor (it is NOT
-                // backpressure) -> max-size / max-acquire-time must be sized >= the Mongo baseline.
-                .maxAcquireTime(poolConfig.getMaxAcquireTime());
+                // Overload: the acquire budget must fit INSIDE the caller's deadline. A borrow that times out fails
+                // the write Future, which stops the persistent actor (not backpressure). But the caller -- the
+                // entity supervisor's 5s local-ask.timeout -- has given up before that, so a borrow that waits
+                // longer and then succeeds commits a write the caller was told had failed (e.g. an orphan Policy on
+                // CreateThing). A longer budget therefore never helps; it only widens that window. Hence:
+                //  - max-acquire-time (4s) below the caller deadline, and acquire-retry 0 so it IS the effective
+                //    budget (r2dbc-pool's default acquireRetry=1 re-runs the whole acquire with a fresh timeout);
+                //  - a bounded pending-acquire queue (default 2 x max-size): r2dbc-pool has no option for it, only
+                //    this PoolBuilder customizer. Borrowers beyond the bound fail immediately with
+                //    PoolAcquirePendingLimitException instead of queueing behind a deadline nobody waits for.
+                // Sustained overload is a capacity problem (max-size, PgBouncer, upstream throttling), not a reason to
+                // raise these values. See ditto-postgres-client.conf.
+                .maxAcquireTime(poolConfig.getMaxAcquireTime())
+                .acquireRetry(poolConfig.getAcquireRetry())
+                .customizer(poolBuilder -> poolBuilder.maxPendingAcquire(pendingAcquireMaxSize));
 
         applyIfPositive(poolConfig.getMaxIdleTime(), builder::maxIdleTime);
         applyIfPositive(poolConfig.getMaxLifeTime(), builder::maxLifeTime);
@@ -262,6 +276,51 @@ public final class ConnectionPoolFactory {
             final java.util.function.Consumer<Duration> setter) {
         if (duration != null && !duration.isZero() && !duration.isNegative()) {
             setter.accept(duration);
+        }
+    }
+
+    /**
+     * Logs the effective pool-overload settings once at startup (INFO) and WARNs about the combinations an env override
+     * can silently break: {@code acquire-retry > 0} (it multiplies the effective acquire budget),
+     * {@code connect-timeout >= max-acquire-time} (a failed connect would then surface as a generic acquire timeout)
+     * and an unbounded pending-acquire queue. Never blocks boot.
+     */
+    static void logAcquireBudgetCrossCheck(final PostgresConfig config) {
+        final PostgresConfig.PoolConfig poolConfig = config.getPoolConfig();
+        final Duration maxAcquireTime = poolConfig.getMaxAcquireTime();
+        final Duration effectiveAcquireBudget = maxAcquireTime.multipliedBy(1L + poolConfig.getAcquireRetry());
+        final int pendingAcquireMaxSize = poolConfig.getPendingAcquireMaxSize();
+        final Duration connectTimeout = config.getConnectTimeout();
+
+        LOGGER.info("PostgreSQL pool overload settings: max-size={}, pending-acquire-max-size={}, " +
+                        "max-acquire-time={}ms, acquire-retry={} -> effective acquire budget={}ms, " +
+                        "connect-timeout={}ms",
+                poolConfig.getMaxSize(),
+                pendingAcquireMaxSize == PostgresConfig.PoolConfig.UNBOUNDED_PENDING_ACQUIRE
+                        ? "unbounded"
+                        : pendingAcquireMaxSize,
+                maxAcquireTime.toMillis(), poolConfig.getAcquireRetry(), effectiveAcquireBudget.toMillis(),
+                connectTimeout.toMillis());
+
+        if (poolConfig.getAcquireRetry() > 0) {
+            LOGGER.warn("pool.acquire-retry={} re-runs the whole acquire with a fresh max-acquire-time, so a starved " +
+                            "borrow waits up to effective acquire budget={}ms instead of {}ms. Keep the effective " +
+                            "budget below the callers' 5s deadline (the things/policies supervisor " +
+                            "local-ask.timeout), or a write can commit after its caller was told it failed. Set " +
+                            "POSTGRES_POOL_ACQUIRE_RETRY=0.",
+                    poolConfig.getAcquireRetry(), effectiveAcquireBudget.toMillis(), maxAcquireTime.toMillis());
+        }
+        if (connectTimeout.compareTo(maxAcquireTime) >= 0) {
+            LOGGER.warn("connect-timeout={}ms is not below pool.max-acquire-time={}ms: a borrow that has to open a " +
+                            "connection to an unreachable host fails with a generic acquire timeout instead of the " +
+                            "real connect error. Lower connect-timeout (POSTGRES_CONNECT_TIMEOUT) together with " +
+                            "max-acquire-time.",
+                    connectTimeout.toMillis(), maxAcquireTime.toMillis());
+        }
+        if (pendingAcquireMaxSize == PostgresConfig.PoolConfig.UNBOUNDED_PENDING_ACQUIRE) {
+            LOGGER.warn("pool.pending-acquire-max-size=-1: the pending-acquire queue is unbounded, so an overload " +
+                    "queues borrowers whose callers have already given up instead of failing them fast. Unset " +
+                    "POSTGRES_POOL_PENDING_ACQUIRE_MAX_SIZE to get the default bound of 2 x max-size.");
         }
     }
 

@@ -51,7 +51,8 @@ import scala.jdk.javaapi.FutureConverters;
  *     <li><strong>Error mapping.</strong> A duplicate {@code (pid, sn)} triggers a SELECT
  *     of the existing row: if payload + manifest match the write completes successfully (idempotent commit-then-blip
  *     retry); a genuine mismatch is a fatal failure. A pool-acquire-timeout yields a failed Future — a lost write that
- *     stops the persistent actor rather than applying backpressure. A bad-grammar error (schema drift) surfaces
+ *     stops the persistent actor rather than applying backpressure; so does a pool overload (pending-acquire queue
+ *     full), classified as {@link PostgresPoolOverloadException}. A bad-grammar error (schema drift) surfaces
  *     unchanged.</li>
  * </ul>
  */

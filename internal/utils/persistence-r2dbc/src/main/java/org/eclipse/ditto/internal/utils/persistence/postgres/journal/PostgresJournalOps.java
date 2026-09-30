@@ -39,6 +39,7 @@ import org.apache.pekko.persistence.AtomicWrite;
 import org.apache.pekko.persistence.PersistentRepr;
 import org.apache.pekko.persistence.journal.Tagged;
 
+import reactor.pool.PoolAcquirePendingLimitException;
 import scala.jdk.javaapi.CollectionConverters;
 
 /**
@@ -145,6 +146,17 @@ public final class PostgresJournalOps {
             LOGGER.error("PostgreSQL write timed out (pool acquire); treating as a lost write that stops the actor.",
                     cause);
             return CompletableFuture.failedFuture(cause);
+        }
+        if (cause instanceof PoolAcquirePendingLimitException pendingLimit) {
+            // Pool overload: every connection is busy and the bounded pending-acquire queue is full, so the pool shed
+            // this borrow at once instead of letting it queue past the caller's deadline. Same outcome as an acquire
+            // timeout (lost write -> failed Future -> actor stop, never a rejection), but classified, so it is not
+            // reported as an unclassified store error below. Logged without a stack trace: under overload many writes
+            // are shed at once, and Pekko's own persist-failure log carries the cause.
+            final PostgresPoolOverloadException overload = PostgresPoolOverloadException.of(pendingLimit);
+            LOGGER.error("Shedding journal write for pid <{}> as a lost write that stops the actor: {}",
+                    atomicWrite.persistenceId(), overload.getMessage());
+            return CompletableFuture.failedFuture(overload);
         }
         if (cause instanceof R2dbcBadGrammarException) {
             return CompletableFuture.failedFuture(cause);

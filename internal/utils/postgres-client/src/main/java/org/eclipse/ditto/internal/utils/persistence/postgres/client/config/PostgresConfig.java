@@ -22,10 +22,13 @@ import org.eclipse.ditto.internal.utils.config.KnownConfigValue;
 /**
  * Provides the configuration settings of the PostgreSQL (R2DBC) persistence backend.
  * <p>
- * Lives under the HOCON namespace {@code ditto.postgresql.{uri, pooler-mode, pool.*, ssl.*}}. The defaults mirror the
- * deployed Mongo baseline so the backend can be swapped without re-tuning: {@code pool.max-size=100} (intended to be
- * overridden per service and validated under load, not a hardcoded guess), {@code pool.max-acquire-time=30s},
- * {@code fetch-size=0}, {@code prepared-statement-cache-queries=0}, and {@code ssl.mode=verify-full}.
+ * Lives under the HOCON namespace {@code ditto.postgresql.{uri, pooler-mode, pool.*, ssl.*}}. Defaults:
+ * {@code pool.max-size=100} (intended to be overridden per service and validated under load, not a hardcoded guess),
+ * {@code fetch-size=0}, {@code prepared-statement-cache-queries=0} and {@code ssl.mode=verify-full}. The pool-overload
+ * settings deliberately do NOT mirror Mongo's 30 s wait: {@code pool.max-acquire-time=4s} with
+ * {@code pool.acquire-retry=0}, {@code connect-timeout=2s} and a pending-acquire queue bounded at
+ * {@code 2 x pool.max-size}, so a borrow fails before its caller's 5 s deadline instead of committing after it (see
+ * {@code ditto-postgres-client.conf}).
  * </p>
  */
 @Immutable
@@ -57,7 +60,8 @@ public interface PostgresConfig {
 
     /**
      * The TCP connect timeout for establishing a physical connection (r2dbc SPI {@code CONNECT_TIMEOUT}). Bounds how
-     * long a borrow may block on a dead/unreachable host before failing fast.
+     * long a borrow may block on a dead/unreachable host before failing fast. Must stay below
+     * {@link PoolConfig#getMaxAcquireTime()} so a failed connect surfaces as itself rather than as an acquire timeout.
      *
      * @return the configured connect timeout.
      */
@@ -129,6 +133,12 @@ public interface PostgresConfig {
     interface PoolConfig {
 
         /**
+         * The {@link #getPendingAcquireMaxSize()} value that leaves the pending-acquire queue unbounded (reactor-pool
+         * semantics). Discouraged: an unbounded queue only holds borrowers whose callers have already given up.
+         */
+        int UNBOUNDED_PENDING_ACQUIRE = -1;
+
+        /**
          * @return the initial number of connections created when the pool is warmed up.
          */
         int getInitialSize();
@@ -139,9 +149,32 @@ public interface PostgresConfig {
         int getMaxSize();
 
         /**
-         * @return the maximum time to wait for a connection to be acquired from the pool before failing.
+         * The maximum time to wait for a connection to be acquired from the pool before failing. With
+         * {@link #getAcquireRetry()} {@code = 0} this is the effective acquire budget; it must stay below the caller's
+         * deadline (the entity supervisor's 5 s {@code local-ask.timeout}).
+         *
+         * @return the maximum acquire wait.
          */
         Duration getMaxAcquireTime();
+
+        /**
+         * How often r2dbc-pool re-subscribes a failed acquire, each time with a fresh {@link #getMaxAcquireTime()}
+         * budget. The effective acquire budget is therefore {@code (1 + acquire-retry) x max-acquire-time}. Default
+         * {@code 0}; the library default of {@code 1} would silently double the budget.
+         *
+         * @return the number of acquire retries, never negative.
+         */
+        int getAcquireRetry();
+
+        /**
+         * The maximum number of borrowers allowed to wait for a connection once all {@link #getMaxSize()} connections
+         * are in use. Borrowers beyond it fail immediately with {@code reactor.pool.PoolAcquirePendingLimitException}.
+         * Derived as {@code 2 x max-size} when {@code pool.pending-acquire-max-size} is not configured; {@code 0}
+         * means no queue at all; {@link #UNBOUNDED_PENDING_ACQUIRE} means unbounded.
+         *
+         * @return the effective pending-acquire bound, or {@link #UNBOUNDED_PENDING_ACQUIRE}.
+         */
+        int getPendingAcquireMaxSize();
 
         /**
          * @return the maximum time a pooled connection may stay idle before being evicted ({@code Duration.ZERO} = no
@@ -184,7 +217,14 @@ public interface PostgresConfig {
 
             MAX_SIZE("max-size", 100),
 
-            MAX_ACQUIRE_TIME("max-acquire-time", Duration.ofSeconds(30L)),
+            MAX_ACQUIRE_TIME("max-acquire-time", Duration.ofSeconds(4L)),
+
+            ACQUIRE_RETRY("acquire-retry", 0),
+
+            /**
+             * No literal default: when unset, {@link #getPendingAcquireMaxSize()} is derived as 2 x max-size.
+             */
+            PENDING_ACQUIRE_MAX_SIZE("pending-acquire-max-size", null),
 
             MAX_IDLE_TIME("max-idle-time", Duration.ZERO),
 
@@ -363,7 +403,7 @@ public interface PostgresConfig {
 
         POOLER_MODE("pooler-mode", PoolerMode.DIRECT.getConfigValue()),
 
-        CONNECT_TIMEOUT("connect-timeout", Duration.ofSeconds(5L)),
+        CONNECT_TIMEOUT("connect-timeout", Duration.ofSeconds(2L)),
 
         STATEMENT_TIMEOUT("statement-timeout", Duration.ofSeconds(60L)),
 

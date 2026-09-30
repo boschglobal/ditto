@@ -18,6 +18,7 @@ import java.util.Objects;
 import javax.annotation.concurrent.Immutable;
 
 import org.eclipse.ditto.internal.utils.config.ConfigWithFallback;
+import org.eclipse.ditto.internal.utils.config.DittoConfigError;
 import org.eclipse.ditto.internal.utils.config.ScopedConfig;
 
 import com.typesafe.config.Config;
@@ -33,6 +34,8 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
     private final int initialSize;
     private final int maxSize;
     private final Duration maxAcquireTime;
+    private final int acquireRetry;
+    private final int pendingAcquireMaxSize;
     private final Duration maxIdleTime;
     private final Duration maxLifeTime;
     private final int fetchSize;
@@ -43,6 +46,8 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
         initialSize = config.getNonNegativeIntOrThrow(PoolConfigValue.INITIAL_SIZE);
         maxSize = config.getPositiveIntOrThrow(PoolConfigValue.MAX_SIZE);
         maxAcquireTime = config.getNonNegativeDurationOrThrow(PoolConfigValue.MAX_ACQUIRE_TIME);
+        acquireRetry = config.getNonNegativeIntOrThrow(PoolConfigValue.ACQUIRE_RETRY);
+        pendingAcquireMaxSize = readPendingAcquireMaxSize(config, maxSize);
         maxIdleTime = config.getNonNegativeDurationOrThrow(PoolConfigValue.MAX_IDLE_TIME);
         maxLifeTime = config.getNonNegativeDurationOrThrow(PoolConfigValue.MAX_LIFE_TIME);
         fetchSize = config.getNonNegativeIntOrThrow(PoolConfigValue.FETCH_SIZE);
@@ -63,6 +68,24 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
                 ConfigWithFallback.newInstance(config, CONFIG_PATH, PoolConfigValue.values()));
     }
 
+    /**
+     * Reads {@code pending-acquire-max-size}: the configured value when set ({@code -1} = unbounded, {@code 0} = no
+     * queue, positive = the bound), otherwise {@code 2 x max-size} (saturating at {@link Integer#MAX_VALUE}).
+     */
+    private static int readPendingAcquireMaxSize(final ScopedConfig config, final int maxSize) {
+        final String path = PoolConfigValue.PENDING_ACQUIRE_MAX_SIZE.getConfigPath();
+        if (!config.hasPath(path)) {
+            return (int) Math.min(Integer.MAX_VALUE, 2L * maxSize);
+        }
+        final int configured = config.getInt(path);
+        if (configured < UNBOUNDED_PENDING_ACQUIRE) {
+            throw new DittoConfigError("The int value at <" + config.getConfigPath() + "." + path + "> must be >= "
+                    + UNBOUNDED_PENDING_ACQUIRE + " (" + UNBOUNDED_PENDING_ACQUIRE + " = unbounded) but it was <"
+                    + configured + ">!");
+        }
+        return configured;
+    }
+
     @Override
     public int getInitialSize() {
         return initialSize;
@@ -76,6 +99,16 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
     @Override
     public Duration getMaxAcquireTime() {
         return maxAcquireTime;
+    }
+
+    @Override
+    public int getAcquireRetry() {
+        return acquireRetry;
+    }
+
+    @Override
+    public int getPendingAcquireMaxSize() {
+        return pendingAcquireMaxSize;
     }
 
     @Override
@@ -114,6 +147,8 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
         final DefaultPoolConfig that = (DefaultPoolConfig) o;
         return initialSize == that.initialSize &&
                 maxSize == that.maxSize &&
+                acquireRetry == that.acquireRetry &&
+                pendingAcquireMaxSize == that.pendingAcquireMaxSize &&
                 fetchSize == that.fetchSize &&
                 preparedStatementCacheQueries == that.preparedStatementCacheQueries &&
                 Objects.equals(maxAcquireTime, that.maxAcquireTime) &&
@@ -124,8 +159,8 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
 
     @Override
     public int hashCode() {
-        return Objects.hash(initialSize, maxSize, maxAcquireTime, maxIdleTime, maxLifeTime, fetchSize,
-                preparedStatementCacheQueries, ddlCredentials);
+        return Objects.hash(initialSize, maxSize, maxAcquireTime, acquireRetry, pendingAcquireMaxSize, maxIdleTime,
+                maxLifeTime, fetchSize, preparedStatementCacheQueries, ddlCredentials);
     }
 
     @Override
@@ -134,6 +169,8 @@ public final class DefaultPoolConfig implements PostgresConfig.PoolConfig {
                 "initialSize=" + initialSize +
                 ", maxSize=" + maxSize +
                 ", maxAcquireTime=" + maxAcquireTime +
+                ", acquireRetry=" + acquireRetry +
+                ", pendingAcquireMaxSize=" + pendingAcquireMaxSize +
                 ", maxIdleTime=" + maxIdleTime +
                 ", maxLifeTime=" + maxLifeTime +
                 ", fetchSize=" + fetchSize +

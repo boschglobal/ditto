@@ -82,6 +82,12 @@
             <groupId>io.r2dbc</groupId>
             <artifactId>r2dbc-pool</artifactId>
         </dependency>
+        <!-- reactor-pool: PostgresJournalOps classifies reactor.pool.PoolAcquirePendingLimitException (pool overload);
+             version managed in bom/pom.xml -->
+        <dependency>
+            <groupId>io.projectreactor.addons</groupId>
+            <artifactId>reactor-pool</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>r2dbc-postgresql</artifactId>
