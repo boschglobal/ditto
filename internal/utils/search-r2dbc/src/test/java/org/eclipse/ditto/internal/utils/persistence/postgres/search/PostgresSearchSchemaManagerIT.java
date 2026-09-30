@@ -122,6 +122,24 @@ public final class PostgresSearchSchemaManagerIT {
                 .hasMessageContaining("checksum mismatch");
     }
 
+    @Test
+    public void v1BootsAgainstANewerCompatibleSchemaWithoutRunningDdlOrTouchingTheRow() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+        // Simulate a v2 pod mid-roll: it advanced the search row (declaring v1 compatible) and dropped an index the v1
+        // DDL creates.
+        runDdl("UPDATE schema_version SET version = 2, checksum = 'v2-checksum', min_compatible_version = 1 "
+                + "WHERE component = '" + PostgresSearchSchema.COMPONENT + "'");
+        runDdl("DROP INDEX sf_exists");
+
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+
+        assertThat(indexExists("sf_exists")).as("v1 DDL must not run against the v2 schema").isFalse();
+        assertThat(scalar("SELECT version || '/' || checksum || '/' || min_compatible_version FROM schema_version "
+                + "WHERE component = '" + PostgresSearchSchema.COMPONENT + "'"))
+                .isEqualTo("2/v2-checksum/1");
+    }
+
     private static void reset() {
         runDdl("DROP TABLE IF EXISTS search_flat, search_things, search_sync, schema_version CASCADE");
     }

@@ -64,8 +64,18 @@ public final class PostgresSearchSchema {
     /** Logical component identifier stored in {@code schema_version} — distinct from the persistence backend's row. */
     public static final String COMPONENT = "ditto-postgres-search";
 
-    /** Bumped on any breaking DDL change, per the schema-evolution policy. */
+    /**
+     * Bumped on any DDL change (the checksum covers every statement), per the schema-evolution policy; each bump also
+     * declares {@link #MIN_COMPATIBLE_VERSION}.
+     */
     public static final int VERSION = 1;
+
+    /**
+     * The oldest code schema version that can run against the {@link #VERSION} schema (stored as
+     * {@code schema_version.min_compatible_version}); see {@code PostgresSchemaDescriptor#minCompatibleVersion()} for
+     * the bump rules.
+     */
+    public static final int MIN_COMPATIBLE_VERSION = 1;
 
     /**
      * The byte-ordered collation ({@code information_schema.columns.collation_name = 'C'}) that every string column
@@ -131,6 +141,11 @@ public final class PostgresSearchSchema {
         @Override
         public int version() {
             return VERSION;
+        }
+
+        @Override
+        public int minCompatibleVersion() {
+            return MIN_COMPATIBLE_VERSION;
         }
 
         @Override

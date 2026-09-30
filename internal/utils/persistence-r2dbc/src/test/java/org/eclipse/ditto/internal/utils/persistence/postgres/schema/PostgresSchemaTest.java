@@ -33,6 +33,12 @@ public final class PostgresSchemaTest {
     private static final List<String> DDL = PostgresSchemaManager.effectiveDdl(PostgresSchema.descriptor());
 
     @Test
+    public void descriptorDeclaresVersionAndMinCompatibleVersion() {
+        assertThat(PostgresSchema.descriptor().version()).isEqualTo(2);
+        assertThat(PostgresSchema.descriptor().minCompatibleVersion()).isEqualTo(2);
+    }
+
+    @Test
     public void everyStatementIsIdempotent() {
         // Every CREATE carries IF NOT EXISTS; ALTERs are inherently idempotent (SET).
         assertThat(DDL).allSatisfy(stmt -> {

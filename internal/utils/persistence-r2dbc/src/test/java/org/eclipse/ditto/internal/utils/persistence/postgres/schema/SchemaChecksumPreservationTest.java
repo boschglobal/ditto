@@ -42,9 +42,10 @@ import org.junit.Test;
  * (version-independently). The pinned literal has since moved ONCE, deliberately: schema v2 replaced the redundant
  * {@code (pid, sn DESC)} snaps index creation with an idempotent {@code DROP INDEX IF EXISTS}, changing the DDL text.
  * That is exactly the "deliberate, versioned schema change" the policy above allows — it is carried by the
- * {@link PostgresSchema#VERSION} bump 1 -&gt; 2, and {@code SchemaVerifier.verifyChecksum} treats a stored version
+ * {@link PostgresSchema#VERSION} bump 1 -&gt; 2, and {@code SchemaVerifier.verifyStoredVersion} treats a stored version
  * OLDER than the code version as an upgrade in flight (pass, then advance the row), so deployed v1 databases upgrade
- * rather than refuse to boot.
+ * rather than refuse to boot. The later {@code min_compatible_version} column is added by a manager-owned statement
+ * outside the effective DDL, so it left this literal unchanged.
  * </p>
  */
 public final class SchemaChecksumPreservationTest {

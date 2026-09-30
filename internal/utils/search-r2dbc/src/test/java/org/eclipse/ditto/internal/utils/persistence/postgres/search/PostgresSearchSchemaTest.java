@@ -31,6 +31,7 @@ public final class PostgresSearchSchemaTest {
     public void descriptorIdentity() {
         assertThat(PostgresSearchSchema.descriptor().component()).isEqualTo("ditto-postgres-search");
         assertThat(PostgresSearchSchema.descriptor().version()).isEqualTo(1);
+        assertThat(PostgresSearchSchema.descriptor().minCompatibleVersion()).isEqualTo(1);
         assertThat(PostgresSearchSchema.COMPONENT).isEqualTo("ditto-postgres-search");
     }
 

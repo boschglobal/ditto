@@ -21,8 +21,11 @@ import javax.annotation.Nullable;
  * Pure, I/O-free refuse-to-boot decision logic for the schema bootstrap. Kept separate from {@code PostgresSchemaManager}
  * so the two guards can be unit-tested without a live PostgreSQL:
  * <ol>
- *     <li><strong>checksum guard</strong> — the stored {@code schema_version.checksum} (if any) must equal the code's
- *     current checksum; a mismatch is a code-vs-stored downgrade or drift.</li>
+ *     <li><strong>version guard</strong> — the stored {@code schema_version} row (version, checksum,
+ *     {@code min_compatible_version}) decides, <em>before</em> any component DDL runs, whether this code applies its
+ *     DDL, runs against a newer but compatible schema without touching it, or refuses (same-version checksum drift, or
+ *     a newer schema this code is not compatible with). See {@link #verifyStoredVersion} and
+ *     {@link #verifyStoredVersionForHeal}.</li>
  *     <li><strong>live-catalog guard</strong> — each table's actual primary-key definition, column types, and the
  *     {@code COLLATE "C"} collation of its persistence-id columns (read from the catalog) must match the canonical
  *     contract, because {@code CREATE TABLE IF NOT EXISTS} silently keeps a divergent pre-existing table that the
@@ -45,39 +48,45 @@ public final class SchemaVerifier {
     }
 
     /**
-     * Version-aware checksum verification.
-     * <ul>
-     *   <li>No stored row: first boot — pass.</li>
-     *   <li>Stored version equals the current code version: checksums must match exactly (drift guard).</li>
-     *   <li>Stored version is OLDER: pass — an additive schema upgrade is in flight (the additive-only DDL
-     *       policy means the CREATE-IF-NOT-EXISTS bootstrap has already applied the delta); the caller then
-     *       advances the row to the current version+checksum. During a rolling upgrade, not-yet-upgraded
-     *       nodes keep booting because their older version compares as OLDER only on the upgraded row —
-     *       see the runbook note below for the mixed-version window.</li>
-     *   <li>Stored version is NEWER: refuse — a downgrade against an already-advanced schema.</li>
-     * </ul>
-     * NOTE on the mixed-version window: once one upgraded node advances the row, an OLD-version node that
-     * restarts sees storedVersion &gt; its currentVersion and refuses to boot — this is intentional
-     * (old code must not run against a newer schema); the runbook documents completing the roll promptly.
+     * The boot-time decision over the stored {@code schema_version} row, taken under the advisory lock
+     * <strong>before</strong> any component DDL runs:
+     * <table>
+     *   <caption>Boot decision matrix</caption>
+     *   <tr><th>Stored row</th><th>Decision</th></tr>
+     *   <tr><td>none (first boot)</td><td>{@link SchemaVersionDecision#APPLY}</td></tr>
+     *   <tr><td>{@code version < code}</td><td>{@link SchemaVersionDecision#APPLY} — upgrade: the idempotent DDL runs
+     *   and the caller advances the row (including this code's {@code min_compatible_version})</td></tr>
+     *   <tr><td>{@code version == code}</td><td>{@link SchemaVersionDecision#APPLY} if the checksums match; refuse on a
+     *   mismatch (drift: manual DDL edits or a code/DB mismatch at the same version)</td></tr>
+     *   <tr><td>{@code version > code} and {@code min_compatible_version <= code}</td>
+     *   <td>{@link SchemaVersionDecision#COMPATIBLE_NEWER} — the checksum of the newer version is not
+     *   compared</td></tr>
+     *   <tr><td>{@code version > code} and {@code min_compatible_version > code}</td><td>refuse (downgrade against a
+     *   schema this code is not compatible with)</td></tr>
+     * </table>
+     * A {@code NULL} {@code min_compatible_version} (a row written before the column existed) counts as
+     * {@code min_compatible_version = version}, i.e. a newer legacy row is never compatible.
      *
      * @param component the logical component identifier (for the diagnostic message).
      * @param expectedChecksum the current code checksum (computed over the effective DDL for the component).
      * @param currentVersion the current code schema version for the component.
      * @param storedChecksum the checksum read from {@code schema_version}, or {@code null} on first boot (no row yet).
      * @param storedVersion the version read from {@code schema_version}, or {@code null} on first boot (no row yet).
-     * @throws SchemaBootException on a same-version checksum mismatch (drift) or a stored version newer than the
-     * current code version (downgrade).
+     * @param storedMinCompatibleVersion the {@code min_compatible_version} read from {@code schema_version}, or
+     * {@code null} when there is no row or the row predates the column.
+     * @return {@link SchemaVersionDecision#APPLY} or {@link SchemaVersionDecision#COMPATIBLE_NEWER}.
+     * @throws SchemaBootException on a same-version checksum mismatch (drift) or a newer stored version whose
+     * {@code min_compatible_version} exceeds the current code version.
      */
-    public static void verifyChecksum(final String component, final String expectedChecksum, final int currentVersion,
-            @Nullable final String storedChecksum, @Nullable final Integer storedVersion) {
+    public static SchemaVersionDecision verifyStoredVersion(final String component, final String expectedChecksum,
+            final int currentVersion, @Nullable final String storedChecksum, @Nullable final Integer storedVersion,
+            @Nullable final Integer storedMinCompatibleVersion) {
         if (storedChecksum == null || storedVersion == null) {
-            return;
+            return SchemaVersionDecision.APPLY;
         }
         if (storedVersion > currentVersion) {
-            throw new SchemaBootException("Refusing to boot: stored schema version " + storedVersion
-                    + " is NEWER than this code's version " + currentVersion + " for component '"
-                    + component + "' — schema downgrade detected. Upgrade this service "
-                    + "or restore the matching database.");
+            return decideNewer("Refusing to boot", component, currentVersion, storedVersion,
+                    storedMinCompatibleVersion);
         }
         if (storedVersion == currentVersion && !storedChecksum.equals(expectedChecksum)) {
             throw new SchemaBootException(
@@ -87,7 +96,47 @@ public final class SchemaVerifier {
                             + ". This indicates schema drift (manual DDL edits or a code/DB mismatch at the "
                             + "same schema version). See deployment/postgres/README.md#schema-upgrades.");
         }
-        // storedVersion < currentVersion: additive upgrade in flight — allowed.
+        // storedVersion < currentVersion: upgrade in flight; storedVersion == currentVersion: checksums match.
+        return SchemaVersionDecision.APPLY;
+    }
+
+    /**
+     * The self-heal decision over the stored {@code schema_version} row. Only the "newer stored version" rule of
+     * {@link #verifyStoredVersion} applies (the heal never compared checksums and still doesn't): with no row, an older
+     * or the same version the heal re-runs its create-only DDL as before; with a newer version it runs no DDL — a no-op
+     * when the newer schema is compatible, a failure when it isn't.
+     *
+     * @param component the logical component identifier (for the diagnostic message).
+     * @param currentVersion the current code schema version for the component.
+     * @param storedVersion the version read from {@code schema_version}, or {@code null} when there is no row.
+     * @param storedMinCompatibleVersion the {@code min_compatible_version} read from {@code schema_version}, or
+     * {@code null} when there is no row or the row predates the column.
+     * @return {@link SchemaVersionDecision#APPLY} or {@link SchemaVersionDecision#COMPATIBLE_NEWER}.
+     * @throws SchemaBootException on a newer stored version whose {@code min_compatible_version} exceeds the current
+     * code version.
+     */
+    public static SchemaVersionDecision verifyStoredVersionForHeal(final String component, final int currentVersion,
+            @Nullable final Integer storedVersion, @Nullable final Integer storedMinCompatibleVersion) {
+        if (storedVersion != null && storedVersion > currentVersion) {
+            return decideNewer("Refusing PostgreSQL schema self-heal", component, currentVersion, storedVersion,
+                    storedMinCompatibleVersion);
+        }
+        return SchemaVersionDecision.APPLY;
+    }
+
+    private static SchemaVersionDecision decideNewer(final String refusal, final String component,
+            final int currentVersion, final int storedVersion, @Nullable final Integer storedMinCompatibleVersion) {
+        // A row written before min_compatible_version existed is compatible with nothing older than itself.
+        final int minCompatibleVersion =
+                storedMinCompatibleVersion != null ? storedMinCompatibleVersion : storedVersion;
+        if (minCompatibleVersion <= currentVersion) {
+            return SchemaVersionDecision.COMPATIBLE_NEWER;
+        }
+        throw new SchemaBootException(refusal + ": stored schema version " + storedVersion
+                + " (min_compatible_version " + minCompatibleVersion + ") for component '" + component
+                + "' is NEWER than this code's version " + currentVersion
+                + " and not compatible with it — schema downgrade detected. Upgrade this service "
+                + "or restore the matching database. See deployment/postgres/README.md#schema-upgrades.");
     }
 
     /**

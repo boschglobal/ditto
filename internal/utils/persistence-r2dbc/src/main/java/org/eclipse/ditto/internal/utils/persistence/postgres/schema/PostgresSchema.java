@@ -65,10 +65,19 @@ public final class PostgresSchema {
     public static final String COMPONENT = "ditto-postgres-persistence";
 
     /**
-     * Bumped on any breaking DDL change, per the schema-evolution policy.
+     * Bumped on any DDL change (the checksum covers every statement), per the schema-evolution policy; each bump also
+     * declares {@link #MIN_COMPATIBLE_VERSION}.
      * v2: v1's {@code (pid, sn DESC)} snaps index dropped — redundant under the loose-index-scan queries.
      */
     public static final int VERSION = 2;
+
+    /**
+     * The oldest code schema version that can run against the {@link #VERSION} schema (stored as
+     * {@code schema_version.min_compatible_version}); see {@code PostgresSchemaDescriptor#minCompatibleVersion()} for
+     * the bump rules. v2 is the first version that declares one; it is 2 because v1 code predates the compatibility
+     * check.
+     */
+    public static final int MIN_COMPATIBLE_VERSION = 2;
 
     /** The per-entity prefixes that get a full journal/journal_seq/snaps table set. */
     public static final List<String> ENTITIES = List.of("things", "policies", "connections", "wot");
@@ -134,6 +143,11 @@ public final class PostgresSchema {
         @Override
         public int version() {
             return VERSION;
+        }
+
+        @Override
+        public int minCompatibleVersion() {
+            return MIN_COMPATIBLE_VERSION;
         }
 
         @Override

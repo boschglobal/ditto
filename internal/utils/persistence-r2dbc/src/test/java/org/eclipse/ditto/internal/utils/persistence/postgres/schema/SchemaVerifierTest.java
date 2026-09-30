@@ -26,45 +26,16 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
 import org.junit.Test;
 
 /**
- * Unit tests for {@link SchemaVerifier} — the two-layer refuse-to-boot logic: a checksum comparison against the
- * recorded schema version plus a live-catalog comparison of each table's primary key, column types, and the
- * {@code COLLATE "C"} collation of its persistence-id columns (including the NULL-collation drift case that
- * {@code data_type} cannot detect). Pure logic, no live PostgreSQL.
+ * Unit tests for {@link SchemaVerifier}'s live-catalog refuse-to-boot guard (the version/checksum decision against the
+ * recorded schema version is covered by postgres-client's {@code SchemaVerifierVersionDecisionTest}): a comparison of
+ * each table's primary key, column types, and the {@code COLLATE "C"} collation of its persistence-id columns
+ * (including the NULL-collation drift case that {@code data_type} cannot detect). Pure logic, no live PostgreSQL.
  */
 public final class SchemaVerifierTest {
 
     private static final TableContract JOURNAL = new TableContract(
             "things_journal", "PRIMARY KEY (pid, sn)",
             Map.of("pid", "text", "sn", "bigint", "event", "jsonb"), Set.of("pid"));
-
-    @Test
-    public void firstBootPasses() {
-        SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, null, null); // no throw
-    }
-
-    @Test
-    public void sameVersionSameChecksumPasses() {
-        SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, "abc", 2); // no throw
-    }
-
-    @Test
-    public void sameVersionDifferentChecksumThrows() {
-        assertThatThrownBy(() -> SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, "xyz", 2))
-                .isInstanceOf(SchemaBootException.class).hasMessageContaining("drift");
-    }
-
-    @Test
-    public void olderStoredVersionPasses() {
-        // rolling upgrade: this node carries version 3, the row still says version 2 — allowed;
-        // the caller re-runs the additive DDL and advances the row.
-        SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 3, "old-checksum", 2); // no throw
-    }
-
-    @Test
-    public void newerStoredVersionThrows() {
-        assertThatThrownBy(() -> SchemaVerifier.verifyChecksum("ditto-postgres-persistence", "abc", 2, "newer", 3))
-                .isInstanceOf(SchemaBootException.class).hasMessageContaining("downgrade");
-    }
 
     @Test
     public void matchingCatalogPasses() {

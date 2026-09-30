@@ -27,6 +27,7 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.Postg
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.monitoring.PostgresMetrics;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaDescriptor;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaVersionDecision;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,7 +43,8 @@ import reactor.core.publisher.Mono;
  * When a runtime statement hits a missing table (SQLSTATE {@code 42P01}), the runtime execution paths call
  * {@link #heal()} to recreate the schema (idempotent {@code CREATE … IF NOT EXISTS}) before retrying the statement once,
  * giving the Postgres backend MongoDB's implicit-collection-create-on-first-use property. A dropped/recreated database
- * therefore self-heals instead of failing every persistence call.
+ * therefore self-heals instead of failing every persistence call. A heal never runs this code's DDL against a newer
+ * stored schema version (rolling upgrade): see {@link PostgresSchemaManager#ensureTablesReactive()}.
  * </p>
  * <p>
  * Healing needs DDL privilege, which the DML-only runtime pool does not have, so the heal runs through a separate,
@@ -58,7 +60,9 @@ import reactor.core.publisher.Mono;
  * sufficient.
  * </p>
  * <p>
- * Each heal emits a WARN log + increments {@link PostgresMetrics#SELF_HEAL_COUNT}: the heal <strong>masks data loss</strong>
+ * Each heal that recreates a component's schema emits a WARN log + increments {@link PostgresMetrics#SELF_HEAL_COUNT}
+ * (a heal that runs no DDL because the stored schema version is newer and compatible is neither logged as a
+ * recreation nor counted): the heal <strong>masks data loss</strong>
  * (a wiped database silently self-heals to empty tables), the same trade-off MongoDB already has. Operators wanting
  * fail-loud set {@code ditto.postgresql.schema.self-heal = false} ({@link #isEnabled()} then {@code false}, and the
  * original error surfaces unchanged).
@@ -163,9 +167,9 @@ public final class PostgresSchemaHealer {
         // doFinally has cleared the reference (updateAndGet installs only when the reference is null), so the plain
         // set(null) can never clobber a successor.
         return Mono.defer(this::doHeal)
-                // Log a heal FAILURE once (doHeal already WARN-logs the heal ATTEMPT). The callers surface the original
-                // missing-table error on a heal failure, so without this the reason a heal could not run (e.g. 42501
-                // insufficient_privilege when the role lacks CREATE) would otherwise be invisible.
+                // Log a heal FAILURE once (doHeal WARN-logs a heal only after it recreated a schema). The callers
+                // surface the original missing-table error on a heal failure, so without this the reason a heal could
+                // not run (e.g. 42501 insufficient_privilege when the role lacks CREATE) would otherwise be invisible.
                 .doOnError(error -> LOGGER.warn("PostgreSQL schema self-heal failed; the original missing-table error "
                         + "will surface unchanged.", error))
                 .doFinally(signalType -> inFlightHeal.set(null))
@@ -180,13 +184,21 @@ public final class PostgresSchemaHealer {
             return Mono.error(new IllegalStateException(
                     "PostgreSQL schema self-heal fired before any schema descriptor was registered; cannot heal."));
         }
-        LOGGER.warn("Missing PostgreSQL table detected; recreating the persistence schema (self-heal). This masks a "
-                + "wiped/absent database — set ditto.postgresql.schema.self-heal=false to fail loud instead.");
-        incrementHealCounter();
         final ConnectionFactory ddlFactory = getOrCreateDdlConnectionFactory();
         return Flux.fromIterable(toHeal)
-                .concatMap(descriptor -> PostgresSchemaManager.of(ddlFactory, descriptor).ensureTablesReactive())
+                .concatMap(descriptor -> PostgresSchemaManager.of(ddlFactory, descriptor).ensureTablesReactive()
+                        .doOnNext(decision -> reportHeal(descriptor, decision)))
                 .then();
+    }
+
+    private void reportHeal(final PostgresSchemaDescriptor descriptor, final SchemaVersionDecision decision) {
+        if (decision == SchemaVersionDecision.APPLY) {
+            LOGGER.warn("Missing PostgreSQL table detected; recreated the schema of component '{}' (self-heal). This "
+                    + "masks a wiped/absent database — set ditto.postgresql.schema.self-heal=false to fail loud "
+                    + "instead.", descriptor.component());
+            incrementHealCounter();
+        }
+        // COMPATIBLE_NEWER: no DDL ran (a newer, compatible schema owns it); PostgresSchemaManager logged why at INFO.
     }
 
     private void incrementHealCounter() {

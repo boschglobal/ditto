@@ -108,6 +108,60 @@ public final class PostgresSchemaManagerIT {
         }
     }
 
+    @Test
+    public void v2BootsAgainstANewerCompatibleSchemaWithoutRunningDdlOrTouchingTheRow() {
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+        // Simulate a v3 pod mid-roll: it advanced the shared row (declaring v2 compatible) and dropped an index that
+        // the v2 DDL creates.
+        runDdl("UPDATE schema_version SET version = 3, checksum = 'v3-checksum', min_compatible_version = 2 "
+                + "WHERE component = '" + PostgresSchema.COMPONENT + "'");
+        runDdl("DROP INDEX things_journal_tags_idx");
+        try {
+            // A v2 pod restarts: it must boot, run no DDL and leave the v3 row alone.
+            PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+
+            assertThat(indexExists("things_journal_tags_idx")).as("v2 DDL must not run against the v3 schema")
+                    .isFalse();
+            assertThat(storedRow()).isEqualTo("3/v3-checksum/2");
+        } finally {
+            restoreV2Schema();
+        }
+    }
+
+    @Test
+    public void v2RefusesANewerIncompatibleSchema() {
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+        runDdl("UPDATE schema_version SET version = 3, checksum = 'v3-checksum', min_compatible_version = 3 "
+                + "WHERE component = '" + PostgresSchema.COMPONENT + "'");
+        try {
+            assertThatThrownBy(() -> PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor())
+                    .bootstrap())
+                    .isInstanceOf(SchemaBootException.class)
+                    .hasMessageContaining("min_compatible_version 3");
+            assertThat(storedRow()).isEqualTo("3/v3-checksum/3");
+        } finally {
+            restoreV2Schema();
+        }
+    }
+
+    /** Puts the shared row back to this code's v2 values and re-runs the bootstrap (re-creates dropped indexes). */
+    private static void restoreV2Schema() {
+        runDdl("UPDATE schema_version SET version = " + PostgresSchema.VERSION + ", checksum = '"
+                + PostgresSchemaManager.checksum(PostgresSchema.descriptor()) + "', min_compatible_version = "
+                + PostgresSchema.MIN_COMPATIBLE_VERSION + " WHERE component = '" + PostgresSchema.COMPONENT + "'");
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+    }
+
+    private static String storedRow() {
+        return scalar("SELECT version || '/' || checksum || '/' || min_compatible_version FROM schema_version "
+                + "WHERE component = '" + PostgresSchema.COMPONENT + "'");
+    }
+
+    private static boolean indexExists(final String index) {
+        return Boolean.parseBoolean(scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = '" + index + "')"));
+    }
+
     private static boolean tableExists(final String table) {
         return Boolean.parseBoolean(scalar(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" + table + "')"));

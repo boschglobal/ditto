@@ -135,21 +135,76 @@ using a staged multi-CA bundle:
 Never remove the old CA from the client bundle before every server has cut over,
 or in-flight pods that still present the old cert will fail `verify-full`.
 
-## Schema upgrades (`schema_version`)
+## Schema upgrades
 
-The bootstrap guards the `schema_version` row (component `ditto-postgres-persistence`): same-version
-checksum drift refuses boot; an OLDER stored version is upgraded in place (DDL is additive-only,
-`CREATE … IF NOT EXISTS`); a NEWER stored version refuses boot (downgrade guard).
+Every PostgreSQL-backed component keeps one row in `schema_version`: things, policies and
+connectivity share the row `ditto-postgres-persistence`; the optional search backend has its own row
+`ditto-postgres-search`. The row holds the schema `version`, the `checksum` of the DDL, and
+`min_compatible_version`, the oldest code version that can still run against that schema.
 
-Because the policy is additive-only, `CREATE TABLE IF NOT EXISTS` alone cannot upgrade an *existing*
-table's shape: a future schema version that adds columns to an already-created table must ship
-`ALTER TABLE … ADD COLUMN IF NOT EXISTS …` statements for those columns, not just a `CREATE TABLE`
-block that a same-named existing table would cause Postgres to silently skip.
+The bootstrap runs in one transaction under a cluster-wide advisory lock. It reads the row **before**
+it runs any DDL and decides:
 
-Rolling upgrades: things/policies/connectivity share ONE row. As soon as the first upgraded pod
-advances it, a NOT-yet-upgraded pod that RESTARTS will refuse to boot (downgrade guard) — running
-pods are unaffected. Complete the roll across all three services promptly; do not pin one service to
-an older image across a schema-version bump.
+| Stored row | What the booting pod does |
+|---|---|
+| none (first boot) | creates the schema, verifies the catalog, inserts the row |
+| `version` older than the code | upgrade: runs its idempotent DDL, verifies the catalog, advances the row (including its own `min_compatible_version`) |
+| `version` equal to the code | runs its idempotent DDL and verifies the catalog; a checksum mismatch refuses to boot (drift) |
+| `version` newer, `min_compatible_version` ≤ code | **compatible newer** (rolling upgrade in progress): runs **no** DDL and does **not** write the row; only verifies the catalog facts it needs (primary keys, column types, `COLLATE "C"`; extra columns or extra/dropped indexes are fine); logs an INFO line naming both versions |
+| `version` newer, `min_compatible_version` > code | refuses to boot; the message names `min_compatible_version` |
+
+A row written before the `min_compatible_version` column existed has it `NULL`, which counts as
+`min_compatible_version = version`. The first boot of an image with this check adds the column and
+fills it in: the bootstrap checks the catalog first and issues
+`ALTER TABLE schema_version ADD COLUMN IF NOT EXISTS min_compatible_version INT` only while the
+column is missing. That statement is not part of the checksummed DDL, so no stored checksum changes.
+
+Privileges: this one-time `ALTER TABLE` needs **ownership** of `schema_version`. With the default
+provisioning (`provisioning/01-roles-and-grants.sql`) the DDL role created the table and owns it.
+If a component's DDL role does not own `schema_version`, boot a component whose role owns it first,
+or add the column once as the owner. Once the column exists, boots and heals need the same
+privileges on `schema_version` as before this change (`SELECT`, `INSERT`, `UPDATE`), no ownership.
+
+The runtime self-heal (re-creating a missing table on SQLSTATE `42P01`) follows the same rule: if the
+stored version is newer, it runs no DDL. With a compatible newer schema the heal is a no-op and the
+failed statement is retried once. With an incompatible one the heal fails and the original error
+surfaces.
+
+### Rolling upgrades
+
+As soon as the first upgraded pod advances the row, the not-yet-upgraded pods run against the newer
+schema. Pods that keep running are unaffected either way. A not-yet-upgraded pod that **restarts**
+mid-roll:
+
+- keeps booting if the new version declares it compatible (`min_compatible_version` ≤ its version);
+- refuses to boot if it does not. Then complete the roll across all services that share the row
+  promptly, and don't pin one service to an older image across such a bump.
+
+**One-time window for existing databases:** images built before `min_compatible_version` existed don't
+read it. They treat any newer stored version as a downgrade, and their self-heal still runs their own
+DDL. So during the first schema bump after this change, a pod still on such an older image refuses to
+boot if it restarts mid-roll, the same window as before. Roll every pod to an image with this check
+first (that roll needs no schema bump); later bumps then follow the table above.
+
+### Rules for schema bumps (developers)
+
+Any change to a component's DDL changes its checksum, so it must bump the component's `VERSION`, and
+each bump declares its `MIN_COMPATIBLE_VERSION` (`PostgresSchemaDescriptor#minCompatibleVersion()`):
+
+- **Backward-compatible changes** keep the previous `MIN_COMPATIBLE_VERSION`. Examples: an index
+  drop, reloptions (e.g. autovacuum settings), a new index.
+- **Changes older code can't run against** set it to the new version. Examples: a column rename or
+  type change, a new `NOT NULL` column without a default, dropping a column or table older code
+  still uses.
+- Both versions run side by side during a roll, so a "compatible" change must also let the new code
+  cope with rows the old code writes.
+
+`CREATE TABLE IF NOT EXISTS` never changes an *existing* table's shape: a version that adds columns
+to an already-created table must ship `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` statements for
+them, not just a changed `CREATE TABLE` block that Postgres silently skips for the existing table.
+
+### Recovery from same-version drift
 
 Recovery from a genuine same-version drift (manual DDL edits): reconcile the DDL, then
 `UPDATE schema_version SET checksum = '<expected-from-the-boot-error>' WHERE component = 'ditto-postgres-persistence';`
+(use `ditto-postgres-search` for the search row).

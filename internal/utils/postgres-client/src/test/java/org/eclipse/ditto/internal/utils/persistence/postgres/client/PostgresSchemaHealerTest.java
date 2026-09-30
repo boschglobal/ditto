@@ -71,6 +71,11 @@ public final class PostgresSchemaHealerTest {
         }
 
         @Override
+        public int minCompatibleVersion() {
+            return 1;
+        }
+
+        @Override
         public List<String> ddlStatements() {
             return List.of("CREATE TABLE IF NOT EXISTS healer_test (id BIGINT PRIMARY KEY)");
         }
