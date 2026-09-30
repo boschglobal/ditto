@@ -31,17 +31,39 @@
 #   status       show container / corpus / result-file state
 #   down         remove the container (add --purge to also delete the data volume)
 #
+# Production-config stages (shipped schema + shipped translator; own container, see README.md):
+#   pc-up        start the production-config container (postgres:16, image-default server settings,
+#                named data volume)
+#   pc-load      ProductionConfigLoadBench: same corpus, schema ONLY from PostgresSearchSchema.ddlStatements()
+#   pc-read      ProductionConfigReadBench#warm: shapes 1-5 via the service parser + SearchQueryAssembler +
+#                PostgresThingsSearchPersistence; warm rounds + EXPLAIN (ANALYZE, BUFFERS)
+#   pc-cold      ProductionConfigReadBench#cold: per shape, container stop + Docker-VM page-cache drop +
+#                start, first execution timed (+ one cold EXPLAIN)
+#   pc-bias      ProductionConfigReadBench#corpusBias: read-only corpus-bias counts; run it AFTER pc-cold
+#                (it reads the pages the first cold samples need, and the host cache is never dropped)
+#   production-config   pc-up pc-load pc-read pc-cold pc-bias (asks for confirmation first)
+#   pc-status    show the production-config container / corpus state
+#   pc-down      remove the production-config container (add --purge to also delete its data volume)
+#
 # Options:
-#   --count N    corpus size for `load` (default 1000000)
+#   --count N    corpus size for `load` / `pc-load` (default 1000000)
 #   --seed N     corpus seed (default 42)
 #   --quick      demo mode: 50k corpus + short write windows (numbers NOT comparable)
 #   --yes        skip the duration/disk confirmation prompt
-#   --purge      with `down`: also remove the data volume
+#   --purge      with `down` / `pc-down`: also remove the data volume
+#   --rounds N   pc-read: warm rounds (default 3; each = every shape, 3 warmup + 20 timed)
+#   --cold-samples N    pc-cold: cold first executions per shape (default 3)
+#   --results-dir DIR   pc-*: evidence folder, relative to the module
+#                (default src/test/resources/bench/results/production-config)
 #
 # Environment:
-#   MVN          maven binary (default: mvn on PATH)
+#   MVN          maven binary (default: mvn on PATH); extra Maven flags via MAVEN_ARGS (e.g. MAVEN_ARGS=-o)
 #   BENCH_PORT   host port for the bench DB (default 55432)
 #   BENCH_CONTAINER  container name (default ditto-search-bench-pg)
+#   BENCH_PC_PORT / BENCH_PC_CONTAINER / BENCH_PC_VOLUME   production-config container
+#                (defaults 55433 / ditto-search-bench-pc / ditto-search-bench-pc-data)
+#   DOCKER_HOST  honoured by docker and by the cold-run harness
+#                (OrbStack: unix://$HOME/.orbstack/run/docker.sock)
 
 set -euo pipefail
 
@@ -54,8 +76,15 @@ CONTAINER="${BENCH_CONTAINER:-ditto-search-bench-pg}"
 PORT="${BENCH_PORT:-55432}"
 IMAGE="postgres:16"
 
+PC_CONTAINER="${BENCH_PC_CONTAINER:-ditto-search-bench-pc}"
+PC_PORT="${BENCH_PC_PORT:-55433}"
+PC_VOLUME="${BENCH_PC_VOLUME:-ditto-search-bench-pc-data}"
+
 COUNT=1000000
 SEED=42
+PC_ROUNDS=3
+PC_COLD_SAMPLES=3
+PC_RESULTS_DIR=""
 QUICK=0
 YES=0
 PURGE=0
@@ -74,12 +103,15 @@ while [ $# -gt 0 ]; do
         --quick) QUICK=1;    shift ;;
         --yes)   YES=1;      shift ;;
         --purge) PURGE=1;    shift ;;
-        -h|--help) sed -n '15,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --rounds) PC_ROUNDS="$2"; shift 2 ;;
+        --cold-samples) PC_COLD_SAMPLES="$2"; shift 2 ;;
+        --results-dir) PC_RESULTS_DIR="$2"; shift 2 ;;
+        -h|--help) sed -n '15,66p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) STAGES+=("$1"); shift ;;
     esac
 done
-[ ${#STAGES[@]} -gt 0 ] || { sed -n '15,45p' "${BASH_SOURCE[0]}"; exit 1; }
+[ ${#STAGES[@]} -gt 0 ] || { sed -n '15,66p' "${BASH_SOURCE[0]}"; exit 1; }
 
 if [ "$QUICK" = 1 ] && [ "$COUNT" = 1000000 ]; then
     COUNT=50000
@@ -245,6 +277,112 @@ stage_down() {
     fi
 }
 
+# --- production-config mode (shipped schema + shipped translator) ----------------------------------------------
+
+pc_env() {
+    export BENCH_PG_URL="jdbc:postgresql://localhost:${PC_PORT}/bench"
+    export BENCH_PG_CONTAINER="$PC_CONTAINER"
+    export BENCH_PG_IMAGE="$IMAGE"
+}
+
+pc_run_bench() { # args: -Dtest spec, extra -D props...
+    local spec="$1"; shift
+    if [ -n "$PC_RESULTS_DIR" ]; then
+        run_bench "$spec" "$@" -Dbench.pc.resultsDir="$PC_RESULTS_DIR"
+    else
+        run_bench "$spec" "$@"
+    fi
+}
+
+pc_exists()  { docker ps -a --format '{{.Names}}' | grep -qx "$PC_CONTAINER"; }
+pc_running() { docker ps    --format '{{.Names}}' | grep -qx "$PC_CONTAINER"; }
+
+stage_pc_up() {
+    if pc_running; then
+        log "container ${PC_CONTAINER} already running"
+    elif pc_exists; then
+        log "starting existing container ${PC_CONTAINER}"
+        docker start "$PC_CONTAINER" >/dev/null
+    else
+        # Server settings: the postgres:16 image defaults (shared_buffers=128MB, effective_cache_size=4GB,
+        # work_mem=4MB, ...), i.e. the settings of the original raw E0 run, for comparability. No -c flags.
+        log "creating container ${PC_CONTAINER} (postgres:16, port ${PC_PORT}, volume ${PC_VOLUME}, image-default settings)"
+        docker run -d --name "$PC_CONTAINER" \
+            -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+            -p "${PC_PORT}:5432" -v "${PC_VOLUME}:/var/lib/postgresql/data" "$IMAGE" >/dev/null
+    fi
+    local saved="$CONTAINER"
+    CONTAINER="$PC_CONTAINER"; wait_ready; CONTAINER="$saved"
+    log "production-config bench DB ready on localhost:${PC_PORT}"
+}
+
+stage_pc_load() {
+    stage_pc_up; pc_env
+    log "production-config load: count=${COUNT} seed=${SEED} (drops + recreates the search tables from the production DDL)"
+    pc_run_bench ProductionConfigLoadBench -Dbench.count="$COUNT" -Dbench.seed="$SEED"
+}
+
+stage_pc_read() {
+    stage_pc_up; pc_env
+    pc_run_bench 'ProductionConfigReadBench#warm' -Dbench.pc.rounds="$PC_ROUNDS"
+}
+
+stage_pc_cold() {
+    stage_pc_up; pc_env
+    pc_run_bench 'ProductionConfigReadBench#cold' -Dbench.pc.coldSamples="$PC_COLD_SAMPLES"
+}
+
+# Read-only corpus-bias counts. Runs after pc-cold: it reads exactly the pages the first cold samples need (the
+# fixed subject pair's search_things blocks, Stuttgart's heap, a full search_things scan), and the cold protocol
+# cannot drop the macOS host cache, so running it before pc-cold would warm those samples.
+stage_pc_bias() {
+    stage_pc_up; pc_env
+    pc_run_bench 'ProductionConfigReadBench#corpusBias'
+}
+
+stage_pc_status() {
+    if pc_running; then
+        echo "container: ${PC_CONTAINER} RUNNING (port ${PC_PORT}, volume ${PC_VOLUME})"
+        docker exec "$PC_CONTAINER" psql -U bench -d bench -Atc \
+            "SELECT 'things: ' || count(*) FROM search_things" 2>/dev/null || echo "schema: not loaded"
+        docker exec "$PC_CONTAINER" psql -U bench -d bench -Atc \
+            "SELECT 'database: ' || pg_size_pretty(pg_database_size('bench'))" 2>/dev/null || true
+    elif pc_exists; then
+        echo "container: ${PC_CONTAINER} exists but is STOPPED"
+    else
+        echo "container: ${PC_CONTAINER} does not exist"
+    fi
+}
+
+stage_pc_down() {
+    if pc_exists; then
+        docker rm -f "$PC_CONTAINER" >/dev/null
+        echo "removed container ${PC_CONTAINER}"
+    else
+        echo "container ${PC_CONTAINER} does not exist"
+    fi
+    if [ "$PURGE" = 1 ]; then
+        if docker volume inspect "$PC_VOLUME" >/dev/null 2>&1; then
+            docker volume rm "$PC_VOLUME" >/dev/null || die "could not remove volume ${PC_VOLUME}"
+            echo "removed volume ${PC_VOLUME}"
+        else
+            echo "volume ${PC_VOLUME} does not exist"
+        fi
+    fi
+}
+
+confirm_production_config_run() {
+    [ "$YES" = 1 ] && return 0
+    printf '\n  Production-config search benchmark at count=%s:\n' "$COUNT"
+    printf '    - wall clock : roughly 25-30 minutes at 1M (load ~12, %s warm rounds ~10, cold runs ~3)\n' "$PC_ROUNDS"
+    printf '    - disk       : ~45 GB in the Docker data volume %s\n' "$PC_VOLUME"
+    printf '    - results overwrite the evidence under %s/src/test/resources/bench/results/production-config/\n\n' \
+        "$MODULE"
+    printf 'Proceed? [y/N] '
+    read -r reply
+    case "$reply" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
+}
+
 confirm_full_run() {
     [ "$YES" = 1 ] && return 0
     [ "$QUICK" = 1 ] && return 0
@@ -273,6 +411,19 @@ for stage in "${STAGES[@]}"; do
         write)       stage_write ;;
         status)      stage_status ;;
         down)        stage_down ;;
+        pc-up)       stage_pc_up ;;
+        pc-load)     stage_pc_load ;;
+        pc-read)     stage_pc_read ;;
+        pc-cold)     stage_pc_cold ;;
+        pc-bias)     stage_pc_bias ;;
+        pc-status)   stage_pc_status ;;
+        pc-down)     stage_pc_down ;;
+        production-config)
+            confirm_production_config_run
+            stage_pc_up; stage_pc_load; stage_pc_read; stage_pc_cold; stage_pc_bias
+            log "production-config benchmark complete"
+            stage_pc_status
+            ;;
         all)
             confirm_full_run
             stage_up; stage_load; stage_read; stage_mitigations; stage_write

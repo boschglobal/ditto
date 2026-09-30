@@ -100,6 +100,45 @@ final class BenchConfig {
         return (int) longProperty("bench.write.poolSize", 2000L);
     }
 
+    // --- production-config mode knobs (ProductionConfigLoadBench / ProductionConfigReadBench) ---------------------------
+
+    /**
+     * @return the r2dbc URL of the bench database for the shipped read stack, from {@code BENCH_PG_R2DBC_URL}
+     * (sysprop or env), defaulting to {@link #jdbcUrl()} with the {@code jdbc:} scheme swapped for {@code r2dbc:}.
+     */
+    static String r2dbcUrl() {
+        return property("BENCH_PG_R2DBC_URL", jdbcUrl().replaceFirst("^jdbc:postgresql:", "r2dbc:postgresql:"));
+    }
+
+    /** @return the bench container the cold runs restart, from {@code BENCH_PG_CONTAINER} (sysprop or env). */
+    static String container() {
+        return property("BENCH_PG_CONTAINER", "ditto-search-bench-pc");
+    }
+
+    /**
+     * @return the image the cold runs use for the privileged page-cache drop, from {@code BENCH_PG_IMAGE} (sysprop or
+     * env); defaults to the bench container's own image so no extra image has to be pulled.
+     */
+    static String image() {
+        return property("BENCH_PG_IMAGE", "postgres:16");
+    }
+
+    /** @return where the production-config evidence is written, from {@code bench.pc.resultsDir}. */
+    static java.nio.file.Path productionConfigResultsDir() {
+        return java.nio.file.Path.of(property("bench.pc.resultsDir",
+                "src/test/resources/bench/results/production-config"));
+    }
+
+    /** @return how many warm rounds (each: every shape, 3 warmup + 20 timed) to run; default 3. */
+    static int productionConfigRounds() {
+        return (int) longProperty("bench.pc.rounds", 3L);
+    }
+
+    /** @return how many cold first-executions to take per shape; default 3. */
+    static int productionConfigColdSamples() {
+        return (int) longProperty("bench.pc.coldSamples", 3L);
+    }
+
     private static long longProperty(final String key, final long defaultValue) {
         final String v = property(key, null);
         return v != null ? Long.parseLong(v) : defaultValue;
