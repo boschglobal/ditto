@@ -11,6 +11,12 @@ This document synthesizes Tasks 0.1 (corpus/load), 0.2 (read-path raw), 0.2b (re
 (write-path + plan amendments). Every number below traces to a committed evidence file; inferences are labeled
 as such and kept separate from measured facts.
 
+> **Added 2026-09-30 — which read numbers describe the shipped system:** §2-§3 and §7 were measured with
+> hand-written SQL and (§3) bench-only extras (statistics targets, covering indexes, a path-scoped trigram index,
+> tuned memory) that do not ship. §10 "Production-config baseline" measures the shipped schema, translator and read
+> persistence on the same corpus; at 1M things only the low-cardinality `ilike` shape meets the 200 ms p95 gate
+> there.
+
 ## 1. Corpus and load (Task 0.1)
 
 Exact figures, re-quoted from `.superpowers/sdd/briefs/task-0.1-report.md`:
@@ -247,7 +253,8 @@ alternative (§3). Recorded in the plan doc.
 
 **What passed, and under which mitigations, at 1M/10-min:**
 - All five read-path shapes close under the 200ms warm-p95 bar with the full E1(stats)+E2(memory)+E4(scoped
-  trigram)[+E5(rescue CTE)] mitigation stack in place (§3). None pass unmitigated (§2).
+  trigram)[+E5(rescue CTE)] mitigation stack in place (§3). None pass unmitigated (§2). *(2026-09-30: that stack
+  does not ship; with the shipped schema and translator only shape 3-low passes at 1M — see §10.)*
 - The write path sustains ~179-198/s (below the 200/s target but close, and honestly reported as such) with
   zero transaction errors across both a 10-minute blanket run and a 2×5-minute blanket-vs-anti-join comparison.
 - The v1.5 anti-join churn-reduction candidate is measurably, substantially better than the v1 blanket rewrite
@@ -330,3 +337,123 @@ as an open risk, not resolved**: the full 10M run is the only way to actually an
 - `internal/utils/search-r2dbc/src/test/resources/bench/results/write-bench/part0-db-normalization.md`,
   `part1-sustained-upsert.md`, `part2-antijoin-vs-blanket-comparison.md`, `db-state-post-writebench.md`
 - `docs/superpowers/specs/2026-07-03-postgres-search-plan.md` (amended alongside this document)
+- `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/*` (§10: `summary.md`,
+  `environment.md`, `load.md`, `cold.md`, `corpus-bias.md`, `shape-*.md`, `warm.json`, `cold.json`;
+  `attempt-1-interleaved/` and `attempt-2-contiguous-3-warmups/` = superseded runs, kept for the protocol
+  comparison)
+
+## 10. Production-config baseline (shipped schema + translator), 2026-09-30
+
+**These are the read numbers that describe the shipped system.**
+
+- Harness: `ProductionConfigLoadBench` + `ProductionConfigReadBench` (commit `75c1cf138f`). Runbook:
+  `src/test/resources/bench/README.md`, "Production-config mode".
+- One command: `benchmark/run-benchmark.sh production-config`, which runs load → warm → cold → corpus bias. The
+  corpus was loaded by that command. The committed warm/cold/bias evidence comes from the stages `pc-read` →
+  `pc-cold` → `pc-bias` (744 s) on that load.
+
+What differs from §2-§3:
+
+- **Schema:** only `PostgresSearchSchema.ddlStatements()` (indexes created after the COPY, then
+  `VACUUM (ANALYZE)`). The catalog check compares every index definition, column, constraint, reloption,
+  statistics target and extended statistics object with a reference built from the production DDL.
+- **Queries:** RQL requests parsed by the query parser the search service builds (`SearchRootActor.getQueryParser`)
+  and its `ThingsSearchCursor`; a test drives the real `SearchActor` to pin that the harness produces the same
+  queries.
+  - Rendered by `SearchQueryAssembler` / `CreateSqlVisitor` / `AuthFilterSqlBuilder`: full per-field auth chain,
+    `global_read`, default sort `+thingId`, page size 25 + has-next row, the selective-leg CTE.
+  - Timed through `PostgresThingsSearchPersistence`, on a pool built by the production `ConnectionPoolFactory`
+    from the shipped `ditto-postgres-search` profile (`plan_cache_mode = force_custom_plan`, 60 s statement
+    timeout, unnamed statements, fetch size 100).
+  - Shape 1's range is `ge` + `le` (RQL has no BETWEEN); shape 4's keyset is the service cursor.
+- **Corpus and settings:** the same corpus (seed 42, 1,000,000 things, 68,513,542 flat rows; DB 29 GB) and bind
+  cycles as §2. Server settings of the original raw E0 run: postgres:16 image defaults (`shared_buffers` 128MB,
+  `effective_cache_size` 4GB, `work_mem` 4MB, `jit` on).
+- **Warm:** per shape, 3 contiguous rounds. Each round runs a warmup over the whole filter rotation (every city,
+  threshold or pattern the timed iterations use), then 20 timed iterations (the original binds 3..22); nearest rank.
+  - A shape is "settled" when its per-round p95s lie within 10% (or 10 ms) of each other, and "did not settle"
+    otherwise. That is a statement about the numbers; the cause is given per shape. The gate quotes the all-rounds
+    p95 with that state.
+  - Timed iterations 3..n−1 repeat the warmup's requests (filter and subject pair). In round 1, iterations ≥ n meet
+    their subject pair for the first time.
+- **Cold:** container stop, Docker-VM page cache dropped (`drop_caches` from a privileged container), start, fresh
+  pool, first execution; 3 samples.
+  - The macOS host file cache is not dropped (needs root): "PostgreSQL- and VM-cold, host-cache state unknown".
+  - The corpus-bias counts run after cold, because they read the pages the first cold samples need.
+- **Plans:** EXPLAINs run in the timed path's execution mode: finds leader-only (finding 5), counts as they are.
+- **Superseded runs**, kept only for the protocol comparison (finding 6):
+  - `production-config/attempt-1-interleaved/`: round → shape order;
+  - `attempt-2-contiguous-3-warmups/`: 3 warmups covering 3 of 7–10 filter values.
+
+| Shape | §2 raw p50 / p95 | §3 mitigated p95 | **shipped warm p50 / p95 (all rounds)** | p95 per round | settled? | cold 1st exec (samples) | 200 ms gate |
+|---|---:|---:|---:|---|---|---|:---:|
+| 1 eq AND range | 6,462 / 6,905 | 48 (E5) | **895 / 1,365** | 1,655 · 1,075 · 898 | no | 6,049 · 1,650 · 1,504 | MISS |
+| 2 gt range | 168 / 178 | 71 (E4) | **120 / 399** | 408 · 141 · 119 | no | 356 · 235 · 273 | MISS |
+| 3-low ilike | 71 / 126 | — | **47 / 50** | 51 · 49 · 48 | yes | 610 · 78 · 72 | pass |
+| 3-high ilike | 2,298 / 2,405 | 49 (E4) | **199 / 392** | 329 · 395 · 391 | no | 2,089 · 432 · 373 | MISS |
+| 4 page 1 | 558 / 567 | — | **578 / 600** | 599 · 600 · 599 | yes | 1,843 · 1,432 · 1,404 | MISS |
+| 4 page 100 OFFSET | 569 / 575 | — | **611 / 653** | 690 · 632 · 632 | yes | 1,168 · 1,142 · 1,411 | MISS |
+| 4 page 100 keyset (cursor) | 574 / 601 | — | **735 / 773** | 755 · 773 · 774 | yes | 1,207 · 1,095 · 1,188 | MISS |
+| 4 page 201 OFFSET | — | — | **622 / 648** | 658 · 648 · 643 | yes | 1,217 · 1,202 · 1,214 | MISS |
+| 4 page 201 keyset (cursor) | — | — | **286 / 300** | 300 · 297 · 299 | yes | 420 · 391 · 384 | MISS (corpus-flattered) |
+| 5 count | 5,802 / 6,603 | 41 (E5) | **988 / 1,641** | 2,029 · 1,225 · 988 | no | 1,603 · 1,346 · 1,378 | MISS |
+
+Findings (each read off the committed plans / per-iteration tables):
+
+1. **The shipped selective-leg CTE picks the unselective leg for shape 1/5**, and its working set does not stay
+   cached.
+   - It materialises the first top-level `eq`: city, ~90k thing ids (a lossy bitmap heap scan at `work_mem` 4MB,
+     ~370–410 ms).
+   - Then ~90k `search_things` PK probes (~430 ms; `read=203,043` blocks per execution).
+   - The E5 rescue that produced 48 ms materialised the ~1.4% temperature range (with covering indexes).
+   - Ten cities × ~690 MB do not stay cached, so iterations keep getting faster round by round (shape 1: 0.92–1.72 s
+     in round 1, 0.84–0.91 s in round 3). The per-round p95 of shapes 1 and 5 falls each round; neither settles.
+2. **Shape 2** drives from `global_read` (~29k things), filters by the per-field auth and probes the flat PK per
+   survivor. It runs leader-only in the shipped path.
+   - 109–146 ms once a subject pair's pages are cached.
+   - In round 1, timed iterations 3–6 repeat warmup requests (110–114 ms), while iterations 7–22 meet their pair for
+     the first time (202–491 ms), so the per-round p95 falls after round 1 and the shape does not settle.
+3. **Shape 3-high:** the table-wide `sf_trgm` yields ~44k candidates, filtered to the `features/*` wpath and
+   hash-semi-joined with the global-read set.
+   - Most patterns take 190–210 ms.
+   - `*890*` and `*456*` take 320–420 ms and set every round's p95. `*890*` has the same ~44k trigram hits
+     (44,082 vs `*234*`'s 44,298), but the planner's estimate (150,256 vs 1,488 rows) flips it to
+     `BitmapAnd(sf_trgm, sf_exists)`. `*456*`'s plan was not captured; its timings match.
+   - That plan scans the 4.5M-row wpath in `sf_exists`: 200.8 ms of 387.0 ms.
+   - The choice comes from the `ANALYZE` sample: attempt 1's load flipped `*234*` too.
+   - The per-round p95 rose (329 → 395 → 391) and did not settle: variance of the `BitmapAnd` executions.
+4. **Shape 4** probes one `LEFT JOIN LATERAL` per global-read-visible thing (29k) and top-N sorts, so page 1 and
+   OFFSET pages cost the same (~0.6 s).
+   - Default `jit=on` adds ~60–80 ms (page 1/OFFSET) and ~180–235 ms (cursor pages) of JIT compilation.
+   - The service cursor's resume filter is an ordinary criteria, so it carries the sort path's per-field auth; a
+     cursor page is therefore not the same request as the OFFSET page at that position.
+   - Shape 4 settles; across the three runs it drifted by up to ~13%.
+5. **Parallel query is effectively off for every shipped `findAll`.**
+   - `PostgresThingsSearchPersistence.executeRows` sets `fetchSize(100)`; r2dbc-postgresql 1.0.7 then sends
+     `Execute(portal, 100)`, and PostgreSQL runs parallel plans leader-only for a portal executed with a row limit.
+   - Shape 2's plan: 61 ms with workers (attempt 1's plain EXPLAIN) vs 106 ms leader-only; the timed round-3 p50 is
+     114 ms.
+   - Counts (no fetch size) are not affected.
+6. **The protocol moves the round-1 numbers, not the verdicts.** Per-round p95, attempt 1 (interleaved) → attempt 2
+   (3 warmups) → this run:
+   - shape 1: 4,735 · 919 · 920 → 6,784 · 1,253 · 894 → 1,655 · 1,075 · 898;
+   - shape 5: 4,895 · 5,289 · 5,681 → 4,514 · 1,852 · 1,597 → 2,029 · 1,225 · 988;
+   - shape 2: 402 · 416 · 476 → 421 · 134 · 124 → 408 · 141 · 119.
+7. **Corpus bias** (counts: `corpus-bias.md`). The generator draws `global_read` and `policy_auth` independently: 573
+   of 29,411 visible things are root-readable, and ~20% of features have a `features_auth` entry. The per-field auth
+   therefore removes candidates *before* the expensive probes, which flatters several shapes:
+   - **shapes 1/5:** 2,681 of Stuttgart's 89,901 ids are visible, but only 63 survive auth; consistent auth would
+     run ~42× more flat probes;
+   - **shape 2** (thresholds 42–44): ~573 candidates here vs ~1.9k probes until 26 hits with consistent auth;
+   - **page-201 cursor:** 467 survivors vs ~24k things after the anchor. "Cursor faster than OFFSET at page 201"
+     is a corpus artifact.
+   - **page-100 cursor:** 5,040 survivors vs ~27k.
+   - Neutral: 3-low, 3-high, page 1 and OFFSET.
+8. **Fresh-load caveat:**
+   - COPY order clusters each thing's rows, `CREATE INDEX` builds dense B-trees, and `VACUUM` set the visibility
+     map (`Index Only Scan … Heap Fetches: 0` in the cursor plans).
+   - There are no ~6 system-field flat rows per thing.
+   - A churned production table is less favourable.
+9. **Environment caveat:** the OrbStack VM's page cache varies (0.3–10 GB cached before the cold drops, `cold.md`),
+   and memory is returned to macOS. Beyond the 128MB `shared_buffers`, "warm" means "read recently enough to still
+   be cached somewhere", and the cold samples carry an unknown host-cache state.
