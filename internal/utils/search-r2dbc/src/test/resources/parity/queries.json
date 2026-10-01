@@ -287,7 +287,12 @@
             "org.eclipse.ditto.parity:nenull-stringvals",
             "org.eclipse.ditto.parity:scalars-blue",
             "org.eclipse.ditto.parity:scalars-green",
-            "org.eclipse.ditto.parity:scalars-red"
+            "org.eclipse.ditto.parity:scalars-red",
+            "org.eclipse.ditto.parity:zsort-a",
+            "org.eclipse.ditto.parity:zsort-b",
+            "org.eclipse.ditto.parity:zsort-c",
+            "org.eclipse.ditto.parity:zsort-d",
+            "org.eclipse.ditto.parity:zsort-e"
           ]
         }
       }
@@ -1142,6 +1147,24 @@
       "expectNonEmptySudo": true
     },
     {
+      "name": "sort-feature-prop-asc",
+      "filter": "like(thingId,\"*:zsort-*\")",
+      "options": [
+        "sort(+features/meter/properties/reading,+thingId)"
+      ],
+      "expectNonEmptySudo": true,
+      "comment": "Concrete feature-property sort (the sort lateral binds path = wpath = the concrete wpath to use the full search_flat key prefix). zsort-a/-d hold arrays (ASC sorts by the MIN element), zsort-b also has feature meter2 with reading 1, so the /features/*/properties/reading twin rows carry a smaller value than its own meter reading (5) and must not leak into the sort, zsort-c misses the key (null rank, first) although its meter2 twin rows carry 99, zsort-e is a string (after all numbers). Sort keys carry no auth on either backend (plan §3.3 exception 3), so every auth situation must agree, incl. 'limited' (features revoked). The zsort-* ids sort after every other parity id so first-page-pinned divergence lists (not-wildcard-eq) stay stable, and every zsort feature carries status \"on\" (so only the full eq-wildcard-status-on pin lists them) because a feature WITHOUT status would trip a separate, pre-existing empty(features/*/...) divergence in empty-wildcard-property: Mongo matches a thing with a feature that lacks the property, Postgres does not."
+    },
+    {
+      "name": "sort-feature-prop-desc",
+      "filter": "like(thingId,\"*:zsort-*\")",
+      "options": [
+        "sort(-features/meter/properties/reading,+thingId)"
+      ],
+      "expectNonEmptySudo": true,
+      "comment": "DESC twin of sort-feature-prop-asc: arrays sort by their MAX element, the missing key sorts last. zsort-c's meter2 reading 99 is larger than every meter reading, so a leak of the /features/* twin rows would move zsort-c from last to first."
+    },
+    {
       "name": "sort-rankdiv-asc",
       "filter": "like(thingId,\"*:rankdiv-*\")",
       "options": [
@@ -1307,6 +1330,20 @@
       "auth": [
         "sudo"
       ]
+    },
+    {
+      "name": "walk-feature-level-asc",
+      "mode": "cursorWalk",
+      "filter": "exists(features/f1)",
+      "options": [
+        "sort(+features/f1/properties/level,+thingId)",
+        "size(2)"
+      ],
+      "auth": [
+        "sudo",
+        "full"
+      ],
+      "comment": "Cursor walk on a concrete feature-property sort key: the three f1 things without a level exercise the null-anchor resume branch, the 3/3 tie the eq-dimension resume. Scalars only (no arrays, no explicit nulls), per the walk-corpus rules in SearchBackendParityIT."
     },
     {
       "name": "walk-rankdiv-asc-divergent-encodings",

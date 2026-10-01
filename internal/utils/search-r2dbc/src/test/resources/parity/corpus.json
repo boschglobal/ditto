@@ -35,6 +35,11 @@
     "walker-l9b",
     "nenull-nullvals",
     "nenull-stringvals",
-    "nenull-realvals"
+    "nenull-realvals",
+    "zsort-a",
+    "zsort-b",
+    "zsort-c",
+    "zsort-d",
+    "zsort-e"
   ]
 }

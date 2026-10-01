@@ -171,6 +171,18 @@ public final class SearchQueryAssemblerTest {
     }
 
     @Test
+    public void sortLateralCarriesNoAuthorization() {
+        // Sort keys are never authorization-filtered (plan §3.3 exception 3, mirrored in PostgresSortClause's javadoc;
+        // Mongo sorts the unfiltered thing too): the subjects restrict WHICH things match, never their sort key.
+        final PostgresSortClause sort = PostgresSortClause.of(
+                List.of(asc(fef.sortByFeatureProperty("env", "temperature")), asc(fef.sortByThingId())));
+        final String sql = SearchQueryAssembler.findAll(cf.any(), SUBJECTS, sort, 26L, 0L).sql();
+        final String lateral = sql.substring(sql.indexOf("LEFT JOIN LATERAL"), sql.indexOf(") k0 ON true"));
+        assertThat(lateral).doesNotContain("global_read").doesNotContain("policy_auth").doesNotContain("features_auth");
+        assertThat(sql).contains("st.global_read && "); // visibility is still restricted, outside the lateral
+    }
+
+    @Test
     public void namespaceReportGroupsByNamespace() {
         assertThat(SearchQueryAssembler.Fixed.NAMESPACE_REPORT_SQL)
                 .isEqualTo("SELECT namespace, count(*) AS count FROM search_things GROUP BY namespace");

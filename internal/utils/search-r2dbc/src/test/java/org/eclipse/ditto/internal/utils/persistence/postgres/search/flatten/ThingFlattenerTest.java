@@ -78,6 +78,42 @@ public class ThingFlattenerTest {
                 .containsExactlyInAnyOrder(path, "/features/*/properties/temperature");
     }
 
+    // --- invariant the sort lateral relies on: wpath differs from path only on the /features/* twin rows ----------
+
+    @Test
+    public void everyRowOutsideTheFeaturesWildcardTwinsHasWpathEqualToPath() {
+        // The sort lateral binds "path = wpath = <sort wpath>" to use the full primary-key prefix. That is
+        // result-preserving only because a row whose wpath is not the /features/* twin always carries wpath == path,
+        // whatever the payload shape.
+        final JsonObject thing = JsonFactory.newObject("""
+                {
+                  "_modified": "2026-10-01T00:00:00Z",
+                  "policyId": "ns:policy",
+                  "attributes": {
+                    "a/b~c": { "deep": [1, "x", null, true, {"n": 2}, [3, 4], []] },
+                    "empty": {}, "nothing": null
+                  },
+                  "features": {
+                    "env": {
+                      "definition": ["ns:def:1.0.0"],
+                      "properties": { "temperature": [21.5, 19], "nested": { "k": "v" } },
+                      "desiredProperties": { "temperature": 20 }
+                    },
+                    "x/y~z": { "properties": { "temperature": 18 } }
+                  }
+                }
+                """);
+
+        final List<FlatRow> rows = ThingFlattener.flatten(THING_ID, thing);
+
+        assertThat(rows).filteredOn(row -> !row.wpath().startsWith("/features/*"))
+                .hasSizeGreaterThan(20)
+                .allSatisfy(row -> assertThat(row.wpath()).isEqualTo(row.path()));
+        assertThat(rows).filteredOn(row -> row.wpath().startsWith("/features/*"))
+                .isNotEmpty()
+                .allSatisfy(row -> assertThat(row.path()).isNotEqualTo(row.wpath()));
+    }
+
     // --- rule 3 + rule 6: dual-wpath applies to object/empty-container exists-rows too ------------------------------
 
     @Test

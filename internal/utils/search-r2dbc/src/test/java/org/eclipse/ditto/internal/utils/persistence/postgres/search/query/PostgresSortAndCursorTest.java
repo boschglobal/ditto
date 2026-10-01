@@ -78,13 +78,29 @@ public final class PostgresSortAndCursorTest {
         assertThat(r.sql()).isEqualTo(
                 "SELECT st.thing_id FROM search_things st "
                         + "LEFT JOIN LATERAL (SELECT s.type_rank, s.val_num, s.val_text, s.val_bool "
-                        + "FROM search_flat s WHERE (s.thing_id = st.thing_id AND s.wpath = $1) "
+                        + "FROM search_flat s WHERE (s.thing_id = st.thing_id AND s.path = $1 AND s.wpath = $2) "
                         + "ORDER BY s.type_rank, s.val_num, s.val_text, s.val_bool LIMIT 1) k0 ON true "
                         + "ORDER BY COALESCE(CASE WHEN k0.type_rank = 5 THEN 1 ELSE k0.type_rank END, 1), "
                         + "k0.val_num, k0.val_text, k0.val_bool");
-        assertThat(r.bindValues()).containsExactly("/attributes/temp");
+        assertThat(r.bindValues()).containsExactly("/attributes/temp", "/attributes/temp");
         // No aggregate functions anywhere — the boundary is a whole row.
         assertThat(r.sql()).doesNotContain("min(").doesNotContain("max(").doesNotContain("MIN(").doesNotContain("MAX(");
+    }
+
+    // ============================================================================ lateral probe: full primary-key prefix
+
+    @Test
+    public void lateralBindsPathToTheSortWpathSoTheProbeUsesTheWholePrimaryKeyPrefix() {
+        // search_flat's primary key is (thing_id, path, wpath, ord). A sort wpath is never wildcarded (rejected below),
+        // and every non-wildcard row has wpath = path (ThingFlattener emits the exact row with wpath = path; the
+        // /features/* twin's wpath is the wildcarded one). So "s.path = <wpath>" is redundant for the result but
+        // bounds the probe on (thing_id, path, wpath) instead of scanning every row of the thing. Both binds
+        // carry the same concrete wpath — for a feature property too, never the /features/* form.
+        final RenderedSql r = renderSort(asc(fef.sortByFeatureProperty("env", "temperature")));
+        assertThat(r.sql()).contains(
+                "FROM search_flat s WHERE (s.thing_id = st.thing_id AND s.path = $1 AND s.wpath = $2) ");
+        assertThat(r.bindValues()).containsExactly("/features/env/properties/temperature",
+                "/features/env/properties/temperature");
     }
 
     @Test
@@ -163,13 +179,13 @@ public final class PostgresSortAndCursorTest {
         // _modified → /_modified: slash-mapped ⇒ flat lateral (unlike the root-mapped system columns).
         final RenderedSql r = renderSort(asc(fef.sortBy("_modified")));
         assertThat(r.sql()).contains("LEFT JOIN LATERAL");
-        assertThat(r.bindValues()).containsExactly("/_modified");
+        assertThat(r.bindValues()).containsExactly("/_modified", "/_modified");
     }
 
     @Test
     public void featurePropertySortResolvesConcreteWpath() {
         final RenderedSql r = renderSort(asc(fef.sortByFeatureProperty("f1", "temp")));
-        assertThat(r.bindValues()).containsExactly("/features/f1/properties/temp");
+        assertThat(r.bindValues()).containsExactly("/features/f1/properties/temp", "/features/f1/properties/temp");
     }
 
     // ============================================================================ wildcard sort rejection (parity)
@@ -183,6 +199,19 @@ public final class PostgresSortAndCursorTest {
                 .hasMessageContaining("wildcard");
         assertThatThrownBy(() -> PostgresSortClause.of(List.of(asc(fef.sortByFeatureDesiredProperty("*", "x")))))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void wildcardWpathReachingTheLateralFailsLoudly() {
+        // GetSortSqlVisitor rejects a "*" feature id, but a configured simple-field mapping can still name a
+        // /features/* wpath directly. The lateral binds path = wpath, which no /features/* row satisfies, so such a
+        // key would silently sort every thing as missing: it must fail instead.
+        final ThingsFieldExpressionFactory wildcardMapping =
+                ThingsFieldExpressionFactory.of(Map.of("wildTemp", "/features/*/properties/temp"));
+        final PostgresSortClause clause = PostgresSortClause.of(List.of(asc(wildcardMapping.sortBy("wildTemp"))));
+        assertThatThrownBy(() -> clause.applyOrdering(baseSelect()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("/features/*/properties/temp");
     }
 
     // ============================================================================ cursor projection (handoff to D4)
