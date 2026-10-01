@@ -333,9 +333,91 @@ The PostgreSQL search backend adds a small set of search-specific knobs on top o
 | `ditto.postgresql.search.reaper.interval` | `30s` | `POSTGRES_SEARCH_REAPER_INTERVAL` | How often the `delete_at` reaper attempts a tick (Postgres has no TTL index; the reaper replaces Mongo's TTL deletion). |
 | `ditto.postgresql.search.reaper.batch-size` | `1000` | `POSTGRES_SEARCH_REAPER_BATCH_SIZE` | Rows deleted per reap batch (`DELETE … FOR UPDATE SKIP LOCKED` LIMIT), bounding one statement's lock footprint. |
 | `ditto.postgresql.search.reaper.max-batches-per-tick` | `50` | `POSTGRES_SEARCH_REAPER_MAX_BATCHES_PER_TICK` | Safety valve: at most this many batches per tick, so one tick's transaction is never held open against an arbitrarily large backlog. |
-| `ditto.postgresql.force-custom-plan` | `true` (for search) | `POSTGRES_SEARCH_FORCE_CUSTOM_PLAN` | Binds `plan_cache_mode=force_custom_plan` on the search JVM's pool so `wpath`-parameterized read statements re-plan against their actual bound path instead of latching onto a generic plan. |
+| `ditto.postgresql.force-custom-plan` | `true` (for search) | `POSTGRES_SEARCH_FORCE_CUSTOM_PLAN` | Binds `plan_cache_mode=force_custom_plan` on the search JVM's pool so `wpath`-parameterized read statements re-plan against their actual bound path instead of latching onto a generic plan. Also required for the per-path indexes below to be used. |
+| `ditto.postgresql.search.path-indexes.paths` | unset (not managed) | `POSTGRES_SEARCH_PATH_INDEXES` (a JSON array) | Per-path search indexes, see [Per-path search indexes](#per-path-search-indexes-optional). Unset: none is built or dropped; `[]`: all are dropped. |
+| `ditto.postgresql.search.path-indexes.direct-uri` | `""` (use `ditto.postgresql.uri`) | `POSTGRES_SEARCH_PATH_INDEXES_DIRECT_URI` | A direct (non-PgBouncer) r2dbc URI of the same database for building the per-path indexes. Required with `pooler-mode = transaction`. |
 
 Pool sizing, SSL and credentials are **not** search-specific — they come from the shared `ditto.postgresql.*` client block (the same one the persistence backend uses), tuned via `POSTGRES_URI` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DDL_*` and `POSTGRES_SSL_MODE`.
+
+#### Per-path search indexes (optional)
+
+`like`/`ilike` with a pattern of at least three letters or digits is served by one table-wide trigram index, `sf_trgm`, over the text values of **all** paths. On a path that many things carry, typically a property of every feature (`features/*/properties/…`), such a query first collects the matching values of all paths and then discards those on other paths, and the planner may additionally intersect them with a scan of every row of that path. For such hot paths you can configure a per-path trigram index: a partial index restricted to one path, which the planner uses instead of `sf_trgm` for `like`/`ilike` on exactly that path. It is the PostgreSQL counterpart of the MongoDB custom search indexes.
+
+```hocon
+ditto.postgresql.search.path-indexes {
+  paths = [
+    { path = "features/*/properties/serialNumber", kind = "trigram" }
+    { path = "attributes/location/city", kind = "trigram" }
+  ]
+}
+```
+
+The same list as an environment variable, or as system properties:
+
+```shell
+POSTGRES_SEARCH_PATH_INDEXES='[{"path":"features/*/properties/serialNumber","kind":"trigram"}]'
+
+-Dditto.postgresql.search.path-indexes.paths.0.path=features/*/properties/serialNumber
+-Dditto.postgresql.search.path-indexes.paths.0.kind=trigram
+```
+
+* `path`: the search field exactly as you write it in an RQL filter: `attributes/…`, `features/<featureId>/properties/…`, `features/*/properties/…`, `…/desiredProperties/…`, `features/<featureId or *>/definition`, or a field mapped to one of these. `features/*/properties/x` and `features/env/properties/x` are different paths: index the form your queries use. `thingId` and `namespace` are columns of `search_things`, not paths, and are rejected.
+* `kind`: `trigram`, the only kind so far.
+* An invalid entry (an unknown field, a missing or unknown `kind`, a duplicate) fails the start of the search service.
+* **Unset versus empty.** While `paths` is not set (the default; a blank `POSTGRES_SEARCH_PATH_INDEXES` counts as not set), the service manages no per-path index: it builds none and drops none, and logs (INFO) which `sf_path_*` indexes exist. Only a set list is applied, and an explicitly empty list (`paths = []`, or `POSTGRES_SEARCH_PATH_INDEXES='[]'`) drops every `sf_path_*` index.
+
+For each entry the search service builds:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS sf_path_trgm_<hash> ON search_flat
+    USING gin ((val_text COLLATE "C.utf8") gin_trgm_ops)
+    WHERE wpath = '<the path as stored in search_flat>' AND val_text IS NOT NULL;
+```
+
+* **Name:** `sf_path_trgm_` followed by 16 hex digits of the SHA-256 of the index definition. It is the same on every instance and at every start; the service log names the path of every index it builds.
+* **Semantics:** the indexed expression is the one of `sf_trgm`, so the prerequisites and the matching are the same (the `pg_trgm` extension and the `C.utf8` collation, see the `like`/`ilike` notes below). The index changes which index serves a query, never which things match.
+* **Planning:** the planner can only use a per-path index when it sees the queried path as a value, i.e. with custom plans. Keep `ditto.postgresql.force-custom-plan` at its search default `true`; under a generic plan the per-path indexes are never used.
+
+**How and when the indexes are built.** They are not part of the versioned (checksummed) search schema.
+
+* After every successful schema bootstrap, the search service compares the configured list with the `sf_path_*` indexes on `search_flat`, in the background: the service starts serving right away, and until a new index is valid, queries on its path keep using `sf_trgm`.
+* If nothing has to change, that costs one catalog query: no lock, no DDL.
+* Otherwise one instance takes a session advisory lock (the others skip), sets `statement_timeout = 0` and `lock_timeout = 0` for its own session, and builds one index at a time with `CREATE INDEX CONCURRENTLY`. The build by itself does not block reads or writes of the running instances. The build phase and progress are logged every 30 seconds.
+* Nothing is changed while the stored search schema is newer than the running code (during a rolling upgrade the newer code manages the indexes), and nothing at all when the schema bootstrap refused to start.
+* **Repair:** a `CREATE INDEX CONCURRENTLY` that fails or is cancelled, or whose database backend is killed, leaves an INVALID index behind, which `IF NOT EXISTS` would skip forever and which still costs write overhead. The service drops it right away if it can, and otherwise drops and rebuilds it at the next start of any instance.
+* If the service stops during a build, PostgreSQL keeps building until the build is done, unless a search instance that starts meanwhile deadlocks the build (see below); meanwhile no other instance starts a second one.
+
+**Do not start, restart or roll search instances while a per-path index is built or dropped.** Every start of a search instance runs the schema bootstrap, which re-runs `CREATE INDEX IF NOT EXISTS` for the built-in indexes of `search_things` and `search_flat` in one transaction. On `search_flat` those statements wait for the lock that a running build (or a `DROP INDEX CONCURRENTLY` of a removed path) holds for its whole duration. Measured on PostgreSQL 16:
+
+* The starting instance waits in its bootstrap. Meanwhile **writes to `search_things` and `search_flat` stall for all search instances** (the waiting bootstrap already holds a lock on `search_things`, and new writes to `search_flat` queue behind its pending lock request); reads continue. This lasts up to the bootstrap's statement timeout (`ditto.postgresql.statement-timeout`, 60 s by default). Then that start fails, and the next start attempt stalls writes again, until the build is done.
+* Or PostgreSQL's deadlock detector aborts the **build** instead (when the build reaches its last phase while the bootstrap waits): the start succeeds, the index is left INVALID, and it is dropped and rebuilt at the next start of an instance (another full build).
+* This also happens when a single instance is restarted during its own build: PostgreSQL keeps building, and the restarted instance's bootstrap waits for that build as described.
+
+What to do:
+
+* Add or remove paths at a quiet time, and roll the change out so that no further search instance starts while the build runs: for example, scale the search service to one instance, change the list, wait until the build has finished, then scale back up. Later restarts with an unchanged list build and drop nothing, with one exception: if a build failed and left an INVALID index that could not be dropped right away, the next start repairs it, which is a full build again; treat that start like a path change (no further starts until `Built search path index …`).
+* Do not restart or roll search instances (and avoid node drains) while a build or drop is running.
+* To see whether one is running:
+  * in the log of the instance that builds: `Building search path index sf_path_… (i/n)` and a progress line every 30 seconds, until `Built search path index …` and `Search path index changes applied`;
+  * in PostgreSQL: `SELECT pid, phase, blocks_done, blocks_total FROM pg_stat_progress_create_index WHERE relid = 'search_flat'::regclass;` returns a row while a build runs, and `SELECT pid, query FROM pg_stat_activity WHERE query LIKE 'DROP INDEX CONCURRENTLY IF EXISTS sf_path_%';` while a drop runs. An `sf_path_*` index with `pg_index.indisvalid = false` is being built, or is the leftover of a failed build.
+
+**A direct database connection is required.** The build runs on a dedicated, non-pooled connection (never one of the search pool) as the DDL role (`ddl-credentials`, else the runtime role), which must own `search_flat`. The advisory lock, the session settings and the build have to run in **one** server session. Transaction-mode PgBouncer cannot carry that: it may run every statement on a different server connection, so the lock could stay behind on a pooled server connection, `statement_timeout = 0` could leak into other clients' transactions, and the build would run under the server's timeout.
+
+* With a direct connection or session-mode pooling, leave `direct-uri` empty.
+* With `ditto.postgresql.pooler-mode = transaction`, set `ditto.postgresql.search.path-indexes.direct-uri` (`POSTGRES_SEARCH_PATH_INDEXES_DIRECT_URI`) to a direct r2dbc URI of the same database (the credentials and SSL settings of `ditto.postgresql` apply to it). Without it, the service logs an error and changes no index.
+* A `statement_timeout` or `lock_timeout` role default on the DDL role is overridden for the build session only.
+
+**Removing a path drops its index.** At the next start the service drops (`DROP INDEX CONCURRENTLY`) every `sf_path_*` index whose path is no longer in the (set) list, as Ditto drops a MongoDB custom search index that is removed from `custom-indexes`. A per-path index costs maintenance on every write to its path, so a forgotten one would cost write throughput without serving any query.
+
+* Only per-path indexes are dropped. This rests on the names: the service only drops indexes of `search_flat` whose name starts with `sf_path_`, a prefix no other index of the search schema uses, and the hash in the name keeps different paths and definitions apart. Do not give your own indexes that prefix.
+* **All search instances that share the database must use the same list** (one configuration source, changed in one rollout). With different lists, each instance drops at its start what its list lacks and builds what it adds, so the indexes are dropped and rebuilt again at every start, and each rebuild reads the whole table. During a rolling change this happens once: an instance with the old list does not rebuild a dropped index before its own next start.
+* An instance that must not manage the indexes (for example a blue/green twin on the same database) leaves `paths` unset; it then only logs at INFO which `sf_path_*` indexes it found and leaves them alone.
+
+**Build time and cost.** On the 1M-thing search benchmark corpus (68.5 million `search_flat` rows, 4.5 million of them on `/features/*/properties/prop0`; PostgreSQL 16 defaults, `maintenance_work_mem` 64 MB, a laptop VM), building the index for `features/*/properties/prop0` took **44 seconds**, with much of the table in the page cache, and the index is **51 MB** (the table-wide `sf_trgm`: 304 MB). Infix `ilike` on that path then took **111.2 / 111.1 ms p95** in two runs (96.6 / 95.7 ms p50), instead of **305.8 / 325.5 ms p95** (197.6 / 187.8 ms p50) in two runs without it. Measurements and plans: `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/path-index/README.md`.
+
+* A build reads the whole `search_flat` heap twice (build and validation scan), however few rows the path has, so its duration grows with the whole table.
+* A larger `maintenance_work_mem` for the DDL role speeds up GIN builds, e.g. `ALTER ROLE <ddl role> SET maintenance_work_mem = '512MB'`.
+* Every write to a configured path also updates its index.
 
 #### Prerequisites, migration and known limitations
 
@@ -349,14 +431,14 @@ Pool sizing, SSL and credentials are **not** search-specific — they come from 
   ```
 
   While the index is absent, `like`/`ilike` queries fall back to scans — everything else is unaffected. Recreate it **before** the next search-service restart: the schema bootstrap re-runs `CREATE INDEX IF NOT EXISTS sf_trgm` at every start, so a restart would otherwise rebuild it as a plain (blocking, non-concurrent) build against the by-then-populated table. This is purely an optimisation — by default GIN's `fastupdate` pending list amortises per-insert cost, and the re-index works fine with the index in place.
-* **`like`/`ilike` performance caveat:** sub-3-character `like`/`ilike` patterns and high-cardinality-path `ilike` cannot be fully served by the trigram index and degrade to a scan — mirroring MongoDB's own unanchored-regex degradation. The slow-query log catches abuse. Per-path scoped trigram indexes are under evaluation as a possible future mitigation but are not part of this release.
+* **`like`/`ilike` performance caveat:** sub-3-character `like`/`ilike` patterns cannot be served by the trigram index and degrade to a scan — mirroring MongoDB's own unanchored-regex degradation. The slow-query log catches abuse. `ilike` on a path that many things carry is slow with the table-wide `sf_trgm` alone: on the 1M-thing benchmark corpus, infix `ilike` on `features/*/properties/prop0` took **305.8–391.5 ms p95** in three runs (most patterns about 200 ms, some 300–420 ms when the planner adds a scan of all rows of the path). Configure a [per-path search index](#per-path-search-indexes-optional) for such paths.
 * **Sort performance caveat:** sorting by any field other than `thingId` or `namespace` (an attribute, a feature property such as `sort(+features/env/properties/temperature)`, `_modified`, …) cannot be served by an index. To return any page, the search looks up the sort value of **every** thing that matches the filter and is visible to the caller, then orders them. The cost grows with the number of matching visible things, not with the page size, and neither `limit(offset,size)` nor cursor paging reduces it.
   * On the 1M-thing search benchmark (PostgreSQL 16 defaults: 128 MB `shared_buffers`, `jit = on`; no filter; about 29,400 things visible to the caller), one sorted page took about **350 ms p95** for page 1 and about **360–390 ms p95** for page 100 via `limit`. Page 100 via the cursor took about **680 ms p95**. That is above the 200 ms target the other read shapes are measured against.
   * The cursor page costs more because its resume filter is evaluated for every visible thing.
   * For fast sorted searches, sort by `thingId` (the default) or `namespace`. Both are index-served: on the same corpus, page 1 took 0.3 ms p95 (warm). Deep pages via `limit` still cost in proportion to the skipped things (about 130 ms p95 at page 100). Otherwise, narrow the matching set with a selective filter.
   * About 200 ms of the cursor page is JIT compilation (`jit = on` is the PostgreSQL default). With `jit = off`, that page took about 460 instead of 670 ms p95 on the same corpus.
   * Measurements, SQL and plans: `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/sort-path-bound/` (`README.md` and `psql-checks.md`).
-* **Mongo-only search knobs:** search settings specific to MongoDB (e.g. per-metric MongoDB index hints, custom MongoDB search indexes) are ignored (logged with a WARN) when the PostgreSQL search backend is active.
+* **Mongo-only search knobs:** search settings specific to MongoDB (e.g. per-metric MongoDB index hints, custom MongoDB search indexes) are ignored (logged with a WARN) when the PostgreSQL search backend is active. Per-path PostgreSQL indexes are configured separately, see [Per-path search indexes](#per-path-search-indexes-optional).
 
 {% include note.html content="A `search-update-mapper` custom extension implementation must be re-typed to the backend-neutral write model to work with this release — see the release notes for the `SearchUpdateMapper` breaking change and migration guide. Custom `search-update-observer` implementations need no change." %}
 
@@ -377,7 +459,7 @@ unchanged. (`stream.persistence.with-acks-writeConcern` is a MongoDB write conce
 | `stream.write-interval` | `THINGS_SEARCH_UPDATER_STREAM_WRITE_INTERVAL` | identical — the per-thing write tick lives in the updater actor; both backends receive one write per tick |
 | `stream.policy-cache.retry-delay`, `stream.thing-cache.retry-delay` | `THINGS_SEARCH_UPDATER_STREAM_POLICY_CACHE_RETRY_DELAY`, `THINGS_SEARCH_UPDATER_STREAM_THING_CACHE_RETRY_DELAY` | identical — enforcer-cache retry back-off in the shared enforcement flow (the policy-cache delay is parsed but currently not consumed; only the thing-cache delay drives the retry) |
 
-The only PostgreSQL-specific search tunables are the ones listed under *Operational tunables* above; there is no
+The only PostgreSQL-specific search tunables are the ones listed under *Operational tunables* above (including the per-path indexes); there is no
 Postgres-side override of any background-sync or stream setting.
 
 ## Further reading

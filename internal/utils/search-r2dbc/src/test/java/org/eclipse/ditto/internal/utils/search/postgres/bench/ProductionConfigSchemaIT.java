@@ -18,8 +18,12 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Map;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndex;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexKind;
+import org.eclipse.ditto.rql.query.expression.ThingsFieldExpressionFactory;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assume;
@@ -31,7 +35,8 @@ import org.junit.Test;
  * Proves the production-config catalog check ({@link ProductionConfigSchema#verify}) accepts exactly the production
  * DDL and reports every bench-only extra the Phase-0 mitigation ladder used — a covering index, a same-named but
  * redefined index, a per-column statistics target, an extended statistics object, a reloption — and that the
- * reference schema it builds leaves no trace.
+ * reference schema it builds leaves no trace. An operator-configured per-path trigram index (built outside the
+ * production DDL) is listed separately, not reported.
  */
 public final class ProductionConfigSchemaIT {
 
@@ -75,6 +80,7 @@ public final class ProductionConfigSchemaIT {
 
         assertThat(check.differences()).isEmpty();
         assertThat(check.matchesProduction()).isTrue();
+        assertThat(check.productionVerdict()).isEqualTo("true");
         assertThat(check.actualIndexes()).containsExactlyInAnyOrderElementsOf(
                 ProductionConfigSchema.expectedIndexNames());
         // 14 indexes + 25 columns + 4 constraints at least.
@@ -128,6 +134,33 @@ public final class ProductionConfigSchemaIT {
 
         assertThat(ProductionConfigSchema.verify(connection).differences())
                 .anyMatch(d -> d.startsWith("reloptions search_flat: live=autovacuum_vacuum_scale_factor=0.01"));
+    }
+
+    @Test
+    public void perPathTrigramIndexIsListedNotReported() throws SQLException {
+        final PathIndex index = PathIndex.of("features/*/properties/prop0", PathIndexKind.TRIGRAM,
+                ThingsFieldExpressionFactory.of(Map.of()));
+        execute(index.createStatement());
+
+        final ProductionConfigSchema.CatalogCheck check = ProductionConfigSchema.verify(connection);
+
+        assertThat(check.differences()).isEmpty();
+        assertThat(check.perPathIndexes()).singleElement().asString()
+                .startsWith("CREATE INDEX " + index.name() + " ON search_flat USING gin");
+        assertThat(check.perPathIndexNames()).containsExactly(index.name());
+        assertThat(check.actualIndexes()).contains(index.name());
+        // a run with a leftover per-path index must not read as a plain production-DDL run
+        assertThat(check.productionVerdict()).isEqualTo("production DDL + 1 per-path index");
+    }
+
+    @Test
+    public void otherIndexUnderThePerPathPrefixIsReported() throws SQLException {
+        execute("CREATE INDEX sf_path_trgm_0000000000000000 ON search_flat (wpath)");
+
+        final ProductionConfigSchema.CatalogCheck check = ProductionConfigSchema.verify(connection);
+
+        assertThat(check.differences()).anyMatch(d -> d.startsWith("index sf_path_trgm_0000000000000000: live="));
+        assertThat(check.perPathIndexes()).isEmpty();
     }
 
     private void execute(final String sql) throws SQLException {

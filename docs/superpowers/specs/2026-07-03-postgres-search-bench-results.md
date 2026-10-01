@@ -302,6 +302,11 @@ Mongo custom indexes ... explicitly out of scope"). Options on the table, NOT de
 This is genuinely open. The plan doc's §3.5 ilike row and §5 risk table now both point here (this section) and
 state explicitly that the plan does not choose an option.
 
+**Decided 2026-10-01: option (b).** The production-config baseline (§10) measured 3-high at 391.5 ms all-rounds warm
+p95 with the shipped schema and translator (every per-round and pooled reading of three runs ≥ 314.7 ms), above the
+200 ms rule. Operator-configured per-path trigram indexes (`ditto.postgresql.search.path-indexes`) now ship, built
+with `CREATE INDEX CONCURRENTLY` outside the checksummed DDL (plan §3.7).
+
 ### 8.2 Plancache generic-plan-flip hazard (HARD requirement for Phase D)
 
 r2dbc-postgresql, like pgjdbc, reuses named prepared statements. Task 0.2b measured PostgreSQL's plancache

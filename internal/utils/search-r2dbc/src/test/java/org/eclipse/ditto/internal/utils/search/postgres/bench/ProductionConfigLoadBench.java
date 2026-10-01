@@ -169,7 +169,7 @@ public class ProductionConfigLoadBench {
         sb.append("Every index definition, column, constraint, reloption, per-column statistics target and extended ")
                 .append("statistics object of the search tables, compared with a reference built from ")
                 .append("`PostgresSearchSchema.ddlStatements()` in a rolled-back scratch schema.\n\n");
-        sb.append("- matches production: **").append(check.matchesProduction()).append("** (")
+        sb.append("- matches production: **").append(check.productionVerdict()).append("** (")
                 .append(check.comparedItems()).append(" items compared)\n");
         sb.append("- differences: ").append(check.differences()).append("\n\n");
         sb.append("```\n");

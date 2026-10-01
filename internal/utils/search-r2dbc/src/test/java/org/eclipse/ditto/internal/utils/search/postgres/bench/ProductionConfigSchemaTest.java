@@ -19,6 +19,8 @@ import java.util.List;
 import java.util.Set;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSearchSchema;
+import org.eclipse.ditto.json.JsonFactory;
+import org.eclipse.ditto.json.JsonObject;
 import org.junit.Test;
 
 /**
@@ -68,4 +70,38 @@ public final class ProductionConfigSchemaTest {
                 "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm"));
     }
 
+
+    @Test
+    public void verdictNamesPerPathIndexesInsteadOfPlainTrue() {
+        final String perPath = "CREATE INDEX sf_path_trgm_ca5f5cd692cb58e9 ON search_flat USING gin (val_text COLLATE "
+                + "\"C.utf8\" gin_trgm_ops) WHERE ((wpath = '/features/*/properties/prop0'::text) AND (val_text IS NOT "
+                + "NULL))";
+
+        assertThat(check(List.of(), List.of()).productionVerdict()).isEqualTo("true");
+        assertThat(check(List.of(), List.of(perPath)).productionVerdict())
+                .isEqualTo("production DDL + 1 per-path index");
+        assertThat(check(List.of(), List.of(perPath, perPath.replace("ca5f", "0000"))).productionVerdict())
+                .isEqualTo("production DDL + 2 per-path indexes");
+        assertThat(check(List.of("index x: live=… production=null"), List.of(perPath)).productionVerdict())
+                .isEqualTo("false");
+        assertThat(check(List.of(), List.of(perPath)).perPathIndexNames())
+                .containsExactly("sf_path_trgm_ca5f5cd692cb58e9");
+    }
+
+    @Test
+    public void summaryStatesThePerPathIndexesOfTheWarmRun() {
+        assertThat(ProductionConfigReadBench.perPathIndexLine(JsonObject.empty()))
+                .isEqualTo("Per-path indexes during the warm run: not recorded.");
+        assertThat(ProductionConfigReadBench.perPathIndexLine(JsonFactory.newObject("{\"perPathIndexes\":[]}")))
+                .isEqualTo("Per-path indexes during the warm run: none (production DDL only).");
+        assertThat(ProductionConfigReadBench.perPathIndexLine(JsonFactory.newObject(
+                "{\"perPathIndexes\":[\"sf_path_trgm_ca5f5cd692cb58e9\"]}")))
+                .startsWith("**Per-path indexes during the warm run**")
+                .endsWith("`sf_path_trgm_ca5f5cd692cb58e9`.");
+    }
+
+    private static ProductionConfigSchema.CatalogCheck check(final List<String> differences,
+            final List<String> perPathIndexes) {
+        return new ProductionConfigSchema.CatalogCheck(Set.of(), 43, differences, List.of(), perPathIndexes);
+    }
 }

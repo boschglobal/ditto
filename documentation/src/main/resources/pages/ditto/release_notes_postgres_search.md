@@ -64,17 +64,24 @@ tooling. The cutover to PostgreSQL is: point the search service at an empty Post
 ## `like`/`ilike` performance — known limitation
 
 Sub-3-character `like`/`ilike` patterns cannot be served by a trigram index and degrade to a scan — this mirrors
-MongoDB's own unanchored-regex degradation and is caught by the existing slow-query log. Separately, high-cardinality
-paths queried with `ilike` remain slower than the point-lookup shapes under the single global trigram index. Per-path
-scoped trigram indexes are **under evaluation** as a possible future mitigation (see the benchmark-results
-investigation) — this release does **not** adopt a scoped-index design and the trade-off remains open; the current
-behavior is documented here as a known limitation, not a settled acceptance.
+MongoDB's own unanchored-regex degradation and is caught by the existing slow-query log. Separately, `ilike` on a path
+that many things carry is slow under the single table-wide trigram index: on the 1M-thing benchmark corpus, infix
+`ilike` on `features/*/properties/prop0` took 305.8–391.5 ms p95 in three runs. For such paths, operators can now
+configure **per-path search indexes** (`ditto.postgresql.search.path-indexes`, the PostgreSQL counterpart of MongoDB
+custom search indexes): a partial trigram index restricted to one path, built in the background with
+`CREATE INDEX CONCURRENTLY` after the schema bootstrap, repaired if a build fails, and dropped when its path is removed
+from the list (an unset list manages nothing; an explicitly empty one drops them all). With it, the same queries took
+111.1–111.2 ms p95. Building the indexes needs a direct (not transaction-pooled) database connection, and no search
+instance should be started or restarted while an index is being built or dropped: a starting instance's schema
+bootstrap waits for the build and stalls index writes meanwhile. See the PostgreSQL search section of the installation
+guide.
 
 ## Mongo-only search knobs ignored on PostgreSQL
 
 Search configuration specific to MongoDB — for example per-metric MongoDB index hints and configurable custom MongoDB
 search indexes — is **ignored (logged with a WARN)** when the PostgreSQL search backend is active. These knobs have no
-PostgreSQL analog and are safely left in place for Mongo-search deployments.
+direct PostgreSQL analog and are safely left in place for Mongo-search deployments; per-path PostgreSQL search indexes
+are configured separately under `ditto.postgresql.search.path-indexes` (see above).
 
 ## Background-sync and updater-stream settings — unchanged on PostgreSQL
 

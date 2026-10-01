@@ -25,6 +25,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSearchSchema;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndex;
 
 /**
  * The production-config bench mode's schema: exactly {@link PostgresSearchSchema#ddlStatements()} — the SHIPPED search
@@ -108,14 +109,47 @@ final class ProductionConfigSchema {
      * @param differences every item whose live definition differs from, or is missing in, the reference (must be
      * empty).
      * @param indexDefinitions {@code pg_get_indexdef} of every live index, for the evidence file.
+     * @param perPathIndexes {@code pg_get_indexdef} of the operator-configured per-path indexes
+     * ({@code ditto.postgresql.search.path-indexes}): built outside the production DDL, so not compared, only listed.
      */
     record CatalogCheck(Set<String> actualIndexes, int comparedItems, List<String> differences,
-            List<String> indexDefinitions) {
+            List<String> indexDefinitions, List<String> perPathIndexes) {
 
         boolean matchesProduction() {
             return differences.isEmpty();
         }
+
+        /**
+         * @return {@code "true"}, {@code "false"}, or — when the catalog matches but per-path indexes are present —
+         * {@code "production DDL + N per-path index(es)"}, so a run with a leftover per-path index cannot pass for a
+         * plain production-DDL run.
+         */
+        String productionVerdict() {
+            if (!matchesProduction()) {
+                return "false";
+            }
+            return perPathIndexes.isEmpty() ? "true" : "production DDL + " + perPathIndexes.size() + " per-path index"
+                    + (perPathIndexes.size() == 1 ? "" : "es");
+        }
+
+        /**
+         * @return the names of the per-path indexes, parsed from their definitions.
+         */
+        List<String> perPathIndexNames() {
+            return perPathIndexes.stream()
+                    .map(definition -> definition.substring("CREATE INDEX ".length(), definition.indexOf(" ON ")))
+                    .toList();
+        }
     }
+
+    /**
+     * The definition of a per-path trigram index as {@code PathIndexMaintenance} builds it (schema name removed): a
+     * managed {@code sf_path_} name, the table-wide trigram expression, restricted to one wpath.
+     */
+    private static final Pattern PER_PATH_TRIGRAM = Pattern.compile("CREATE INDEX "
+            + Pattern.quote(PathIndex.NAME_PREFIX) + "trgm_[0-9a-f]{16} ON search_flat USING gin \\(val_text COLLATE \""
+            + Pattern.quote(PostgresSearchSchema.TRIGRAM_INDEX_COLLATION)
+            + "\" gin_trgm_ops\\) WHERE \\(\\(wpath = '.*'::text\\) AND \\(val_text IS NOT NULL\\)\\)");
 
     /** Scratch schema the reference catalog is built in; the transaction that creates it is always rolled back. */
     private static final String REFERENCE_SCHEMA = "production_config_ddl_reference";
@@ -128,7 +162,10 @@ final class ProductionConfigSchema {
      * every extended statistics object. Anything the production DDL does not create — a covering index, a
      * {@code SET STATISTICS}, a {@code CREATE STATISTICS}, a reloption — or a same-named but redefined index shows up
      * as a difference (review round 1, M5). Comparing against the reference instead of hard-coded expectations keeps
-     * the check correct when the production DDL itself gains, e.g., autovacuum reloptions.
+     * the check correct when the production DDL itself gains, e.g., autovacuum reloptions. An operator-configured
+     * per-path trigram index ({@code sf_path_trgm_*} with exactly the shape {@code PathIndexMaintenance} builds) is not
+     * part of the production DDL by design; it is listed in {@link CatalogCheck#perPathIndexes()} instead of being
+     * reported as a difference. Any other index under that name prefix is still a difference.
      */
     static CatalogCheck verify(final Connection connection) throws SQLException {
         final String liveSchema;
@@ -139,6 +176,18 @@ final class ProductionConfigSchema {
         }
         final java.util.Map<String, String> live = catalog(connection, liveSchema);
         final List<String> liveIndexDefinitions = indexDefinitions(connection, liveSchema);
+        final Set<String> liveIndexes = new TreeSet<>();
+        live.keySet().stream().filter(k -> k.startsWith("index ")).forEach(k -> liveIndexes.add(k.substring(6)));
+        final List<String> perPathIndexes = new ArrayList<>();
+        live.entrySet().removeIf(item -> {
+            final boolean perPath = item.getKey().startsWith("index ")
+                    && PathIndex.isManagedName(item.getKey().substring(6))
+                    && PER_PATH_TRIGRAM.matcher(item.getValue()).matches();
+            if (perPath) {
+                perPathIndexes.add(item.getValue());
+            }
+            return perPath;
+        });
 
         final java.util.Map<String, String> reference;
         final boolean autoCommit = connection.getAutoCommit();
@@ -166,9 +215,8 @@ final class ProductionConfigSchema {
                 differences.add(key + ": live=" + liveValue + " production=" + referenceValue);
             }
         }
-        final Set<String> liveIndexes = new TreeSet<>();
-        live.keySet().stream().filter(k -> k.startsWith("index ")).forEach(k -> liveIndexes.add(k.substring(6)));
-        return new CatalogCheck(liveIndexes, keys.size(), differences, liveIndexDefinitions);
+        return new CatalogCheck(liveIndexes, keys.size(), differences, liveIndexDefinitions,
+                List.copyOf(perPathIndexes));
     }
 
     /** Item → normalised definition for the search tables in {@code schema}. */

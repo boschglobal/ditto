@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.annotation.Nullable;
@@ -34,6 +35,9 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresHeal
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.DefaultPostgresSearchPathIndexConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexMaintenance;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PostgresSearchPathIndexConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.DefaultPostgresDeleteAtReaperConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.PostgresDeleteAtReaper;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.PostgresDeleteAtReaperActor;
@@ -66,6 +70,7 @@ import com.typesafe.config.ConfigValueType;
 import io.r2dbc.spi.Closeable;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcException;
+import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 
 /**
@@ -137,6 +142,8 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
      */
     private final AtomicBoolean deleteAtReaperStarted = new AtomicBoolean(false);
 
+    @Nullable private volatile CompletableFuture<PathIndexMaintenance.Outcome> pathIndexMaintenanceOutcome;
+
     /**
      * Constructor invoked reflectively by {@code PekkoClassLoader} during extension loading.
      *
@@ -158,6 +165,9 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
     public void bootstrapSchema() {
         // SYNCHRONOUS, fail-fast (SPI contract): the service must refuse to serve traffic against an unusable index.
         final PostgresConfig config = postgresConfig();
+        // Validated before any database work: an invalid per-path index entry fails the start with a config error.
+        final PostgresSearchPathIndexConfig pathIndexConfig = DefaultPostgresSearchPathIndexConfig.of(
+                actorSystem.settings().config().getConfig("ditto"), simpleFieldMappings());
         final ConnectionFactory ddlConnectionFactory = ConnectionPoolFactory.createDdlConnectionFactory(config);
         try {
             PostgresSchemaManager.of(ddlConnectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
@@ -178,6 +188,40 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
         // successful bootstrap and before the search read/updater paths issue runtime statements.
         PostgresClientExtension.get(actorSystem).getClient()
                 .registerSchemaDescriptor(PostgresSearchSchema.descriptor());
+        startPathIndexMaintenance(config, pathIndexConfig);
+    }
+
+    /**
+     * Starts the per-path index maintenance in the background — only reached after a successful bootstrap, so a
+     * refused bootstrap never builds an index. It runs on its own non-pooled DDL connection (never a connection of the
+     * runtime pool) and does not delay the start: an index build takes minutes on a large {@code search_flat}, and
+     * until an index is valid the planner keeps using the table-wide one. Failures are logged; the service keeps
+     * running (Mongo parity: custom search indexes are initialized asynchronously, failures logged).
+     */
+    private void startPathIndexMaintenance(final PostgresConfig config,
+            final PostgresSearchPathIndexConfig pathIndexConfig) {
+        final CompletableFuture<PathIndexMaintenance.Outcome> outcome = new CompletableFuture<>();
+        pathIndexMaintenanceOutcome = outcome;
+        try {
+            final Disposable run = PathIndexMaintenance.of(config, pathIndexConfig).run()
+                    .subscribe(outcome::complete, error -> {
+                        LOGGER.error("Search path index maintenance failed: {}", error.getMessage(), error);
+                        outcome.completeExceptionally(error);
+                    });
+            actorSystem.registerOnTermination(run::dispose);
+        } catch (final RuntimeException e) {
+            LOGGER.error("Search path index maintenance could not be started: {}", e.getMessage(), e);
+            outcome.completeExceptionally(e);
+        }
+    }
+
+    /**
+     * @return the outcome of the path-index maintenance started by the last {@link #bootstrapSchema()}, or
+     * {@code null} if none was started. Package private for tests.
+     */
+    @Nullable
+    CompletableFuture<PathIndexMaintenance.Outcome> pathIndexMaintenanceOutcome() {
+        return pathIndexMaintenanceOutcome;
     }
 
     private static void disposeQuietly(final ConnectionFactory ddlConnectionFactory) {
@@ -366,7 +410,8 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
         for (final String knob : detectIgnoredMongoKnobs(config)) {
             LOGGER.warn("Ignoring Mongo-only search configuration '{}': it has no effect on the PostgreSQL search "
                     + "backend (the PostgreSQL query planner chooses indexes; there is no per-query index hint, and "
-                    + "custom Mongo indexes have no PostgreSQL analog — plan §3.6/§3.7).", knob);
+                    + "custom Mongo indexes have no direct PostgreSQL analog — per-path PostgreSQL search indexes "
+                    + "are configured under ditto.postgresql.search.path-indexes).", knob);
         }
     }
 

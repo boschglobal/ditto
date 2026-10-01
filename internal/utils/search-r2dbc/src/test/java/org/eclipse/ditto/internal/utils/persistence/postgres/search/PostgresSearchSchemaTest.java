@@ -76,10 +76,14 @@ public final class PostgresSearchSchemaTest {
 
     @Test
     public void scopedPerPathTrigramIndexIsNotPartOfV1Ddl() {
-        // The E4 per-path scoped-trigram index is an open plan question (§3.7) and is deliberately NOT in v1.
-        assertThat(PostgresSearchSchema.ddlStatements())
-                .noneMatch(s -> s.contains("val_text gin_trgm_ops) WHERE wpath ="))
-                .noneMatch(s -> s.toLowerCase().contains("sf_trgm_scoped"));
+        // Operator-configured per-path indexes are built by PathIndexMaintenance with CREATE INDEX CONCURRENTLY after
+        // the bootstrap, outside the checksummed DDL (a path list change must never alter the schema checksum).
+        assertThat(PostgresSchemaManager.effectiveDdl(PostgresSearchSchema.descriptor()))
+                .noneMatch(s -> s.contains("gin_trgm_ops) WHERE wpath ="))
+                .noneMatch(s -> s.contains("WHERE wpath"))
+                .noneMatch(s -> s.contains("CONCURRENTLY"))
+                .noneMatch(s -> s.toLowerCase().contains("sf_trgm_scoped"))
+                .noneMatch(s -> s.contains("sf_path_"));
     }
 
     @Test

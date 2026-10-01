@@ -28,7 +28,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.IntFunction;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
@@ -104,6 +106,8 @@ public class ProductionConfigReadBench {
     private ActorSystem system;
     private ProductionSearchPath path;
     private Path resultsDir;
+    /** The per-path indexes the catalog check found during the warm run (written to warm.json and summary.md). */
+    private List<String> perPathIndexes = List.of();
 
     @Before
     public void setUp() {
@@ -284,6 +288,7 @@ public class ProductionConfigReadBench {
                     .set("generatedAt", started.toString())
                     .set("rounds", rounds)
                     .set("things", Long.parseLong(db.queryColumn("SELECT count(*) FROM search_things").get(0)))
+                    .set("perPathIndexes", jsonArray(perPathIndexes.stream().map(JsonValue::of).toList()))
                     .set("variants", jsonArray(json))
                     .build().toString());
             writeSummary();
@@ -858,12 +863,15 @@ public class ProductionConfigReadBench {
                     .append("Every index definition, column, constraint, reloption, per-column statistics target and ")
                     .append("extended statistics object of the search tables, compared with a reference built from ")
                     .append("`PostgresSearchSchema.ddlStatements()` in a rolled-back scratch schema.\n\n")
-                    .append("- matches production: **").append(check.matchesProduction()).append("** (")
+                    .append("- matches production: **").append(check.productionVerdict()).append("** (")
                     .append(check.comparedItems()).append(" items compared)\n- indexes: ").append(check.actualIndexes())
-                    .append("\n- differences: ").append(check.differences()).append("\n\n");
+                    .append("\n- differences: ").append(check.differences())
+                    .append("\n- per-path indexes (`ditto.postgresql.search.path-indexes`, built outside the ")
+                    .append("production DDL, not compared): ").append(check.perPathIndexes()).append("\n\n");
             if (!check.matchesProduction()) {
                 throw new AssertionError("catalog diverges from the production DDL: " + check);
             }
+            perPathIndexes = check.perPathIndexNames();
             sb.append("## Corpus\n\n");
             try (ResultSet rs = statement.executeQuery("SELECT (SELECT count(*) FROM search_things), "
                     + "(SELECT count(*) FROM search_flat), pg_size_pretty(pg_database_size(current_database())), "
@@ -884,6 +892,24 @@ public class ProductionConfigReadBench {
         }
         sb.append("## Service cursor (keyset) vs OFFSET pages\n\n").append(keysetCheck).append('\n');
         return sb.toString();
+    }
+
+    /**
+     * The summary's statement on per-path indexes ({@code ditto.postgresql.search.path-indexes}): they change the
+     * plans of {@code like}/{@code ilike} on their paths, so a run with one must not read as a plain production-DDL run.
+     */
+    static String perPathIndexLine(final JsonObject warm) {
+        final Optional<JsonArray> names = warm.getValue("perPathIndexes").filter(JsonValue::isArray)
+                .map(JsonValue::asArray);
+        if (names.isEmpty()) {
+            return "Per-path indexes during the warm run: not recorded.";
+        }
+        if (names.get().isEmpty()) {
+            return "Per-path indexes during the warm run: none (production DDL only).";
+        }
+        return "**Per-path indexes during the warm run** (`ditto.postgresql.search.path-indexes`, outside the "
+                + "production DDL): " + names.get().stream().map(JsonValue::asString).map(name -> "`" + name + "`")
+                .collect(Collectors.joining(", ")) + ".";
     }
 
     private void writeSummary() throws IOException {
@@ -915,6 +941,7 @@ public class ProductionConfigReadBench {
                 .append(" samples per shape (PostgreSQL- and Docker-VM-cold, host-cache state unknown: the macOS host ")
                 .append("file cache is not dropped, see `cold.md`). Plans: finds explained leader-only, as the shipped fetch-size ")
                 .append("path executes them. Server settings: `environment.md`.\n\n");
+        sb.append(perPathIndexLine(warm)).append("\n\n");
         sb.append("| shape | warm p50 ms | warm p95 ms (all rounds) | p50 per round | p95 per round | per-round p95 ")
                 .append("spread | cold 1st exec ms (median; host-cache state unknown) | cold samples | ")
                 .append("warm p95 (all rounds) vs 200 ms gate | evidence |\n");

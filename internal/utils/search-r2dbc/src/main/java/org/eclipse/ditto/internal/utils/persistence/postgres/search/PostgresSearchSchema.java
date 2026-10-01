@@ -57,6 +57,11 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
  * an already-provisioned database is a no-op rather than an error; the live-catalog verifier still catches a divergent
  * pre-existing table that {@code IF NOT EXISTS} would silently keep.
  * </p>
+ * <p>
+ * The operator-configured per-path indexes ({@code ditto.postgresql.search.path-indexes}) are deliberately NOT part of
+ * this DDL: they are built with {@code CREATE INDEX CONCURRENTLY} (which cannot run in the bootstrap transaction) by
+ * {@code PathIndexMaintenance} after a successful bootstrap, so the path list never changes the checksum.
+ * </p>
  */
 @Immutable
 public final class PostgresSearchSchema {
