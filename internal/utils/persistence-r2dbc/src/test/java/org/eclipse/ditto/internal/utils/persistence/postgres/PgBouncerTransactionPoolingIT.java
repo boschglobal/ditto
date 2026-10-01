@@ -30,6 +30,7 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.Defau
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.journal.PostgresJournalOps;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
 import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -49,10 +50,16 @@ import io.r2dbc.spi.ConnectionFactories;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.ConnectionFactoryOptions;
 
+import org.apache.pekko.actor.ActorSystem;
+import org.apache.pekko.stream.SystemMaterializer;
+import org.apache.pekko.stream.javadsl.Sink;
+import org.apache.pekko.testkit.javadsl.TestKit;
+
 /**
- * PgBouncer transaction-pooling smoke test: runs the schema bootstrap (transaction-scoped advisory-lock DDL) and a
- * write/recover/cleanup round-trip <em>through a real PgBouncer container in {@code pool_mode=transaction}</em> with
- * {@code prepared-statement-cache-queries=0} (unnamed statements — safe on any PgBouncer version).
+ * PgBouncer transaction-pooling smoke test: runs the schema bootstrap (transaction-scoped advisory-lock DDL), a
+ * write/recover/cleanup round-trip and portal-backed read-journal streams <em>through a real PgBouncer container in
+ * {@code pool_mode=transaction}</em> with {@code prepared-statement-cache-queries=0} (unnamed statements — safe on any
+ * PgBouncer version).
  * <p>
  * Mirrors the {@code api.version} portability fix via {@link PostgresDbResource}'s static initializer (referenced before
  * any container starts). If Docker or the PgBouncer image is unreachable, the {@link #start() Assume} guard turns it
@@ -79,6 +86,8 @@ public final class PgBouncerTransactionPoolingIT {
     private static GenericContainer<?> pgbouncer;
     private static DittoPostgresClient client;
     private static PostgresJournalOps journal;
+    private static PostgresReadJournal readJournal;
+    private static ActorSystem system;
 
     @BeforeClass
     public static void start() {
@@ -117,11 +126,17 @@ public final class PgBouncerTransactionPoolingIT {
         final ConnectionPool pool = new ConnectionPool(ConnectionPoolConfiguration.builder(factory)
                 .name("pgbouncer-pool").maxSize(8).build());
         client = DittoPostgresClient.forConnectionPool(pool, DefaultPostgresConfig.of(ConfigFactory.empty()));
-        journal = PostgresJournalOps.of(PostgresPersistenceOperations.of(client, "things"));
+        final PostgresPersistenceOperations operations = PostgresPersistenceOperations.of(client, "things");
+        journal = PostgresJournalOps.of(operations);
+        readJournal = PostgresReadJournal.of(operations);
+        system = ActorSystem.create("PgBouncerTransactionPoolingIT");
     }
 
     @AfterClass
     public static void stop() {
+        if (system != null) {
+            TestKit.shutdownActorSystem(system);
+        }
         if (client != null) {
             client.close();
         }
@@ -162,6 +177,37 @@ public final class PgBouncerTransactionPoolingIT {
         // cleanup: physical delete; the high-water-mark must still report 2 afterwards.
         await(journal.deleteMessagesTo(pid, 2L));
         assertThat(await(journal.readHighestSequenceNr(pid, 0L))).isEqualTo(2L);
+    }
+
+    /**
+     * The unbounded read-journal streams bind a positive per-statement fetch size, so they run through a server-side
+     * portal although the pool keeps {@code fetch-size=0}. Under transaction pooling the portal must survive between
+     * fetches: more pids than several fetches stream completely through both variants of the tag pid query (the ID-order
+     * persistence ping and connection-id retrieval use them).
+     */
+    @Test
+    public void portalBackedReadJournalStreamsCompleteThroughTransactionPooling() throws Exception {
+        final String tag = "pgb-portal";
+        final int pidCount = 1_000;
+        reactor.core.publisher.Mono.from(client.executeUpdatePublisher(
+                        "INSERT INTO things_journal (pid, sn, manifest, tags, event) "
+                                + "SELECT 'thing:pgb-portal:' || lpad(i::text, 6, '0'), 1, 'manifest', "
+                                + "ARRAY[$1, 'priority-' || (i % 10)], '{}'::jsonb FROM generate_series(1, $2) AS i",
+                        stmt -> {
+                            stmt.bind(0, tag);
+                            stmt.bind(1, pidCount);
+                        }))
+                .block(Duration.ofSeconds(30));
+
+        final List<String> anyTagged = await(readJournal.getJournalPidsWithTag(tag, 100,
+                Duration.ofSeconds(30), SystemMaterializer.get(system).materializer(), false)
+                .runWith(Sink.seq(), system));
+        final List<String> newestTagged = await(readJournal.getJournalPidsWithTag(tag, 100,
+                Duration.ofSeconds(30), SystemMaterializer.get(system).materializer(), true)
+                .runWith(Sink.seq(), system));
+
+        assertThat(anyTagged).hasSize(pidCount).doesNotHaveDuplicates();
+        assertThat(newestTagged).hasSize(pidCount).doesNotHaveDuplicates();
     }
 
     /**
