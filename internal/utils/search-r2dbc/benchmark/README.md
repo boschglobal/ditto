@@ -246,6 +246,13 @@ Reading the table (all from the committed plans and per-iteration tables):
     the page-100 cursor 689 / 727 / 773 ms: run-to-run drift of up to ~13%.
   - The service cursor's resume filter carries the sort path's per-field auth, so a cursor page is not the same
     request as the OFFSET page (see `environment.md`).
+  - **Path-bound sort lateral (2026-10-01):** the sort lateral now also binds `path` (= the sort wpath), so each
+    probe uses the whole `(thing_id, path, wpath)` key prefix and JIT stays below its optimize/inline thresholds.
+    - Back-to-back on this corpus (ABBA, all-rounds warm p95): page 1 578 / 599 → 347 / 349 ms; page-100 OFFSET
+      587 / 599 → 389 / 359 ms; page-100 cursor 696 / 710 → 683 / 679 ms. The cursor page is dominated by its resume
+      filter's `EXISTS` probes and ~200 ms of JIT.
+    - Still above the gate, so this is documented as a known limitation in `installation-extending.md`.
+    - Evidence: `results/production-config/sort-path-bound/`.
 - **Protocol effects** (superseded runs). Per-round p95:
 
   | Shape | attempt 1 (interleaved order) | attempt 2 (3 warmups) | this run |
