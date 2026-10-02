@@ -156,6 +156,8 @@ By default, Ditto stores Things, Policies, and Connectivity data in MongoDB.
 You can switch any service to a PostgreSQL backend by dropping in the extension JARs and mounting a service-specific activation config.
 MongoDB remains the default — this is strictly opt-in.
 
+**PostgreSQL version:** PostgreSQL 16 or newer (tested: 16, 17, 18). Older versions log a warning at startup, but the service still starts; technically, persistence needs PostgreSQL ≥ 10 and search PostgreSQL ≥ 13.
+
 #### 1. Provide the extension JARs
 
 The extension JARs are **not** included in the default Ditto images.
@@ -275,6 +277,8 @@ Repeat the same pattern for the Policies and Connectivity services, substituting
 ### PostgreSQL search backend
 
 Thing-search can **optionally** run its search index on PostgreSQL instead of MongoDB, independently of which backend the persistence services use. MongoDB remains the default search backend — this is strictly opt-in and only affects the `things-search` service.
+
+**PostgreSQL version:** PostgreSQL 16 or newer (tested: 16, 17, 18). Older versions log a warning at startup, but the service still starts; technically, persistence needs PostgreSQL ≥ 10 and search PostgreSQL ≥ 13 (from 13 on, `pg_trgm` is a trusted extension, see [Prerequisites](#prerequisites-migration-and-known-limitations)).
 
 #### 1. Provide the extension JARs
 

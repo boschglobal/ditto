@@ -26,6 +26,14 @@ Contents:
   rendered by `templates/postgres-tls-secret.yaml` and mounted via the
   `ditto.postgres.tls.{volume,volumeMount}` helpers.
 
+## PostgreSQL version
+
+PostgreSQL 16 or newer (tested: 16, 17, 18). At every start the schema
+bootstrap reads `server_version_num`; on an older server it logs a WARN and
+still starts. Technically, the persistence backend needs PostgreSQL ≥ 10 and
+the search backend PostgreSQL ≥ 13 (from 13 on `pg_trgm` is a trusted
+extension, so the DDL role can create it without superuser).
+
 ## 1. Provisioning order (MUST be followed in this sequence)
 
 The order is load-bearing because PostgreSQL `ALTER DEFAULT PRIVILEGES` applies

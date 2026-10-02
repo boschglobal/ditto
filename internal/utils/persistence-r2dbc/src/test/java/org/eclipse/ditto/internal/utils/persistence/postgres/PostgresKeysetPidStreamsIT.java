@@ -312,7 +312,10 @@ public final class PostgresKeysetPidStreamsIT {
         final String priorityStatement = PidStreamTestSupport.productionSql(PLAN_ENTITY,
                 readJournal -> readJournal.getJournalPidsWithTagOrderedByPriorityTag("", TIMEOUT), mat);
 
-        final String plan = fixture.explain("ANALYZE, COSTS OFF, TIMING OFF", priorityStatement, List.of(PLAN_TAG));
+        // BUFFERS OFF: PostgreSQL 18 reports buffers by default with ANALYZE, which puts a "Buffers:" line between a
+        // node and its child.
+        final String plan = fixture.explain("ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF", priorityStatement,
+                List.of(PLAN_TAG));
         System.out.printf("[plan] priority statement:%n%s%n", plan);
 
         // The priority is computed, not stored: one statement computes it for every qualifying pid and sorts them.
@@ -341,8 +344,14 @@ public final class PostgresKeysetPidStreamsIT {
         }
     }
 
+    /**
+     * The plan as on a table too large for this small fixture's shortcuts: no sequential scan, no sort, and no hashed
+     * alternative of an {@code EXISTS} sub-plan (which needs its whole result in {@code work_mem}). The last setting is
+     * needed from PostgreSQL 18 on: {@code enable_seqscan = off} no longer makes the planner reject the hashed
+     * alternative, whose sequential scan is then only marked "Disabled: true".
+     */
     private static String planWithoutSeqScanAndSort(final String sql, final List<Object> binds) {
-        return fixture.explain(sql, binds, "enable_seqscan = off", "enable_sort = off");
+        return fixture.explain(sql, binds, "enable_seqscan = off", "enable_sort = off", "work_mem = '64kB'");
     }
 
     private static void event(final String entity, final String pid, final long sn, final String... tags) {

@@ -118,7 +118,9 @@ public final class PostgresPidStreamScaleIT {
         for (final String plan : List.of(firstPlan, lastPlan)) {
             assertThat(plan)
                     .as("default planner settings, plan:%n%s", plan)
-                    .contains("Limit (actual rows=" + BATCH_SIZE + " loops=1)", "->  Unique")
+                    // PostgreSQL 18 prints row counts with two decimals ("actual rows=500.00").
+                    .containsPattern("Limit \\(actual rows=" + BATCH_SIZE + "(\\.00)? loops=1\\)")
+                    .contains("->  Unique")
                     .containsPattern("Index (Only )?Scan using " + JOURNAL + "_pkey on " + JOURNAL)
                     .containsPattern("Index Cond: \\(pid > ")
                     .doesNotContain("Sort")

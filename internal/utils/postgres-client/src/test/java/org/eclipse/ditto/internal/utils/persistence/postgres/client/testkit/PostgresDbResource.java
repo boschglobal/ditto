@@ -27,13 +27,14 @@ import io.r2dbc.spi.ConnectionFactoryOptions;
  * A JUnit {@link ExternalResource} wrapping a Testcontainers PostgreSQL container (PG 16 by default), mirroring the
  * shape of {@code MongoDbResource} so the PostgreSQL parity-matrix ITs share one container-lifecycle wrapper.
  * <p>
- * Beyond plain Testcontainers it solves one environment-portability problem: the docker-java client bundled inside
- * Testcontainers 1.20.6 negotiates the legacy Docker Remote API version {@code 1.32} when none is configured, which
- * modern daemons (OrbStack / recent Docker Desktop, minimum API 1.40) reject with
- * {@code "client version 1.32 is too old"}. docker-java reads the API version from the {@code api.version} <em>system
- * property</em> (not the {@code DOCKER_API_VERSION} env var, which its shaded copy ignores), so the static initializer
- * sets a sane default before any Testcontainers class loads. This makes {@code mvn verify} run the ITs against a real
- * Postgres with no per-developer or CI configuration.
+ * The image of a resource created without an explicit one is chosen by the system property
+ * {@value #IMAGE_PROPERTY}, e.g. {@code mvn verify -Dditto.test.postgres.image=postgres:17} (failsafe passes command
+ * line properties on to the forked test JVM); without it, {@value #DEFAULT_IMAGE}. ITs that start their own
+ * {@code PostgreSQLContainer} use {@link #configuredImageName()} so that they follow the same property.
+ * </p>
+ * <p>
+ * The Docker API version is left to Testcontainers' own negotiation (no {@code api.version} pin), so the ITs follow the
+ * daemon's supported range.
  * </p>
  * <p>
  * The resource exposes both the DDL role (schema-owning, used by {@code PostgresSchemaManager}) and the connection
@@ -45,44 +46,71 @@ import io.r2dbc.spi.ConnectionFactoryOptions;
 @NotThreadSafe
 public final class PostgresDbResource extends ExternalResource {
 
-    /** The default PostgreSQL image — PG 16 is the minimum supported version. */
+    /** The default PostgreSQL image — PG 16 is the oldest tested version (tested: 16, 17, 18). */
     public static final String DEFAULT_IMAGE = "postgres:16";
+
+    /**
+     * The system property that chooses the PostgreSQL image of every resource created without an explicit image, e.g.
+     * {@code postgres:17}.
+     */
+    public static final String IMAGE_PROPERTY = "ditto.test.postgres.image";
 
     /** The schema-owning DDL role (mirrors the two-role split between schema-owner and runtime user; the tests run DDL as this role). */
     public static final String DDL_USER = "ditto_ddl";
     public static final String DDL_PASSWORD = "ddl_secret";
     public static final String DATABASE = "ditto";
 
-    static {
-        // docker-java (shaded in Testcontainers 1.20.6) clamps an unconfigured API version to the legacy 1.32, which
-        // daemons with a >=1.40 minimum reject. It honours the `api.version` SYSTEM PROPERTY (its shaded copy does not
-        // read the DOCKER_API_VERSION env var), so set a modern default unless one is already configured. Must run
-        // before any Testcontainers/docker-java class is touched.
-        if (System.getProperty("api.version") == null) {
-            System.setProperty("api.version", "1.43");
-        }
-    }
-
+    private final String imageName;
     private final DockerImageName image;
 
     @Nullable
     private PostgreSQLContainer<?> container;
 
     /**
-     * Creates a resource for the default image ({@link #DEFAULT_IMAGE}).
+     * Creates a resource for the configured image ({@link #configuredImage()}: the {@value #IMAGE_PROPERTY} system
+     * property, else {@link #DEFAULT_IMAGE}).
      */
     public PostgresDbResource() {
-        this(DEFAULT_IMAGE);
+        this(configuredImage());
     }
 
     /**
-     * Creates a resource for an explicit image tag (e.g. {@code postgres:15} / {@code postgres:17} for the version
-     * matrix).
+     * Creates a resource for an explicit image tag, regardless of {@value #IMAGE_PROPERTY}.
      *
      * @param dockerImage the PostgreSQL image, e.g. {@code postgres:16}.
      */
     public PostgresDbResource(final String dockerImage) {
-        this.image = DockerImageName.parse(dockerImage);
+        this.imageName = dockerImage;
+        this.image = compatibleImageName(dockerImage);
+    }
+
+    /**
+     * @return the image chosen by the {@value #IMAGE_PROPERTY} system property, or {@link #DEFAULT_IMAGE} when it is
+     * unset or blank.
+     */
+    public static String configuredImage() {
+        final String configured = System.getProperty(IMAGE_PROPERTY);
+        return configured == null || configured.isBlank() ? DEFAULT_IMAGE : configured.trim();
+    }
+
+    /**
+     * @return {@link #configuredImage()} as an image name that Testcontainers' {@code PostgreSQLContainer} accepts, for
+     * ITs that start their own container.
+     */
+    public static DockerImageName configuredImageName() {
+        return compatibleImageName(configuredImage());
+    }
+
+    private static DockerImageName compatibleImageName(final String dockerImage) {
+        // Declared compatible with "postgres" so that a mirrored image (another registry or repository) is accepted too.
+        return DockerImageName.parse(dockerImage).asCompatibleSubstituteFor("postgres");
+    }
+
+    /**
+     * @return the image this resource starts, e.g. {@code postgres:16}.
+     */
+    public String getImage() {
+        return imageName;
     }
 
     /**

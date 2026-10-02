@@ -61,19 +61,14 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  * {@code pool_mode=transaction}</em> with {@code prepared-statement-cache-queries=0} (unnamed statements — safe on any
  * PgBouncer version).
  * <p>
- * Mirrors the {@code api.version} portability fix via {@link PostgresDbResource}'s static initializer (referenced before
- * any container starts). If Docker or the PgBouncer image is unreachable, the {@link #start() Assume} guard turns it
- * into a skip rather than a failure.
+ * The PgBouncer image is pinned ({@value #PGBOUNCER_IMAGE}). If Docker or the PgBouncer image is unreachable, the
+ * {@link #start() Assume} guard turns it into a skip rather than a failure.
  * </p>
  */
 public final class PgBouncerTransactionPoolingIT {
 
-    static {
-        // Ensure the docker-java api.version portability fix is applied before any Testcontainers class loads.
-        if (System.getProperty("api.version") == null) {
-            System.setProperty("api.version", "1.43");
-        }
-    }
+    /** The same PgBouncer version as {@code PgBouncerStatementTimeoutIT}. */
+    private static final String PGBOUNCER_IMAGE = "edoburu/pgbouncer:v1.26.0-p0";
 
     private static final String PG_USER = "ditto_ddl";
     private static final String PG_PASSWORD = "ddl_secret";
@@ -93,7 +88,7 @@ public final class PgBouncerTransactionPoolingIT {
     public static void start() {
         try {
             network = Network.newNetwork();
-            postgres = new PostgreSQLContainer<>(DockerImageName.parse(PostgresDbResource.DEFAULT_IMAGE))
+            postgres = new PostgreSQLContainer<>(PostgresDbResource.configuredImageName())
                     .withNetwork(network)
                     .withNetworkAliases("postgres")
                     .withDatabaseName(PG_DB)
@@ -101,7 +96,7 @@ public final class PgBouncerTransactionPoolingIT {
                     .withPassword(PG_PASSWORD);
             postgres.start();
 
-            pgbouncer = new GenericContainer<>(DockerImageName.parse("edoburu/pgbouncer:latest"))
+            pgbouncer = new GenericContainer<>(DockerImageName.parse(PGBOUNCER_IMAGE))
                     .withNetwork(network)
                     .withNetworkAliases("pgbouncer")
                     .withEnv("DB_HOST", "postgres")

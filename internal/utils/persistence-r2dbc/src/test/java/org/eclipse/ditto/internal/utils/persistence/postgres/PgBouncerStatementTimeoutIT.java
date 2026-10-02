@@ -90,13 +90,6 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  */
 public final class PgBouncerStatementTimeoutIT {
 
-    static {
-        // Ensure the docker-java api.version portability fix is applied before any Testcontainers class loads.
-        if (System.getProperty("api.version") == null) {
-            System.setProperty("api.version", "1.43");
-        }
-    }
-
     private static final String SUPERUSER = "postgres";
     private static final String SUPERUSER_PASSWORD = "superuser_secret";
     private static final String DATABASE = "ditto";
@@ -161,7 +154,7 @@ public final class PgBouncerStatementTimeoutIT {
                 DockerClientFactory.instance().isDockerAvailable());
 
         network = Network.newNetwork();
-        postgres = new PostgreSQLContainer<>(DockerImageName.parse(PostgresDbResource.DEFAULT_IMAGE))
+        postgres = new PostgreSQLContainer<>(PostgresDbResource.configuredImageName())
                 .withNetwork(network)
                 .withNetworkAliases("postgres")
                 .withDatabaseName(DATABASE)

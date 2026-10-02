@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalInt;
 
 import javax.annotation.Nullable;
 
@@ -40,6 +41,12 @@ import reactor.core.publisher.Mono;
  * {@code schema_version} bookkeeping table ({@link #SCHEMA_VERSION_DDL}) and the cluster-wide first-boot advisory lock
  * ({@link #ADVISORY_LOCK_KEY}) — and applies them for whichever descriptor it is given. The descriptor supplies only its
  * own DDL statements, table contracts, component name and version.
+ * </p>
+ * <p>
+ * On the bootstrap's connection, before the transaction begins, {@code SHOW server_version_num} checks the server
+ * version: a server older than PostgreSQL 16 (the oldest tested version) gets a WARN naming the real requirements
+ * ({@link PostgresServerVersion}). The check never refuses a boot and never fails the bootstrap; when the version cannot
+ * be read it also only logs a WARN. It runs outside the transaction, so even a failing {@code SHOW} cannot abort it.
  * </p>
  * <p>
  * The whole bootstrap is a <strong>single transaction</strong>:
@@ -290,7 +297,10 @@ public final class PostgresSchemaManager {
 
     private Mono<BootstrapOutcome> bootstrapWithin(final Connection connection) {
         final String expectedChecksum = checksum(descriptor);
-        return Mono.from(connection.beginTransaction())
+        // 0) server version: WARN below PostgreSQL 16; never fails, and runs before the transaction so that even a
+        //    failing SHOW cannot abort it.
+        return checkServerVersion(connection, descriptor.component())
+                .then(Mono.defer(() -> Mono.from(connection.beginTransaction())))
                 // 1) transaction-scoped advisory lock — serialises concurrent first-boot DDL across the cluster.
                 .then(executeUpdate(connection, "SELECT pg_advisory_xact_lock($1)", ADVISORY_LOCK_KEY))
                 // 2) the shared schema_version table + the manager-owned compatibility column.
@@ -319,6 +329,45 @@ public final class PostgresSchemaManager {
                 .flatMap(outcome -> Mono.from(connection.commitTransaction()).thenReturn(outcome))
                 .onErrorResume(error -> Mono.from(connection.rollbackTransaction())
                         .then(Mono.error(error)));
+    }
+
+    /**
+     * Reads {@code server_version_num} on the given connection and logs a WARN when the server is older than
+     * PostgreSQL 16 ({@link PostgresServerVersion#warning(String, int)}), or when the version cannot be read. Never
+     * fails: every error is logged and dropped, so the check can never refuse a boot.
+     *
+     * @param connection the bootstrap's connection, outside any transaction.
+     * @param component the component whose schema is bootstrapped, named in the WARN.
+     * @return completes empty once the version was checked.
+     */
+    static Mono<Void> checkServerVersion(final Connection connection, final String component) {
+        return Flux.defer(() -> Flux.from(
+                        connection.createStatement(PostgresServerVersion.SHOW_SERVER_VERSION_NUM).execute()))
+                .flatMap(result -> result.map((row, meta) -> Objects.toString(row.get(0, String.class), "")))
+                .next()
+                .defaultIfEmpty("")
+                .doOnNext(value -> {
+                    final OptionalInt versionNum = PostgresServerVersion.parse(value);
+                    if (versionNum.isEmpty()) {
+                        LOGGER.warn("PostgreSQL server version could not be determined for component '{}': <{}> "
+                                        + "returned <{}>. Ditto is tested with PostgreSQL 16, 17 and 18.", component,
+                                PostgresServerVersion.SHOW_SERVER_VERSION_NUM, value);
+                    } else {
+                        PostgresServerVersion.warning(component, versionNum.getAsInt())
+                                .ifPresentOrElse(LOGGER::warn,
+                                        () -> LOGGER.debug("PostgreSQL server version {} (server_version_num {}) "
+                                                        + "for component '{}'.",
+                                                PostgresServerVersion.display(versionNum.getAsInt()),
+                                                versionNum.getAsInt(), component));
+                    }
+                })
+                .then()
+                .onErrorResume(error -> {
+                    LOGGER.warn("PostgreSQL server version could not be determined for component '{}': <{}> failed: "
+                                    + "{}. Ditto is tested with PostgreSQL 16, 17 and 18.", component,
+                            PostgresServerVersion.SHOW_SERVER_VERSION_NUM, error.toString());
+                    return Mono.empty();
+                });
     }
 
     /**

@@ -28,12 +28,12 @@ import java.util.Map;
 
 import javax.annotation.Nullable;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 /**
  * Testcontainers-backed smoke test for the Phase-0 bench harness: applies {@code bench/search-schema.sql},
@@ -49,15 +49,6 @@ import org.testcontainers.utility.DockerImageName;
  */
 public class PostgresSearchBenchSmokeIT {
 
-    static {
-        // docker-java (shaded in Testcontainers) clamps an unconfigured API version to the legacy 1.32, which
-        // daemons with a >=1.40 minimum (OrbStack / recent Docker Desktop) reject. Mirrors the workaround in
-        // persistence-r2dbc's PostgresDbResource.
-        if (System.getProperty("api.version") == null) {
-            System.setProperty("api.version", "1.43");
-        }
-    }
-
     private static final String EDGE_THING_ID = "smoke.ns:edge-case-1";
     private static final int CORPUS_SIZE = 5_000;
 
@@ -67,7 +58,7 @@ public class PostgresSearchBenchSmokeIT {
     @Before
     public void setUp() {
         try {
-            container = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"))
+            container = new PostgreSQLContainer<>(PostgresDbResource.configuredImageName())
                     .withDatabaseName("bench_smoke")
                     .withUsername("bench")
                     .withPassword("bench");
