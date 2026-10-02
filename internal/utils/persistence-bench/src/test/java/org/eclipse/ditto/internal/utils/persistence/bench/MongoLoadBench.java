@@ -35,7 +35,10 @@ import com.mongodb.client.model.InsertManyOptions;
  * journal_tag_index{_tg}sparse, ditto_tag_pid{_tg,pid}sparse, things_snaps_index{pid,sn:-1,ts:-1}
  * unique, snaps_pid_sn_id_index{pid,sn:-1,_id}; metadata collection created empty (only written on
  * the Pekko deleteFrom path, which no scenario exercises); things_realtime capped 100MB, empty at
- * rest (a live-tail buffer would have evicted corpus-age docs).
+ * rest (a live-tail buffer would have evicted corpus-age docs). Snapshot {@code _id}s embed the
+ * snapshot's write time ({@link PersistenceShapes#snapshotObjectId}), so the cleanup min-age filter
+ * (on {@code _id}) sees the same ages as PG's {@code written_at}; journal {@code _id}s are left to the
+ * driver (insert time), as no scenario filters journal documents by {@code _id}.
  * Invoke via: mvn -pl internal/utils/persistence-bench test -Dtest=MongoLoadBench -DfailIfNoTests=false
  */
 public final class MongoLoadBench {
@@ -97,8 +100,13 @@ public final class MongoLoadBench {
             final Iterator<CorpusGenerator.SnapshotRow> it = gen.snapshots(i);
             while (it.hasNext()) {
                 final CorpusGenerator.SnapshotRow s = it.next();
-                batch.add(PersistenceShapes.snapshotDoc(s.pid(), s.sn(), s.timestampMillis(),
+                // _id carries the write time, as a driver-generated _id does in production: the cleanup
+                // min-age filter reads _id, not ts
+                final Document doc = new Document("_id",
+                        PersistenceShapes.snapshotObjectId(i, s.sn(), s.timestampMillis()));
+                doc.putAll(PersistenceShapes.snapshotDoc(s.pid(), s.sn(), s.timestampMillis(),
                         Document.parse(s.snapshotJson())));
+                batch.add(doc);
                 snapshotRows++;
                 if (batch.size() == BATCH) {
                     snaps.insertMany(batch, unordered);
@@ -146,8 +154,9 @@ public final class MongoLoadBench {
             md.append("- metadata docs: 0 (only written on the Pekko deleteFrom path — see plan deviation 6)\n");
             md.append(String.format("- insertMany: %.1f s; index build: %.1f s; total: %.1f s%n%n",
                     insertSeconds, indexSeconds, (System.nanoTime() - t0) / 1e9));
+            md.append(BenchProtocol.freshCorpusLine(gen));
             md.append("## Sizes (collStats)\n\n").append(sizesMarkdown(db));
-            BenchProtocol.writeEvidence("load-mongo.md", md.toString());
+            BenchProtocol.writeEvidence(BenchProtocol.corpusEvidenceName("load-mongo", gen), md.toString());
         }
         return stats;
     }

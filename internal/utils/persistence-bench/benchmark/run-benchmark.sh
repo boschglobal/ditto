@@ -25,6 +25,8 @@
 #   recovery     RecoveryBench      — R1 latest snapshot, R2 replay (tail+full), R3 highest sn
 #   write        AppendBench W1, SnapshotBench W2, AppendBench W3 sustained churn
 #   cleanup      CleanupShapeBench  — C1 pid-stream page, C2 single-pid cleanup
+#   retention    CleanupShapeBench  — C1 with the production min age (--retention, default 3d) vs 0;
+#                load with --fresh-share first: on the backdated corpus every row qualifies
 #   sweep        CleanupSweepBench  — C3 full sweep (DESTRUCTIVE: empties cleanup backlog), C4 proof
 #   mixed        MixedChurnBench    — M1 cleanup concurrent with churn (post-sweep corpus)
 #   all          up load recovery write cleanup sweep mixed (asks for confirmation first)
@@ -36,6 +38,11 @@
 #   --seed N       corpus seed (default 42)
 #   --quick        demo mode: 50k pids + short windows + credits-pace fidelity (numbers NOT comparable)
 #   --backend B    pg | mongo | both (default both)
+#   --fresh-share S  share of pids whose rows are all younger than the retention (default 0 = all
+#                    rows backdated to 2026-01-01); pass the same value to `load` and `retention`
+#   --fresh-base T   ISO-8601 instant the fresh-only pids' rows are written after (default: the
+#                    previous UTC midnight); pin it when the backends are loaded on different days
+#   --retention D    history-retention-duration for `retention` (default 3d, the things.conf default)
 #   --yes          skip the duration/disk confirmation prompt
 #   --purge        with `down`: also remove the data volumes
 #
@@ -78,13 +85,16 @@ PG_ARGS=(-c shared_buffers=4GB -c effective_cache_size=12GB -c work_mem=64MB)
 # Mirrors deployment/docker/docker-compose.yml plus a 4GB WT cache for memory symmetry with PG.
 MONGO_ARGS=(--storageEngine wiredTiger --noscripting --wiredTigerCacheSizeGB 4)
 
-usage() { sed -n '14,52p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '14,60p' "${BASH_SOURCE[0]}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --count) COUNT="$2"; shift 2 ;;
         --seed) SEED="$2"; shift 2 ;;
         --backend) BACKEND="$2"; shift 2 ;;
+        --fresh-share) export BENCH_FRESH_SHARE="$2"; shift 2 ;;
+        --fresh-base) export BENCH_FRESH_BASE="$2"; shift 2 ;;
+        --retention) export BENCH_C1_RETENTION="$2"; shift 2 ;;
         --quick) QUICK=1; shift ;;
         --yes) YES=1; shift ;;
         --purge) PURGE=1; shift ;;
@@ -219,6 +229,13 @@ stage_cleanup() {
     run_bench 'CleanupShapeBench#c2SinglePidCleanup' $(quick_props)
 }
 
+stage_retention() {
+    stage_up
+    log "C1 with retention ${BENCH_C1_RETENTION:-3d} on a corpus with fresh share ${BENCH_FRESH_SHARE:-0}"
+    # shellcheck disable=SC2046
+    run_bench 'CleanupShapeBench#c1PidStreamPageWithRetention' $(quick_props)
+}
+
 stage_sweep() {
     stage_up
     log "C3 full sweep — DESTRUCTIVE: deletes journal/snapshot rows below each latest snapshot"
@@ -309,6 +326,7 @@ for stage in "${STAGES[@]}"; do
         recovery) stage_recovery ;;
         write) stage_write ;;
         cleanup) stage_cleanup ;;
+        retention) stage_retention ;;
         sweep) stage_sweep ;;
         mixed) stage_mixed ;;
         all) confirm_full_run; stage_up; stage_load; stage_recovery; stage_write; stage_cleanup; stage_sweep; stage_mixed ;;

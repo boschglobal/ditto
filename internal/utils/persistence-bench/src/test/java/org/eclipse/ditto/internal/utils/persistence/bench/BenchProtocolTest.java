@@ -61,6 +61,46 @@ public final class BenchProtocolTest {
     }
 
     @Test
+    public void measurePairInterleavesBothOpsOnTheSameIterationWithAlternatingOrder() {
+        final StringBuilder seen = new StringBuilder();
+        final BenchProtocol.Timing[] timings = BenchProtocol.measurePair(1, 3,
+                iteration -> seen.append('A').append(iteration).append(','),
+                iteration -> seen.append('B').append(iteration).append(','));
+        // warmup 0 untimed; even iterations run A first, odd ones B first (neither op always sees the other's cache)
+        assertThat(seen.toString()).isEqualTo("A0,B0,B1,A1,A2,B2,B3,A3,");
+        assertThat(timings).hasSize(2);
+        assertThat(timings[0].n()).isEqualTo(3);
+        assertThat(timings[1].n()).isEqualTo(3);
+    }
+
+    @Test
+    public void evidenceOfAFreshShareCorpusGoesToItsOwnFile() {
+        final CorpusGenerator backdated = new CorpusGenerator(42L, 10L);
+        final CorpusGenerator fresh = new CorpusGenerator(42L, 10L, 0.3, 1_790_000_000_000L);
+        assertThat(BenchProtocol.corpusEvidenceName("load-pg", backdated)).isEqualTo("load-pg.md");
+        assertThat(BenchProtocol.corpusEvidenceName("load-pg", fresh)).isEqualTo("load-pg-fresh-share-0.3.md");
+    }
+
+    @Test
+    public void freshCorpusLineCountsTheFreshOnlyPids() {
+        assertThat(BenchProtocol.freshCorpusLine(new CorpusGenerator(42L, 10L))).isEmpty();
+
+        final CorpusGenerator gen = new CorpusGenerator(42L, 20_000L, 0.3, 1_790_000_000_000L);
+        long fresh = 0;
+        long snapshotted = 0;
+        long freshSnapshotted = 0;
+        for (long i = 0; i < 20_000; i++) {
+            fresh += gen.isFreshOnly(i) ? 1 : 0;
+            snapshotted += gen.snapshotCount(i) > 0 ? 1 : 0;
+            freshSnapshotted += gen.isFreshOnly(i) && gen.snapshotCount(i) > 0 ? 1 : 0;
+        }
+        assertThat(BenchProtocol.freshCorpusLine(gen)).isEqualTo(
+                "- fresh-only pids (share 0.3, rows at 2026-09-21T14:13:20Z + sn seconds; all others at "
+                        + "2026-01-01T00:00:00Z + sn seconds): " + fresh + " of 20000; with snapshots: "
+                        + freshSnapshotted + " of " + snapshotted + "\n\n");
+    }
+
+    @Test
     public void tableRendersGithubMarkdown() {
         final String md = BenchProtocol.table(List.of("scenario", "pg", "mongo"),
                 List.of(List.of("R1", "1.2", "3.4")));

@@ -19,6 +19,8 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
@@ -44,6 +46,8 @@ public final class LoaderSmokeIT {
 
     private static final long SEED = 42L;
     private static final long COUNT = 5_000L;
+    /** things.conf history-retention-duration default. */
+    private static final Duration RETENTION = Duration.ofDays(3);
 
     private static PostgreSQLContainer<?> postgres;
     private static GenericContainer<?> mongo;
@@ -149,6 +153,91 @@ public final class LoaderSmokeIT {
             assertThat(newest.getLong("sn")).isEqualTo(gen.latestSnapshotSn(idx));
             assertThat(newest.getLong("sn")).isEqualTo(pgLatestSnapSn);
         }
+    }
+
+    /**
+     * A fresh-share corpus: both loaders write the same ages (PG written_at, Mongo snapshot _id), and the
+     * production-shaped cleanup pages return the generator's expected rows with the min age off and on.
+     */
+    @Test
+    public void aFreshShareCorpusHasTheSameAgeMixAndCleanupPagesOnBothBackends() throws Exception {
+        final CorpusGenerator gen =
+                new CorpusGenerator(SEED, COUNT, 0.3, BenchConfig.defaultFreshBaseMillis(Instant.now()));
+        final NewestSnapshotOracle oracle = NewestSnapshotOracle.of(gen);
+        final long fresh = firstSnapshotted(gen, true);
+        final long old = firstSnapshotted(gen, false);
+        final String midPid = oracle.pgPage("", false, (int) oracle.snapshottedPids() / 2)
+                .get((int) oracle.snapshottedPids() / 2 - 1).pid();
+        final List<String> lowerBounds = List.of("", midPid);
+        final int limit = PersistenceShapes.READS_PER_QUERY;
+        assertThat(oracle.pgPage("", true, Integer.MAX_VALUE)).as("corpus large enough for a full page")
+                .hasSizeGreaterThan(limit);
+
+        final Properties props = new Properties();
+        props.setProperty("user", "bench");
+        props.setProperty("password", "bench");
+        props.setProperty("prepareThreshold", "0");
+        try (Connection connection = DriverManager.getConnection(postgres.getJdbcUrl(), props)) {
+            PgLoadBench.run(connection, gen, false);
+
+            assertThat(CleanupShapeBench.pgAgeMix(connection, RETENTION))
+                    .containsExactly(oracle.snapshottedPids(), oracle.freshOnlySnapshottedPids());
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT (extract(epoch FROM written_at) * 1000)::bigint AS ts FROM things_snaps "
+                            + "WHERE pid = ? AND sn = ?")) {
+                for (final long idx : List.of(fresh, old)) {
+                    ps.setString(1, gen.pid(idx));
+                    ps.setLong(2, gen.latestSnapshotSn(idx));
+                    try (ResultSet rs = ps.executeQuery()) {
+                        assertThat(rs.next()).isTrue();
+                        assertThat(rs.getLong("ts")).isEqualTo(gen.timestampMillis(idx, gen.latestSnapshotSn(idx)));
+                    }
+                }
+            }
+            try (PreparedStatement ps = connection.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE)) {
+                for (final String lb : lowerBounds) {
+                    assertThat(CleanupShapeBench.pgPage(ps, lb, Duration.ZERO, limit))
+                            .isEqualTo(oracle.pgPage(lb, false, limit));
+                    assertThat(CleanupShapeBench.pgPage(ps, lb, RETENTION, limit))
+                            .isEqualTo(oracle.pgPage(lb, true, limit))
+                            .noneMatch(e -> e.pid().equals(gen.pid(fresh)));
+                }
+            }
+        }
+
+        final String mongoUri = "mongodb://" + mongo.getHost() + ":" + mongo.getMappedPort(27017);
+        try (MongoClient client = MongoClients.create(mongoUri)) {
+            MongoLoadBench.run(client, "bench", gen, false);
+            final MongoCollection<Document> snaps =
+                    client.getDatabase("bench").getCollection(PersistenceShapes.SNAPS);
+
+            assertThat(CleanupShapeBench.mongoAgeMix(snaps, RETENTION, Instant.now()))
+                    .containsExactly(oracle.snapshottedPids(), oracle.freshOnlySnapshottedPids());
+            for (final long idx : List.of(fresh, old)) {
+                final Document newest = snaps.find(new Document("pid", gen.pid(idx))
+                        .append("sn", gen.latestSnapshotSn(idx))).first();
+                assertThat(newest).isNotNull();
+                final long ts = gen.timestampMillis(idx, gen.latestSnapshotSn(idx));
+                assertThat(newest.getLong("ts")).isEqualTo(ts);
+                assertThat(newest.getObjectId("_id").getDate().getTime()).isEqualTo(ts / 1000L * 1000L);
+            }
+            for (final String lb : lowerBounds) {
+                assertThat(CleanupShapeBench.mongoPage(snaps, lb, Duration.ZERO, limit))
+                        .isEqualTo(oracle.mongoPage(lb, false, limit));
+                assertThat(CleanupShapeBench.mongoPage(snaps, lb, RETENTION, limit))
+                        .isEqualTo(oracle.mongoPage(lb, true, limit))
+                        .noneMatch(e -> e.pid().equals(gen.pid(fresh)));
+            }
+        }
+    }
+
+    private static long firstSnapshotted(final CorpusGenerator gen, final boolean freshOnly) {
+        for (long i = 0; i < gen.pidCount(); i++) {
+            if (gen.snapshotCount(i) > 0 && gen.isFreshOnly(i) == freshOnly) {
+                return i;
+            }
+        }
+        throw new IllegalStateException("no snapshotted pid with freshOnly=" + freshOnly);
     }
 
     private static long deepestPidIndex(final CorpusGenerator gen) {

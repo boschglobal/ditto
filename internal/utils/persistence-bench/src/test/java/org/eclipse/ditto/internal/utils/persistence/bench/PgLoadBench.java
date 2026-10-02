@@ -176,11 +176,12 @@ public final class PgLoadBench {
             md.append("- snapshot rows: ").append(stats.snapshotRows()).append('\n');
             md.append(String.format("- COPY: %.1f s; constraints+indexes+ANALYZE: %.1f s; total: %.1f s%n%n",
                     copySeconds, indexSeconds, (System.nanoTime() - t0) / 1e9));
+            md.append(BenchProtocol.freshCorpusLine(gen));
             md.append("## Sizes\n\n").append(sizesMarkdown(connection));
             md.append("\nEnd-state DDL is identical to PostgresSchema.ddlStatements(): tables were "
                     + "created without PKs for the COPY, then PK/indexes/autovacuum params added "
                     + "(design plan, deviation 8).\n");
-            BenchProtocol.writeEvidence("load-pg.md", md.toString());
+            BenchProtocol.writeEvidence(BenchProtocol.corpusEvidenceName("load-pg", gen), md.toString());
         }
         return stats;
     }

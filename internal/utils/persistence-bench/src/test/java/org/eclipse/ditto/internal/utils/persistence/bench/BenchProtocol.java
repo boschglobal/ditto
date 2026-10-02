@@ -75,6 +75,37 @@ public final class BenchProtocol {
         }
     }
 
+    /**
+     * Times two ops on the same iterations, interleaved so that neither always runs on the cache the
+     * other left behind: even iterations run {@code a} first, odd ones {@code b} first. Both ops get
+     * the same iteration index (e.g. the same lower bound).
+     *
+     * @return the timings of {@code a} and {@code b}, in that order.
+     */
+    public static Timing[] measurePair(final int warmups, final int iterations, final Op a, final Op b) {
+        try {
+            final List<Double> samplesA = new ArrayList<>(iterations);
+            final List<Double> samplesB = new ArrayList<>(iterations);
+            for (int iteration = 0; iteration < warmups + iterations; iteration++) {
+                final boolean timed = iteration >= warmups;
+                final boolean aFirst = iteration % 2 == 0;
+                runTimed(aFirst ? a : b, iteration, timed ? (aFirst ? samplesA : samplesB) : null);
+                runTimed(aFirst ? b : a, iteration, timed ? (aFirst ? samplesB : samplesA) : null);
+            }
+            return new Timing[]{of(samplesA), of(samplesB)};
+        } catch (final Exception e) {
+            throw new IllegalStateException("bench op failed", e);
+        }
+    }
+
+    private static void runTimed(final Op op, final int iteration, final List<Double> samples) throws Exception {
+        final long t0 = System.nanoTime();
+        op.run(iteration);
+        if (samples != null) {
+            samples.add((System.nanoTime() - t0) / 1_000_000.0);
+        }
+    }
+
     public static Timing of(final List<Double> samplesMs) {
         final List<Double> sorted = new ArrayList<>(samplesMs);
         sorted.sort(Double::compareTo);
@@ -117,11 +148,49 @@ public final class BenchProtocol {
     public static String runHeader(final String title) {
         return "# " + title + "\n\n"
                 + "- generated: " + Instant.now() + "\n"
-                + "- corpus: count=" + BenchConfig.count() + " seed=" + BenchConfig.seed() + "\n"
+                + "- corpus: count=" + BenchConfig.count() + " seed=" + BenchConfig.seed() + freshCorpusSuffix() + "\n"
                 + "- backend(s): " + BenchConfig.backend() + "\n"
                 + "- protocol: " + BenchConfig.warmups() + " warmup + " + BenchConfig.iterations()
                 + " timed executions, nearest-rank percentiles, pgjdbc prepareThreshold=0\n"
                 + "- cleanup defaults: reads-per-query=100, writes-per-credit=100 (DefaultCleanupConfig)\n\n";
+    }
+
+    /** Empty for the backdated corpus, so evidence headers of share-0 runs keep their format. */
+    private static String freshCorpusSuffix() {
+        final double share = BenchConfig.freshShare();
+        return share > 0.0
+                ? " freshShare=" + share + " freshBase=" + Instant.ofEpochMilli(BenchConfig.freshBaseMillis())
+                : "";
+    }
+
+    /**
+     * The evidence file name for a corpus: {@code base.md} for the backdated corpus, a fresh-share
+     * suffix otherwise, so a fresh-share run never overwrites the backdated corpus's evidence.
+     */
+    public static String corpusEvidenceName(final String base, final CorpusGenerator gen) {
+        return gen.freshShare() > 0.0 ? base + "-fresh-share-" + gen.freshShare() + ".md" : base + ".md";
+    }
+
+    /** One evidence line with the corpus's fresh-only pid counts; empty for the backdated corpus. */
+    public static String freshCorpusLine(final CorpusGenerator gen) {
+        if (gen.freshShare() <= 0.0) {
+            return "";
+        }
+        long fresh = 0;
+        long snapshotted = 0;
+        long freshSnapshotted = 0;
+        for (long i = 0; i < gen.pidCount(); i++) {
+            final boolean isFresh = gen.isFreshOnly(i);
+            final boolean hasSnapshots = gen.snapshotCount(i) > 0;
+            fresh += isFresh ? 1 : 0;
+            snapshotted += hasSnapshots ? 1 : 0;
+            freshSnapshotted += isFresh && hasSnapshots ? 1 : 0;
+        }
+        return "- fresh-only pids (share " + gen.freshShare() + ", rows at "
+                + Instant.ofEpochMilli(gen.freshBaseMillis()) + " + sn seconds; all others at "
+                + Instant.ofEpochMilli(CorpusGenerator.BASE_TIMESTAMP_MILLIS) + " + sn seconds): "
+                + fresh + " of " + gen.pidCount() + "; with snapshots: " + freshSnapshotted + " of "
+                + snapshotted + "\n\n";
     }
 
     public static void writeEvidence(final String fileName, final String content) {

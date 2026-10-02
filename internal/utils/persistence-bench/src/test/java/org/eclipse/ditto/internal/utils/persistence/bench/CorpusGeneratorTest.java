@@ -13,6 +13,7 @@
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -141,6 +142,111 @@ public final class CorpusGeneratorTest {
         // disjoint second sample for cleanup scenarios
         final List<Long> fromMiddle = gen.findPidIndexes(CorpusGenerator.PidClass.P99, 23, 500_000L);
         assertThat(fromMiddle).hasSize(23);
+    }
+
+    // --- fresh-only pids (cleanup min-age mode) ----------------------------------------------------
+
+    private static final long FRESH_BASE = 1_790_000_000_000L; // 2026-09-21T14:13:20Z
+
+    @Test
+    public void theDefaultCorpusHasNoFreshPidsAndIsIdenticalToAnExplicitZeroShare() {
+        final CorpusGenerator legacy = new CorpusGenerator(42L, 20_000L);
+        final CorpusGenerator zeroShare = new CorpusGenerator(42L, 20_000L, 0.0, FRESH_BASE);
+        assertThat(legacy.freshShare()).isZero();
+        for (long i = 0; i < 20_000; i++) {
+            assertThat(legacy.isFreshOnly(i)).isFalse();
+            assertThat(zeroShare.isFreshOnly(i)).isFalse();
+        }
+        final long p99Index = legacy.findPidIndexes(CorpusGenerator.PidClass.P99, 1, 0).get(0);
+        assertThat(rows(zeroShare, p99Index)).isEqualTo(rows(legacy, p99Index));
+        legacy.snapshots(p99Index).forEachRemaining(s -> assertThat(s.timestampMillis())
+                .isEqualTo(CorpusGenerator.timestampMillisFor(s.sn())));
+    }
+
+    @Test
+    public void freshShareSelectsThatShareOfPidsDeterministicallyAndIndependentlyOfDepth() {
+        final CorpusGenerator a = new CorpusGenerator(42L, 200_000L, 0.3, FRESH_BASE);
+        final CorpusGenerator b = new CorpusGenerator(42L, 200_000L, 0.3, FRESH_BASE);
+        long fresh = 0;
+        long snapshotted = 0;
+        long freshSnapshotted = 0;
+        for (long i = 0; i < 200_000; i++) {
+            assertThat(a.isFreshOnly(i)).isEqualTo(b.isFreshOnly(i));
+            if (a.isFreshOnly(i)) {
+                fresh++;
+            }
+            if (a.snapshotCount(i) > 0) {
+                snapshotted++;
+                if (a.isFreshOnly(i)) {
+                    freshSnapshotted++;
+                }
+            }
+        }
+        assertThat(fresh / 200_000.0).isBetween(0.29, 0.31);
+        // the share also holds among the pids that carry snapshots (the only ones cleanup pages see)
+        assertThat(freshSnapshotted / (double) snapshotted).isBetween(0.27, 0.33);
+    }
+
+    @Test
+    public void freshOnlyPidsWriteEveryRowRelativeToTheFreshBaseAndOthersStayBackdated() {
+        final CorpusGenerator gen = new CorpusGenerator(42L, 1_000_000L, 0.3, FRESH_BASE);
+        final List<Long> p99 = gen.findPidIndexes(CorpusGenerator.PidClass.P99, 23, 0);
+        final long fresh = p99.stream().filter(gen::isFreshOnly).findFirst().orElseThrow();
+        final long old = p99.stream().filter(i -> !gen.isFreshOnly(i)).findFirst().orElseThrow();
+
+        gen.events(fresh).forEachRemaining(e -> {
+            assertThat(e.timestampMillis()).isEqualTo(FRESH_BASE + e.sn() * 1000L);
+            assertThat(JsonObject.of(e.eventJson()).getValue("_timestamp").orElseThrow().asString())
+                    .isEqualTo(java.time.Instant.ofEpochMilli(FRESH_BASE + e.sn() * 1000L).toString());
+        });
+        gen.snapshots(fresh).forEachRemaining(s -> {
+            assertThat(s.timestampMillis()).isEqualTo(FRESH_BASE + s.sn() * 1000L);
+            assertThat(JsonObject.of(s.snapshotJson()).getValue("_modified").orElseThrow().asString())
+                    .isEqualTo(java.time.Instant.ofEpochMilli(FRESH_BASE + s.sn() * 1000L).toString());
+        });
+        gen.events(old).forEachRemaining(e ->
+                assertThat(e.timestampMillis()).isEqualTo(CorpusGenerator.timestampMillisFor(e.sn())));
+        gen.snapshots(old).forEachRemaining(s ->
+                assertThat(s.timestampMillis()).isEqualTo(CorpusGenerator.timestampMillisFor(s.sn())));
+        assertThat(gen.timestampMillis(fresh, 7L)).isEqualTo(FRESH_BASE + 7_000L);
+        assertThat(gen.timestampMillis(old, 7L)).isEqualTo(CorpusGenerator.timestampMillisFor(7L));
+    }
+
+    @Test
+    public void freshShareChangesOnlyTimestampsNotPidsDepthsOrSnapshotSequenceNumbers() {
+        final CorpusGenerator legacy = new CorpusGenerator(42L, 50_000L);
+        final CorpusGenerator mixed = new CorpusGenerator(42L, 50_000L, 0.3, FRESH_BASE);
+        for (long i = 0; i < 50_000; i += 7) {
+            assertThat(mixed.pid(i)).isEqualTo(legacy.pid(i));
+            assertThat(mixed.depth(i)).isEqualTo(legacy.depth(i));
+            assertThat(mixed.latestSnapshotSn(i)).isEqualTo(legacy.latestSnapshotSn(i));
+        }
+        assertThat(mixed.totalEvents()).isEqualTo(legacy.totalEvents());
+        assertThat(mixed.totalSnapshots()).isEqualTo(legacy.totalSnapshots());
+    }
+
+    @Test
+    public void theLatestFreshTimestampIsTheBasePlusTheDepthCap() {
+        final CorpusGenerator gen = new CorpusGenerator(42L, 10L, 0.5, FRESH_BASE);
+        assertThat(gen.freshBaseMillis()).isEqualTo(FRESH_BASE);
+        assertThat(gen.latestFreshTimestampMillis()).isEqualTo(FRESH_BASE + CorpusGenerator.DEPTH_CAP * 1000L);
+    }
+
+    @Test
+    public void aFreshShareOutsideZeroToOneIsRejected() {
+        assertThatThrownBy(() -> new CorpusGenerator(42L, 10L, -0.1, FRESH_BASE))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new CorpusGenerator(42L, 10L, 1.1, FRESH_BASE))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new CorpusGenerator(42L, 10L, Double.NaN, FRESH_BASE))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static List<Object> rows(final CorpusGenerator gen, final long pidIndex) {
+        final List<Object> rows = new ArrayList<>();
+        gen.events(pidIndex).forEachRemaining(rows::add);
+        gen.snapshots(pidIndex).forEachRemaining(rows::add);
+        return rows;
     }
 
     @Test

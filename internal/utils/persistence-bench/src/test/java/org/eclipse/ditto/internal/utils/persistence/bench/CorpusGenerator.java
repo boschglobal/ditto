@@ -26,13 +26,21 @@ import org.eclipse.ditto.json.JsonObject;
  * on any JVM. Depth distribution: piecewise log-uniform pinned at median 20 (u=0.5), p99 2000
  * (u=0.99), cap 50000; analytic mean ~139 events/pid. Snapshots every 500 events (things.conf
  * snapshot.threshold default).
+ * <p>
+ * Row timestamps: every row of a pid is written at {@code base + sn} seconds. The base is
+ * {@link #BASE_TIMESTAMP_MILLIS} (backdated) unless the pid is <em>fresh-only</em>: with a fresh
+ * share {@code s > 0}, a share {@code s} of the pids (chosen per pid from the seed, independently of
+ * depth and namespace) uses {@code freshBaseMillis} instead, so all of its events and snapshots can be
+ * younger than the cleanup's {@code history-retention-duration} while the rest stay months old. Only
+ * the timestamps change: pids, depths, snapshot sequence numbers and payload sizes are those of the
+ * share-0 corpus, which is byte-identical to the corpus without this mode.
  */
 public final class CorpusGenerator {
 
     public static final int SNAPSHOT_EVERY = 500;
     public static final long DEPTH_CAP = 50_000L;
     public static final int NAMESPACE_POOL = 50;
-    /** 2026-01-01T00:00:00Z — all corpus timestamps are BASE + sn seconds (in the past at run time). */
+    /** 2026-01-01T00:00:00Z — backdated rows are written at BASE + sn seconds (in the past at run time). */
     public static final long BASE_TIMESTAMP_MILLIS = 1_767_225_600_000L;
 
     static final String MANIFEST_CREATED = "org.eclipse.ditto.things.model.signals.events.ThingCreated";
@@ -59,13 +67,30 @@ public final class CorpusGenerator {
 
     private final long seed;
     private final long pidCount;
+    private final double freshShare;
+    private final long freshBaseMillis;
     private final double[] namespaceCumulative;
     private long cachedTotalEvents = -1L;
     private long cachedTotalSnapshots = -1L;
 
+    /** The backdated corpus: no fresh-only pids. */
     public CorpusGenerator(final long seed, final long pidCount) {
+        this(seed, pidCount, 0.0, BASE_TIMESTAMP_MILLIS);
+    }
+
+    /**
+     * @param freshShare share of pids whose rows are all written relative to {@code freshBaseMillis}, in [0, 1].
+     * @param freshBaseMillis timestamp base of the fresh-only pids (unused when {@code freshShare} is 0).
+     */
+    public CorpusGenerator(final long seed, final long pidCount, final double freshShare,
+            final long freshBaseMillis) {
+        if (!(freshShare >= 0.0 && freshShare <= 1.0)) {
+            throw new IllegalArgumentException("freshShare must be within [0, 1]: " + freshShare);
+        }
         this.seed = seed;
         this.pidCount = pidCount;
+        this.freshShare = freshShare;
+        this.freshBaseMillis = freshBaseMillis;
         namespaceCumulative = new double[NAMESPACE_POOL];
         double h = 0.0;
         for (int k = 1; k <= NAMESPACE_POOL; k++) {
@@ -79,6 +104,19 @@ public final class CorpusGenerator {
 
     public long pidCount() {
         return pidCount;
+    }
+
+    public double freshShare() {
+        return freshShare;
+    }
+
+    public long freshBaseMillis() {
+        return freshBaseMillis;
+    }
+
+    /** The newest timestamp a fresh-only pid can carry: its base plus the depth cap in seconds. */
+    public long latestFreshTimestampMillis() {
+        return freshBaseMillis + DEPTH_CAP * 1000L;
     }
 
     // --- deterministic randomness -------------------------------------------------------------
@@ -147,8 +185,21 @@ public final class CorpusGenerator {
         return depth(pidIndex) / SNAPSHOT_EVERY;
     }
 
+    /** The timestamp of row {@code sn} of a backdated pid. */
     public static long timestampMillisFor(final long sn) {
         return BASE_TIMESTAMP_MILLIS + sn * 1000L;
+    }
+
+    // --- fresh-only pids ------------------------------------------------------------------------
+
+    /** Whether every row of this pid is written relative to the fresh base (random stream 5). */
+    public boolean isFreshOnly(final long pidIndex) {
+        return freshShare > 0.0 && uniform(pidIndex, 5L) < freshShare;
+    }
+
+    /** The timestamp of row {@code sn} of this pid (event and snapshot alike). */
+    public long timestampMillis(final long pidIndex, final long sn) {
+        return (isFreshOnly(pidIndex) ? freshBaseMillis : BASE_TIMESTAMP_MILLIS) + sn * 1000L;
     }
 
     // --- event / snapshot streams ---------------------------------------------------------------
@@ -171,7 +222,7 @@ public final class CorpusGenerator {
                     throw new NoSuchElementException();
                 }
                 final long currentSn = sn++;
-                final long ts = timestampMillisFor(currentSn);
+                final long ts = timestampMillis(pidIndex, currentSn);
                 final String manifest;
                 final String type;
                 final String path;
@@ -222,7 +273,7 @@ public final class CorpusGenerator {
                 }
                 final long currentSn = sn;
                 sn += SNAPSHOT_EVERY;
-                final long ts = timestampMillisFor(currentSn);
+                final long ts = timestampMillis(pidIndex, currentSn);
                 final int padLen = Math.max(256, targetBytes - 300);
                 final String json = JsonObject.newBuilder()
                         .set("thingId", thingId)

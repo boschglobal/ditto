@@ -15,8 +15,13 @@ package org.eclipse.ditto.internal.utils.persistence.bench;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
@@ -26,6 +31,8 @@ import com.mongodb.client.MongoClients;
  * environment variable, then default. The run-benchmark.sh script exports the BENCH_* variables.
  */
 public final class BenchConfig {
+
+    private static final Pattern RETENTION = Pattern.compile("(\\d+)([dhms])");
 
     private BenchConfig() {
     }
@@ -109,6 +116,64 @@ public final class BenchConfig {
     }
 
     /**
+     * Share of pids whose events and snapshots are all written relative to {@link #freshBaseMillis()}
+     * (see {@link CorpusGenerator}); 0 (default) loads the backdated corpus.
+     */
+    public static double freshShare() {
+        return Double.parseDouble(property("bench.freshShare", "BENCH_FRESH_SHARE", "0"));
+    }
+
+    /**
+     * Timestamp base of the fresh-only pids, an ISO-8601 instant; default: the previous UTC midnight,
+     * so loads on the same UTC day generate the same corpus. Pass it explicitly when the backends
+     * are loaded on different days.
+     */
+    public static long freshBaseMillis() {
+        final String configured = property("bench.freshBase", "BENCH_FRESH_BASE", "");
+        return configured.isEmpty()
+                ? defaultFreshBaseMillis(Instant.now())
+                : Instant.parse(configured).toEpochMilli();
+    }
+
+    static long defaultFreshBaseMillis(final Instant now) {
+        return now.truncatedTo(ChronoUnit.DAYS).minus(Duration.ofDays(1)).toEpochMilli();
+    }
+
+    /** The C1 retention variant's history-retention-duration (things.conf default 3d), e.g. "3d", "12h". */
+    public static String c1RetentionSpec() {
+        return property("bench.c1.retention", "BENCH_C1_RETENTION", "3d");
+    }
+
+    public static Duration c1Retention() {
+        return parseRetention(c1RetentionSpec());
+    }
+
+    /** Parses a non-negative whole number with a d/h/m/s unit, as the service config durations are written. */
+    static Duration parseRetention(final String spec) {
+        final Matcher m = RETENTION.matcher(spec);
+        if (!m.matches()) {
+            throw new IllegalArgumentException("retention must look like 3d, 12h, 90m or 45s: '" + spec + "'");
+        }
+        final long amount = Long.parseLong(m.group(1));
+        return switch (m.group(2)) {
+            case "d" -> Duration.ofDays(amount);
+            case "h" -> Duration.ofHours(amount);
+            case "m" -> Duration.ofMinutes(amount);
+            default -> Duration.ofSeconds(amount);
+        };
+    }
+
+    /** Rejects a fresh base whose deepest fresh pid would write rows at or after {@code now}. */
+    static void checkFreshWindow(final CorpusGenerator gen, final Instant now) {
+        if (gen.freshShare() > 0.0 && gen.latestFreshTimestampMillis() >= now.toEpochMilli()) {
+            throw new IllegalStateException("fresh base " + Instant.ofEpochMilli(gen.freshBaseMillis())
+                    + " puts the deepest fresh-only pid's rows up to "
+                    + Instant.ofEpochMilli(gen.latestFreshTimestampMillis())
+                    + ", in the future; pick a base at least " + CorpusGenerator.DEPTH_CAP + " s in the past");
+        }
+    }
+
+    /**
      * pgjdbc connection with prepareThreshold=0: every execution is custom-planned — the search
      * bench's generic-plan-flip finding, adopted as protocol.
      */
@@ -125,7 +190,12 @@ public final class BenchConfig {
     }
 
     public static CorpusGenerator corpus() {
-        return new CorpusGenerator(seed(), count());
+        final double share = freshShare();
+        final CorpusGenerator gen = share > 0.0
+                ? new CorpusGenerator(seed(), count(), share, freshBaseMillis())
+                : new CorpusGenerator(seed(), count());
+        checkFreshWindow(gen, Instant.now());
+        return gen;
     }
 
     static String property(final String sysProp, final String envVar, final String fallback) {

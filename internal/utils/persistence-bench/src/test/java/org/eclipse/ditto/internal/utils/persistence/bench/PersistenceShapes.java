@@ -12,13 +12,20 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
+import java.nio.ByteBuffer;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 
 import org.bson.BsonNull;
 import org.bson.Document;
 import org.bson.conversions.Bson;
+import org.bson.types.ObjectId;
+
+import com.mongodb.client.model.Aggregates;
+import com.mongodb.client.model.Filters;
 
 /**
  * Verbatim transcriptions of the operations Ditto's persistence plugins issue.
@@ -138,6 +145,21 @@ public final class PersistenceShapes {
                 .append("s2", s2);
     }
 
+    /**
+     * A deterministic, unique {@code _id} for a corpus snapshot whose embedded timestamp is the
+     * snapshot's write time. In production the driver generates {@code _id} at insert time, so its
+     * timestamp IS the write time, and that is what the cleanup min-age filter reads
+     * ({@code MongoReadJournal}: {@code _id < ObjectId.getSmallestWithDate(now - minAge)}), not
+     * {@code ts}. Layout: 4-byte epoch seconds, 4-byte pid index, 4-byte sn.
+     */
+    public static ObjectId snapshotObjectId(final long pidIndex, final long sn, final long tsMillis) {
+        final ByteBuffer bytes = ByteBuffer.allocate(12);
+        bytes.putInt((int) (tsMillis / 1000L));
+        bytes.putInt((int) pidIndex);
+        bytes.putInt((int) sn);
+        return new ObjectId(bytes.array());
+    }
+
     /** Replay filter (ScalaDriverPersistenceJournaller.journalRangeQuery); sort {to:1}, projection {events:1}. */
     public static Document replayFilter(final String pid, final long fromSn, final long toSn) {
         return new Document("pid", pid)
@@ -190,6 +212,24 @@ public final class PersistenceShapes {
         pipeline.add(new Document("$group", new Document("_id", new BsonNull())
                 .append("m", new Document("$max", "$_id"))
                 .append("i", new Document("$push", "$$ROOT"))));
+        return pipeline;
+    }
+
+    /**
+     * The same pipeline with the cleanup's min age ({@code history-retention-duration}) applied as
+     * MongoReadJournal.toMongoFilter does: a non-zero min age ANDs
+     * {@code _id < ObjectId.getSmallestWithDate(now - minAge)} to the pid filter (no index hint: the
+     * things.conf hint names are null). A zero min age is exactly {@link #newestSnapshotsPipeline(String, int)}.
+     */
+    public static List<Bson> newestSnapshotsPipeline(final String lowerBoundPid, final int batchSize,
+            final Duration minAgeFromNow, final Instant now) {
+        final List<Bson> pipeline = newestSnapshotsPipeline(lowerBoundPid, batchSize);
+        if (!minAgeFromNow.isZero()) {
+            final Bson pidFilter = lowerBoundPid.isEmpty() ? Filters.empty() : Filters.gt("pid", lowerBoundPid);
+            final Bson retention =
+                    Filters.lt("_id", ObjectId.getSmallestWithDate(Date.from(now.minus(minAgeFromNow))));
+            pipeline.set(0, Aggregates.match(Filters.and(pidFilter, retention)));
+        }
         return pipeline;
     }
 }
