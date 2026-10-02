@@ -20,14 +20,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.IntStream;
 
-import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
-import org.eclipse.ditto.internal.utils.persistence.postgres.ops.RecordingConnectionFactory;
-import org.eclipse.ditto.internal.utils.persistence.postgres.ops.StubClientSupport;
 import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
 import org.junit.AfterClass;
 import org.junit.Assume;
@@ -57,11 +53,10 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  *     included only if its newest event carries the tag.</li>
  * </ul>
  * <p>
- * A bulk fixture with more pids than the read-journal portal fetch size covers the portal-backed path and the
- * priority order at scale. Paused consumers show the difference between the materialised priority result (no server
- * transaction left) and a portal-backed pid stream (transaction and snapshot open until drained). An EXPLAIN check
- * (sequential scans and explicit sorts disabled) shows that the newest-row step of each query is a backward
- * primary-key scan with no sort on {@code (pid, sn DESC)}.
+ * A bulk fixture with many more pids than one window covers the windowed ID order and the priority order at scale.
+ * Paused consumers show that no server transaction is left while the consumer waits. An EXPLAIN check (sequential scans and explicit
+ * sorts disabled) shows that the newest-row step of each query is a backward primary-key scan with no sort on
+ * {@code (pid, sn DESC)}.
  * </p>
  */
 public final class PostgresNewestPerPidTagQueriesIT {
@@ -266,79 +261,52 @@ public final class PostgresNewestPerPidTagQueriesIT {
     }
 
     // =================================================================================================
-    // paused consumers: a portal keeps the server transaction and its snapshot open, a materialised result does not
+    // paused consumers: between statements no statement, transaction or snapshot is left on the server
     // =================================================================================================
 
     @Test
-    public void pausedConsumerOfThePriorityQueryHoldsNoServerTransaction() throws Exception {
-        // More pids than one portal fetch (so a portal would stay suspended), yet a result small enough (~20 KB) to fit
-        // any socket buffer, so the materialised statement always runs to completion while the consumer pauses.
+    public void pausedConsumerOfThePriorityStreamHoldsNoServerTransaction() throws Exception {
         final String tag = "prio-pause";
         final int pids = 600;
         fixture.seedJournal(ENTITY, "connection:prio-pause:", pids, 1,
                 "ARRAY['" + tag + "', 'priority-' || (i % 10)]");
-        final SinkQueueWithCancel<String> consumer =
-                readJournal.getJournalPidsWithTagOrderedByPriorityTag(tag, STREAM_TIMEOUT).runWith(Sink.queue(), mat);
-        try {
-            for (int i = 0; i < 10; i++) {
-                assertThat(pull(consumer)).isPresent();
-            }
-
-            // The consumer pauses, as the throttled persistence ping does. Without a portal the statement completes
-            // and its transaction ends: no snapshot is held and statement_timeout cannot cut the stream off.
-            awaitNoBackend("state <> 'idle' AND query LIKE '%priority-%'", List.of());
-
-            int received = 10;
-            while (pull(consumer).isPresent()) {
-                received++;
-            }
-            assertThat(received).isEqualTo(pids);
-        } finally {
-            consumer.cancel();
-        }
+        assertNoServerTransactionWhilePausedAndComplete(
+                readJournal.getJournalPidsWithTagOrderedByPriorityTag(tag, STREAM_TIMEOUT), pids);
     }
 
     @Test
-    public void pausedConsumerOfThePortalBackedPidStreamKeepsItsTransactionAndSnapshotOpenUntilDrained()
-            throws Exception {
-        // getJournalPidsWithTag(…, considerOnlyLatest = false) is portal-backed; the persistence ping streams it in ID
-        // order, throttled (by default to one pid per second).
-        final SinkQueueWithCancel<String> consumer =
+    public void pausedConsumerOfTheIdOrderPidStreamHoldsNoServerTransaction() throws Exception {
+        // the policies ping streams getJournalPidsWithTag(…, considerOnlyLatest = false) in ID order, throttled (by
+        // default to one pid per second).
+        assertNoServerTransactionWhilePausedAndComplete(
                 readJournal.getJournalPidsWithTag(BULK_TAG, 100, STREAM_TIMEOUT, mat, false)
-                        .runWith(Sink.queue(), mat);
+                        .filter(pid -> pid.startsWith(BULK_PREFIX)), BULK_PIDS);
+    }
+
+    private static void assertNoServerTransactionWhilePausedAndComplete(final Source<String, ?> stream,
+            final int expectedPids) throws Exception {
+        final SinkQueueWithCancel<String> consumer = stream.runWith(Sink.queue(), mat);
         try {
             for (int i = 0; i < 10; i++) {
                 assertThat(pull(consumer)).isPresent();
             }
 
-            // The consumer pauses: no demand beyond the first portal fetch.
-            final Map<String, String> paused = awaitBackend(
-                    "state <> 'idle' AND query LIKE 'SELECT DISTINCT pid FROM " + JOURNAL + " WHERE%'", List.of(),
-                    row -> true);
+            // The consumer pauses, as the throttled persistence ping does. Every statement is short and is
+            // read completely, so its transaction has ended: no snapshot is held and statement_timeout cannot cut
+            // the stream off.
+            awaitNoBackend("(state <> 'idle' OR backend_xmin IS NOT NULL OR xact_start IS NOT NULL) "
+                    + "AND query LIKE '%" + JOURNAL + "%'", List.of());
             TimeUnit.MILLISECONDS.sleep(PAUSE.toMillis());
-            final Map<String, String> stillPaused = backend(paused.get("pid"));
-            assertThat(stillPaused.get("state"))
-                    .as("no ReadyForQuery while the portal is suspended, so idle-in-transaction timeouts do not apply")
-                    .isEqualTo("active");
-            assertThat(stillPaused.get("backend_xmin"))
-                    .as("the open snapshot holds the database-wide VACUUM horizon")
-                    .isNotNull()
-                    .isEqualTo(paused.get("backend_xmin"));
-            assertThat(Double.parseDouble(stillPaused.get("xact_age_s")))
-                    .as("the implicit transaction spans the consumer's pause")
-                    .isGreaterThanOrEqualTo(PAUSE.toMillis() / 1000.0);
+            assertThat(backends("(state <> 'idle' OR backend_xmin IS NOT NULL OR xact_start IS NOT NULL) "
+                    + "AND query LIKE '%" + JOURNAL + "%'", List.of()))
+                    .as("backends in a statement, a transaction or holding a snapshot during the pause")
+                    .isEmpty();
 
             int received = 10;
             while (pull(consumer).isPresent()) {
                 received++;
             }
-            assertThat(received).isGreaterThanOrEqualTo(BULK_PIDS);
-
-            // once drained, the transaction ends and the snapshot is released.
-            final Map<String, String> drained = awaitBackend("pid = $1",
-                    List.of(Integer.parseInt(paused.get("pid"))), row -> "idle".equals(row.get("state")));
-            assertThat(drained.get("backend_xmin")).isNull();
-            assertThat(drained.get("xact_start")).isNull();
+            assertThat(received).isEqualTo(expectedPids);
         } finally {
             consumer.cancel();
         }
@@ -351,27 +319,29 @@ public final class PostgresNewestPerPidTagQueriesIT {
     @Test
     public void priorityQueryNewestRowStepIsABackwardPrimaryKeyScanWithoutSort() {
         final String sql = productionSql(rj -> rj.getJournalPidsWithTagOrderedByPriorityTag("", STREAM_TIMEOUT));
-        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, "");
-        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, BULK_TAG);
+        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of(""), "");
+        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of(BULK_TAG), BULK_TAG);
     }
 
     @Test
     public void pidsWithTagConsideringOnlyLatestNewestRowStepIsABackwardPrimaryKeyScanWithoutSort() {
         final String sql = productionSql(rj -> rj.getJournalPidsWithTag("", 100, STREAM_TIMEOUT, mat, true));
-        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, "");
-        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, BULK_TAG);
+        // first window: ($1 cursor, $2 tag, $3 window size)
+        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of("", "", 100), "");
+        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of("", BULK_TAG, 100), BULK_TAG);
     }
 
     // =================================================================================================
     // helpers
     // =================================================================================================
 
-    private static void assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(final String sql, final String tag) {
+    private static void assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(final String sql,
+            final List<Object> binds, final String tag) {
         // Index ELIGIBILITY on a test-sized table: without seq scans and explicit sorts the planner must still find a
         // sort-free plan. The former DISTINCT ON (pid) … ORDER BY pid, sn DESC shape has none: even with sorting
         // disabled it keeps an (Incremental) Sort on (pid, sn DESC) over the whole journal. The per-pid top-1 is an
         // index-only scan when the query needs no tags from that row (empty tag, newest-event variant).
-        final String plan = fixture.explain(sql, List.of(tag), "enable_seqscan = off", "enable_sort = off");
+        final String plan = fixture.explain(sql, binds, "enable_seqscan = off", "enable_sort = off");
         assertThat(plan)
                 .as("tag '%s', plan:%n%s", tag, plan)
                 .doesNotContainPattern(Pattern.compile("Sort Key: [^\\n]*\\bsn DESC"))
@@ -381,15 +351,7 @@ public final class PostgresNewestPerPidTagQueriesIT {
 
     /** The SQL the production code issues for a read-journal call, captured offline with a recording stub. */
     private static String productionSql(final Function<PostgresReadJournal, Source<String, ?>> call) {
-        final RecordingConnectionFactory recorder = new RecordingConnectionFactory();
-        final DittoPostgresClient recordingClient = StubClientSupport.clientFor(recorder);
-        try {
-            run(call.apply(PostgresReadJournal.of(PostgresPersistenceOperations.of(recordingClient, ENTITY))));
-        } finally {
-            recordingClient.close();
-        }
-        assertThat(recorder.executedSql()).hasSize(1);
-        return recorder.executedSql().get(0);
+        return PidStreamTestSupport.productionSql(ENTITY, call, mat);
     }
 
     private static void event(final String pid, final long sn, final String... tags) {
@@ -417,27 +379,6 @@ public final class PostgresNewestPerPidTagQueriesIT {
 
     private static Optional<String> pull(final SinkQueueWithCancel<String> consumer) throws Exception {
         return consumer.pull().toCompletableFuture().get(STREAM_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
-    }
-
-    private static Map<String, String> backend(final String pid) {
-        final List<Map<String, String>> rows = backends("pid = $1", List.of(Integer.parseInt(pid)));
-        assertThat(rows).hasSize(1);
-        return rows.get(0);
-    }
-
-    /** Polls {@code pg_stat_activity} until exactly one other backend matches the condition and the predicate. */
-    private static Map<String, String> awaitBackend(final String condition, final List<Object> binds,
-            final Predicate<Map<String, String>> predicate) throws InterruptedException {
-        final long deadline = System.nanoTime() + STREAM_TIMEOUT.toNanos();
-        List<Map<String, String>> rows = List.of();
-        while (System.nanoTime() < deadline) {
-            rows = backends(condition, binds);
-            if (rows.size() == 1 && predicate.test(rows.get(0))) {
-                return rows.get(0);
-            }
-            TimeUnit.MILLISECONDS.sleep(50);
-        }
-        throw new AssertionError("no single backend with " + condition + " " + binds + ": " + rows);
     }
 
     /** Polls {@code pg_stat_activity} until no other backend matches the condition. */

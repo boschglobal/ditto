@@ -53,6 +53,7 @@ import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
 import org.eclipse.ditto.internal.utils.persistence.api.DeleteOutcome;
 import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
 import org.eclipse.ditto.internal.utils.persistence.api.JournalEntry;
+import org.eclipse.ditto.internal.utils.persistence.api.ReadJournalRestarts;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotFilter;
 import org.eclipse.ditto.internal.utils.persistence.mongo.DittoBsonJson;
@@ -176,8 +177,6 @@ public final class MongoReadJournal implements DittoReadJournal {
     public static final String J_EVENT_PID = JournallingFieldNames$.MODULE$.PROCESSOR_ID();
     public static final String J_EVENT_MANIFEST = JournallingFieldNames$.MODULE$.MANIFEST();
     private static final String J_EVENT_SN = JournallingFieldNames$.MODULE$.SEQUENCE_NUMBER();
-
-    private static final Duration MAX_BACK_OFF_DURATION = Duration.ofSeconds(128L);
 
     private static final BsonDocument FILTER_PRIORITY_TAGS_EXPR = BsonDocument.parse(
             "{" +
@@ -920,11 +919,11 @@ public final class MongoReadJournal implements DittoReadJournal {
         // sort stage 2 -- order after group stage is not defined
         pipeline.add(Aggregates.sort(Sorts.orderBy(Sorts.descending(J_TAGS))));
 
-        final Duration minBackOff = Duration.ofSeconds(1L);
-        final double randomFactor = 0.1;
+        final Duration minBackOff = ReadJournalRestarts.MIN_BACKOFF;
+        final double randomFactor = ReadJournalRestarts.RANDOM_FACTOR;
 
         final RestartSettings restartSettings = RestartSettings.create(minBackOff,
-                        MongoReadJournal.MAX_BACK_OFF_DURATION, randomFactor)
+                        ReadJournalRestarts.MAX_BACKOFF, randomFactor)
                 .withMaxRestarts(maxRestarts, minBackOff);
 
         final AggregatePublisher<Document> aggregatePublisher;
@@ -977,11 +976,11 @@ public final class MongoReadJournal implements DittoReadJournal {
         // sort stage 2 -- order after group stage is not defined
         pipeline.add(Aggregates.sort(Sorts.ascending(J_ID)));
 
-        final Duration minBackOff = Duration.ofSeconds(1L);
-        final double randomFactor = 0.1;
+        final Duration minBackOff = ReadJournalRestarts.MIN_BACKOFF;
+        final double randomFactor = ReadJournalRestarts.RANDOM_FACTOR;
 
         final RestartSettings restartSettings = RestartSettings.create(minBackOff,
-                        MongoReadJournal.MAX_BACK_OFF_DURATION, randomFactor)
+                        ReadJournalRestarts.MAX_BACKOFF, randomFactor)
                 .withMaxRestarts(maxRestarts, minBackOff);
         return RestartSource.onFailuresWithBackoff(restartSettings, () ->
                 {
@@ -1011,14 +1010,7 @@ public final class MongoReadJournal implements DittoReadJournal {
     }
 
     private static int computeMaxRestarts(final Duration maxDuration) {
-        if (MAX_BACK_OFF_DURATION.minus(maxDuration).isNegative()) {
-            // maxBackOff < maxDuration: backOff at least 7 times (1+2+4+8+16+32+64=127s)
-            return Math.max(7, 6 + (int) (maxDuration.toMillis() / MAX_BACK_OFF_DURATION.toMillis()));
-        } else {
-            // maxBackOff >= maxDuration: maxRestarts = log2 of maxDuration in seconds
-            final int log2MaxDuration = 63 - Long.numberOfLeadingZeros(maxDuration.getSeconds());
-            return Math.max(0, log2MaxDuration);
-        }
+        return ReadJournalRestarts.computeMaxRestarts(maxDuration);
     }
 
     private Source<SnapshotBatch, NotUsed> listNewestActiveSnapshotsByBatch(

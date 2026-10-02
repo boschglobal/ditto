@@ -41,10 +41,11 @@ import org.apache.pekko.stream.javadsl.Source;
  * H-2: with the connection-pool-wide {@code fetch-size=0} default, the r2dbc-postgresql driver runs a statement as one
  * fetch-all {@code Execute}; it reads the rows demand-driven, so the server blocks on the unread socket under a slow
  * consumer. The genuinely unbounded streaming read-journal queries ({@code currentPersistenceIds()},
- * {@code eventsByTag()}, {@code getPidsWithTag} in both variants) bind a positive per-statement
- * {@code Statement.fetchSize(n)} instead, so a server-side portal produces the rows fetch by fetch on demand.
- * The priority-ordered pid query is the deliberate exception: its small result is materialised, because its consumer
- * (the throttled persistence ping) would otherwise keep the portal's transaction open past {@code statement_timeout}.
+ * {@code eventsByTag()}) bind a positive per-statement {@code Statement.fetchSize(n)} instead, so a server-side portal
+ * produces the rows fetch by fetch on demand. The tag pid streams (both {@code getJournalPidsWithTag} variants and the
+ * priority order) are the deliberate exception: their consumer, the throttled persistence ping, would keep a portal's
+ * transaction open past {@code statement_timeout}, so they read short windows (ID order) or one statement per walk
+ * (priority order) without a portal instead.
  * </p>
  * <p>
  * M-2: {@code getLatestJournalEntries} must NOT be an N+1 (one inner replay query per pid); a single
@@ -97,26 +98,34 @@ public final class PostgresReadJournalBackpressureTest {
     }
 
     @Test
-    public void getPidsWithTagAllBindsPositiveFetchSize() {
+    public void getPidsWithTagIsReadInWindowsWithoutAPortal() {
         final RecordingConnectionFactory factory = new RecordingConnectionFactory();
         final PostgresReadJournal journal = readJournal(factory);
 
-        // considerOnlyLatest=false -> SELECT DISTINCT pid ... WHERE tags @> ... (no LIMIT)
         drain(journal.getJournalPidsWithTag("always-alive", 10, Duration.ofSeconds(1), mat, false));
 
+        assertThat(factory.executedSql()).singleElement().satisfies(sql -> assertThat(sql)
+                .as("one window: the next batchSize pids after the cursor, the tag checked per pid without the GIN "
+                        + "index")
+                .contains("SELECT DISTINCT pid FROM things_journal WHERE pid > $1 ORDER BY pid LIMIT $3",
+                        "EXISTS (", "$2 = ANY(t.tags)")
+                .doesNotContain("tags @>"));
         assertThat(factory.fetchSizeForSqlContaining("SELECT DISTINCT pid FROM"))
-                .as("getPidsWithTag(considerOnlyLatest=false) is unbounded and must bind a positive fetchSize")
-                .isPositive();
+                .as("the throttled ID-order ping must not hold a portal (open transaction, statement_timeout)")
+                .isZero();
     }
 
     @Test
-    public void getPidsWithTagOrderedByPriorityIsMaterialisedWithoutAPortal() {
+    public void getPidsWithTagOrderedByPriorityIsOneStatementWithoutAPortal() {
         final RecordingConnectionFactory factory = new RecordingConnectionFactory();
         final PostgresReadJournal journal = readJournal(factory);
 
         drain(journal.getJournalPidsWithTagOrderedByPriorityTag("always-alive", Duration.ofSeconds(1)));
 
-        assertThat(factory.executedContaining("priority-")).as("the priority query ran").isTrue();
+        assertThat(factory.executedSql()).singleElement().satisfies(sql -> assertThat(sql)
+                .as("the whole priority order in one statement")
+                .contains("ORDER BY COALESCE(pr.prio, 0) DESC")
+                .doesNotContain("LIMIT $"));
         assertThat(factory.fetchSizeForSqlContaining("priority-"))
                 .as("the throttled priority ping must not hold a portal (open transaction, statement_timeout)")
                 .isZero();
@@ -144,11 +153,12 @@ public final class PostgresReadJournalBackpressureTest {
 
         assertThat(factory.executedSql()).singleElement().satisfies(sql -> assertThat(sql)
                 .as("distinct-pid step + per-pid top-1 backward scan, not DISTINCT ON (pid) … ORDER BY pid, sn DESC")
-                .contains("SELECT DISTINCT pid FROM", "CROSS JOIN LATERAL", "ORDER BY sn DESC LIMIT 1")
+                .contains("SELECT DISTINCT pid FROM", "CROSS JOIN LATERAL", "ORDER BY sn DESC LIMIT 1",
+                        "WHERE pid > $1", "ORDER BY pid LIMIT $3", "$2 = ANY(n.tags)")
                 .doesNotContain("DISTINCT ON"));
         assertThat(factory.fetchSizeForSqlContaining("CROSS JOIN LATERAL"))
-                .as("getPidsWithTag(considerOnlyLatest=true) is unbounded and must bind a positive fetchSize")
-                .isPositive();
+                .as("read in windows, without a portal")
+                .isZero();
     }
 
     @Test

@@ -57,7 +57,7 @@ import org.apache.pekko.testkit.javadsl.TestKit;
 
 /**
  * PgBouncer transaction-pooling smoke test: runs the schema bootstrap (transaction-scoped advisory-lock DDL), a
- * write/recover/cleanup round-trip and portal-backed read-journal streams <em>through a real PgBouncer container in
+ * write/recover/cleanup round-trip and the paged tag pid streams <em>through a real PgBouncer container in
  * {@code pool_mode=transaction}</em> with {@code prepared-statement-cache-queries=0} (unnamed statements — safe on any
  * PgBouncer version).
  * <p>
@@ -180,18 +180,17 @@ public final class PgBouncerTransactionPoolingIT {
     }
 
     /**
-     * The unbounded read-journal streams bind a positive per-statement fetch size, so they run through a server-side
-     * portal although the pool keeps {@code fetch-size=0}. Under transaction pooling the portal must survive between
-     * fetches: more pids than several fetches stream completely through both variants of the tag pid query (the ID-order
-     * persistence ping and connection-id retrieval use them).
+     * The tag pid streams (the ID-order persistence ping and connection-id retrieval, one short window per statement;
+     * the priority-order connectivity ping, one statement per walk): under transaction pooling every statement may run
+     * on another server connection, and the walk must still be complete, in order and free of duplicates.
      */
     @Test
-    public void portalBackedReadJournalStreamsCompleteThroughTransactionPooling() throws Exception {
-        final String tag = "pgb-portal";
+    public void pagedTagPidStreamsCompleteThroughTransactionPooling() throws Exception {
+        final String tag = "pgb-paged";
         final int pidCount = 1_000;
         reactor.core.publisher.Mono.from(client.executeUpdatePublisher(
                         "INSERT INTO things_journal (pid, sn, manifest, tags, event) "
-                                + "SELECT 'thing:pgb-portal:' || lpad(i::text, 6, '0'), 1, 'manifest', "
+                                + "SELECT 'thing:pgb-paged:' || lpad(i::text, 6, '0'), 1, 'manifest', "
                                 + "ARRAY[$1, 'priority-' || (i % 10)], '{}'::jsonb FROM generate_series(1, $2) AS i",
                         stmt -> {
                             stmt.bind(0, tag);
@@ -205,9 +204,15 @@ public final class PgBouncerTransactionPoolingIT {
         final List<String> newestTagged = await(readJournal.getJournalPidsWithTag(tag, 100,
                 Duration.ofSeconds(30), SystemMaterializer.get(system).materializer(), true)
                 .runWith(Sink.seq(), system));
+        final List<String> byPriority = await(readJournal.getJournalPidsWithTagOrderedByPriorityTag(tag,
+                        Duration.ofSeconds(30))
+                .runWith(Sink.seq(), system));
 
-        assertThat(anyTagged).hasSize(pidCount).doesNotHaveDuplicates();
-        assertThat(newestTagged).hasSize(pidCount).doesNotHaveDuplicates();
+        assertThat(anyTagged).hasSize(pidCount).doesNotHaveDuplicates().isSorted();
+        assertThat(newestTagged).hasSize(pidCount).doesNotHaveDuplicates().isSorted();
+        assertThat(byPriority).hasSize(pidCount).doesNotHaveDuplicates();
+        assertThat(byPriority.stream().map(pid -> Integer.parseInt(pid.substring(pid.length() - 6)) % 10).toList())
+                .isSortedAccordingTo((a, b) -> Integer.compare(b, a));
     }
 
     /**

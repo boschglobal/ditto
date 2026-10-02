@@ -18,14 +18,23 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import javax.annotation.Nullable;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
+import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
 import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -44,10 +53,20 @@ import com.typesafe.config.ConfigFactory;
 
 import io.r2dbc.pool.ConnectionPool;
 import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.ConnectionFactories;
+import io.r2dbc.spi.ConnectionFactory;
+import io.r2dbc.spi.ConnectionFactoryOptions;
 import io.r2dbc.spi.R2dbcException;
 import io.r2dbc.spi.Result;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+
+import org.apache.pekko.NotUsed;
+import org.apache.pekko.actor.ActorSystem;
+import org.apache.pekko.stream.Materializer;
+import org.apache.pekko.stream.SystemMaterializer;
+import org.apache.pekko.stream.javadsl.Source;
+import org.apache.pekko.testkit.javadsl.TestKit;
 
 /**
  * Proves how {@code statement_timeout} is enforced behind a PgBouncer in {@code pool_mode = transaction}, for the roles
@@ -129,10 +148,12 @@ public final class PgBouncerStatementTimeoutIT {
     private static final int SLEEP_SECONDS = 5;
     private static final String LONG_STATEMENT = "DO $$ BEGIN PERFORM pg_sleep(" + SLEEP_SECONDS + "); END $$;";
     private static final String QUERY_CANCELED = "57014";
+    private static final String ALWAYS_ALIVE = "always-alive";
 
     private static Network network;
     private static PostgreSQLContainer<?> postgres;
     private static GenericContainer<?> pgbouncer;
+    private static boolean schemaSeeded = false;
 
     @BeforeClass
     public static void start() throws Exception {
@@ -240,6 +261,87 @@ public final class PgBouncerStatementTimeoutIT {
                 .as("statement_timeout of a direct %s session with statement-timeout = %s", RUNTIME_ROLE,
                         CLIENT_STATEMENT_TIMEOUT)
                 .isEqualTo("2s");
+    }
+
+    /**
+     * The persistence pings consume their pid streams throttled, far more slowly than one statement may run under the
+     * role default. Read in short statements (windows in ID order, one statement per walk in priority order), the
+     * streams survive a consumer that pauses for longer than the role default (2s here) after the first window,
+     * behind transaction-mode PgBouncer, as the runtime role: every pid is delivered and no statement is cancelled (the
+     * streams run without retries, so a cancellation would fail them).
+     */
+    @Test
+    public void pausedPingStreamsAreNotCancelledByTheRuntimeRoleDefaultBehindTransactionPooling() throws Exception {
+        final int pids = 1_000;
+        final int batchSize = 100;
+        seedAlwaysAlivePolicies(pids);
+        final ActorSystem system = ActorSystem.create("PgBouncerStatementTimeoutIT");
+        try {
+            withRuntimeRoleTimeout(SHORT_ROLE_TIMEOUT, () -> {
+                final DittoPostgresClient client = DittoPostgresClient.forConnectionPool(
+                        poolThroughPgBouncer(RUNTIME_ROLE, RUNTIME_PASSWORD),
+                        DefaultPostgresConfig.of(ConfigFactory.empty()));
+                try {
+                    final PostgresReadJournal readJournal =
+                            PostgresReadJournal.of(PostgresPersistenceOperations.of(client, "policies"));
+                    final Materializer mat = SystemMaterializer.get(system).materializer();
+                    final Map<String, Source<String, NotUsed>> streams = new LinkedHashMap<>();
+                    streams.put("ID order",
+                            readJournal.getJournalPidsWithTag(ALWAYS_ALIVE, batchSize, Duration.ZERO, mat, false));
+                    streams.put("ID order, newest event",
+                            readJournal.getJournalPidsWithTag(ALWAYS_ALIVE, batchSize, Duration.ZERO, mat, true));
+                    streams.put("priority order",
+                            readJournal.getJournalPidsWithTagOrderedByPriorityTag(ALWAYS_ALIVE, Duration.ZERO));
+                    for (final Map.Entry<String, Source<String, NotUsed>> stream : streams.entrySet()) {
+                        assertThat(pauseAfterFirstPageThenDrain(stream.getValue(), batchSize, mat))
+                                .as("%s: every pid, once", stream.getKey())
+                                .hasSize(pids)
+                                .doesNotHaveDuplicates();
+                    }
+                } finally {
+                    client.close();
+                }
+            });
+        } finally {
+            TestKit.shutdownActorSystem(system);
+        }
+    }
+
+    private static List<String> pauseAfterFirstPageThenDrain(final Source<String, NotUsed> stream,
+            final int batchSize, final Materializer mat) throws Exception {
+        final List<String> received = new ArrayList<>();
+        // longer than the 2s role default, as a throttled ping waits between two statements.
+        PidStreamTestSupport.pullPauseDrain(stream, batchSize, Duration.ofSeconds(SLEEP_SECONDS), () -> { },
+                received, mat, Duration.ofSeconds(30));
+        return received;
+    }
+
+    /** Creates the persistence schema as the DDL role and seeds always-alive policies, once. */
+    private static void seedAlwaysAlivePolicies(final int pids) {
+        if (schemaSeeded) {
+            return;
+        }
+        final ConnectionFactory ddl = ConnectionFactories.get(ConnectionFactoryOptions.builder()
+                .option(ConnectionFactoryOptions.DRIVER, "postgresql")
+                .option(ConnectionFactoryOptions.HOST, postgres.getHost())
+                .option(ConnectionFactoryOptions.PORT, postgres.getMappedPort(PostgreSQLContainer.POSTGRESQL_PORT))
+                .option(ConnectionFactoryOptions.DATABASE, DATABASE)
+                .option(ConnectionFactoryOptions.USER, DDL_ROLE)
+                .option(ConnectionFactoryOptions.PASSWORD, DDL_PASSWORD)
+                .build());
+        PostgresSchemaManager.of(ddl, PostgresSchema.descriptor()).bootstrap();
+        Mono.usingWhen(Mono.from(ddl.create()),
+                        connection -> Flux.from(connection.createStatement("INSERT INTO policies_journal "
+                                                + "(pid, sn, manifest, tags, event) SELECT 'policy:pgb-ping:' || "
+                                                + "lpad(i::text, 6, '0'), 1, 'manifest', ARRAY['" + ALWAYS_ALIVE
+                                                + "', 'priority-' || (i % 10)], '{}'::jsonb "
+                                                + "FROM generate_series(1, " + pids + ") AS i")
+                                        .execute())
+                                .flatMap(Result::getRowsUpdated)
+                                .then(),
+                        Connection::close)
+                .block(Duration.ofSeconds(30));
+        schemaSeeded = true;
     }
 
     private static String showStatementTimeout(final String role, final String password) {

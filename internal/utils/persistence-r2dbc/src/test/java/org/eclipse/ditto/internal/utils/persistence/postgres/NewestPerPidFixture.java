@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -121,6 +122,19 @@ public final class NewestPerPidFixture implements AutoCloseable {
      */
     public PostgresReadJournal readJournal(final String entityPrefix) {
         return PostgresReadJournal.of(operations(entityPrefix));
+    }
+
+    /**
+     * A separate pooled client over the fixture's database whose connection factory is decorated first, e.g. with an
+     * r2dbc-proxy listener that observes every statement. The caller closes it.
+     *
+     * @param decorator wraps the fixture's connection factory.
+     * @return the client.
+     */
+    public DittoPostgresClient newClient(final UnaryOperator<ConnectionFactory> decorator) {
+        final ConnectionPool pool = new ConnectionPool(ConnectionPoolConfiguration.builder(decorator.apply(ddlFactory))
+                .name("newest-per-pid-fixture-decorated-pool").maxSize(4).build());
+        return DittoPostgresClient.forConnectionPool(pool, DefaultPostgresConfig.of(ConfigFactory.empty()));
     }
 
     /**

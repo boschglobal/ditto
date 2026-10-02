@@ -67,8 +67,9 @@ public final class PostgresPersistenceOperations {
     /**
      * Server-side portal size bound via {@link Statement#fetchSize(int)} on the long, genuinely-unbounded streaming
      * read-journal queries without a {@code LIMIT} ({@code currentPersistenceIds}, {@code eventsByTag},
-     * {@code getPidsWithTag}, {@code getLatestJournalEntries}; {@code getPidsWithTagOrderedByPriority} is deliberately
-     * materialised instead).
+     * {@code getLatestJournalEntries}). The tag pid streams of the persistence ping and of connection-id retrieval do
+     * not use a portal: the ID order reads one short window per statement ({@link #getPidWindowAbove}), the priority
+     * order one statement per walk that is read completely at once ({@link #getPidsWithTagOrderedByPriority}).
      * <p>
      * The connection-pool-wide default is {@code fetch-size=0} (see {@code ConnectionPoolFactory}/{@code PostgresConfig}),
      * for which the r2dbc-postgresql driver sends one fetch-all {@code Execute}: it still reads the rows demand-driven
@@ -81,9 +82,10 @@ public final class PostgresPersistenceOperations {
      * <p>
      * The portal bounds client memory, not the transaction: the statement's implicit transaction and snapshot stay
      * open until the stream is drained, and {@code statement_timeout} counts across the suspended portal. A slowly
-     * consumed stream therefore holds back VACUUM and fails with SQLSTATE {@code 57014} once it outlives the timeout
-     * (see {@link #getPidsWithTag} for the known throttled consumer, and {@link #getPidsWithTagOrderedByPriority},
-     * which is materialised for that reason).
+     * consumed stream therefore holds back VACUUM and fails with SQLSTATE {@code 57014} once it outlives the timeout.
+     * That is why a throttled consumer such as the persistence ping must never read through a portal: with the
+     * production connection wiring a paused portal stream of tagged pids was cancelled with {@code 57014} after its
+     * first 256-row fetch.
      * </p>
      */
     static final int STREAMING_FETCH_SIZE = 256;
@@ -365,8 +367,9 @@ public final class PostgresPersistenceOperations {
     // =====================================================================================================
 
     /**
-     * The priority-tag ordered PID query. An empty {@code tag} selects ALL pids (Mongo parity — the
-     * PersistencePingActor default journal-tag is empty).
+     * The pids carrying {@code tag} in descending priority order, as ONE statement whose whole result the caller
+     * reads at once. An empty {@code tag} selects ALL pids (Mongo parity — the PersistencePingActor default
+     * journal-tag is empty).
      * <p>
      * The tag filter applies BEFORE the newest-per-pid pick (Mongo parity: {@code $match} on the tag, then
      * {@code $group} with {@code $last} tags): a pid qualifies if ANY of its events carries the tag, and its priority
@@ -379,27 +382,17 @@ public final class PostgresPersistenceOperations {
      * come in no defined order).
      * </p>
      * <p>
-     * The priority {@code ORDER BY} is a server-side sort over the surviving pids (one row per pid, spilling to temp
-     * files beyond {@code work_mem}), so the first row arrives once that sort is done. The distinct-pid phase reads the
-     * whole primary-key index (index-only), or every GIN-matched row for a non-empty tag, because PostgreSQL has no
-     * native loose index scan; acceptable for this periodic background query. The former
-     * {@code DISTINCT ON (pid) … ORDER BY pid, sn DESC} shape additionally sorted every journal row by
-     * {@code (pid, sn DESC)}, an order the ascending primary key cannot deliver.
-     * </p>
-     * <p>
-     * Deliberately MATERIALISED (no server-side portal, unlike the other unbounded read-journal streams, see
-     * {@link #STREAMING_FETCH_SIZE}): the result is small (one pid per qualifying entity) and must be fully sorted
-     * before its first row anyway, while its consumer, the persistence ping, throttles it (by default to one pid per
-     * second). Behind a portal the statement's implicit transaction and snapshot would stay open until the throttled
-     * consumer drained it, holding back VACUUM database-wide, and {@code statement_timeout} keeps counting across a
-     * suspended portal: with the production connection wiring a paused portal stream of this query was cancelled with
-     * SQLSTATE {@code 57014} after its first 256-row fetch. Without a portal the statement runs to completion and no
-     * server transaction remains while the consumer pauses, as long as the whole result fits the socket and driver
-     * buffers: the driver reads rows demand-driven, so a much larger result would leave the server blocked on the
-     * unread socket, still holding its snapshot, until {@code statement_timeout} cancels it.
+     * The order needs every qualifying pid's priority, which is computed from the tags, not stored: there is no
+     * index to page by, so every page of a keyset walk would compute all priorities again. One statement per walk
+     * costs that once. Its result is read completely into memory before the first pid is emitted
+     * ({@link #pageQuerySource}), so the statement ends at once and no transaction or snapshot stays open while the
+     * consumer (the throttled connectivity ping) walks it; the server never waits on an unread socket either. The price
+     * is client memory proportional to the number of qualifying pids: one row is a pid string of a few dozen bytes,
+     * about 100 bytes on the heap, so about 10 MB for 100,000 connections. The ID order
+     * ({@link #getPidWindowAbove}) is the one meant for millions of entities: it reads bounded windows instead.
      * </p>
      *
-     * @param tag the membership tag (typically {@code always-alive}).
+     * @param tag the membership tag (typically {@code always-alive}), or {@code ""} for all pids.
      * @return a {@code Source} of pids in descending-priority order.
      */
     public Source<String, NotUsed> getPidsWithTagOrderedByPriority(final String tag) {
@@ -414,75 +407,73 @@ public final class PostgresPersistenceOperations {
                 + "FROM unnest(n.tags) AS tag WHERE tag ~ '^priority-[0-9]+$'"
                 + ") pr ON true "
                 + "ORDER BY COALESCE(pr.prio, 0) DESC";
-        // Materialised on purpose (no portal): the throttled ping consumer must not hold the transaction open.
-        return querySource(sql, stmt -> stmt.bind(0, tag), row -> getString(row, "pid"));
+        return pageQuerySource(sql, stmt -> stmt.bind(0, tag), row -> getString(row, "pid"));
     }
 
     /**
-     * PIDs carrying {@code tag}, in pid order. An empty {@code tag} selects ALL pids in both variants. Without
-     * {@code considerOnlyLatest} that is Mongo parity (the PersistencePingActor default journal-tag is empty); with it,
-     * the Mongo read journal returns NO pids for the empty tag (it matches the newest entry's tags against
-     * {@code ""}), a known divergence.
+     * One WINDOW of the pid stream in pid order ({@code COLLATE "C"}): the next {@code window} distinct pids strictly
+     * above {@code lowerBoundPid}, whether they carry the tag or not, each flagged with whether it qualifies. The
+     * caller keeps the qualifying pids and continues after the window's last pid, so a window without any qualifying
+     * pid still moves the walk on. An empty {@code tag} qualifies every pid.
+     * <ul>
+     *     <li>Without {@code considerOnlyLatest} a pid qualifies if ANY of its events carries the tag.</li>
+     *     <li>With it, only if its NEWEST event does: the filter applies AFTER the newest-per-pid pick (Mongo parity:
+     *     the newest entry per pid is grouped first, then matched), checked on a per-pid top-1 backward PK scan; it must
+     *     not move into that lateral subquery, where it would select the newest TAGGED event instead. (For the empty
+     *     tag, the Mongo read journal returns NO pids in this variant: a known divergence.)</li>
+     * </ul>
      * <p>
-     * Without {@code considerOnlyLatest} any tagged event qualifies (GIN containment). With it, the tag filter applies
-     * AFTER the newest-per-pid pick (Mongo parity: the newest entry per pid is grouped first, then matched): a pid
-     * qualifies only if its NEWEST event carries the tag, an older tagged event does not count. Two-phase loose index
-     * scan: a distinct-pid phase (a full index-only primary-key scan, as PostgreSQL has no native loose index scan)
-     * feeds a per-pid top-1 {@code CROSS JOIN LATERAL} backward PK scan, and the filter checks only that newest row. It
-     * must stay OUTSIDE the lateral subquery, where it would select the newest TAGGED event instead.
+     * Why windows over all pids rather than "the next tagged pids": the cost of a statement must not depend on where
+     * the tagged pids lie. Always-alive entities are typically a minority clustered in some part of the key space (one
+     * namespace among many). A statement that looked for the next {@code n} tagged pids would read every untagged row
+     * between the cursor and them, and, at the end of every walk, every row after the last tagged pid, in one
+     * statement that {@code statement_timeout} would cancel on every retry. A window is a primary-key range scan that
+     * stops after {@code window} distinct pids (index-only for the window itself), plus one probe per pid on its own
+     * primary-key range, so a statement costs O(window × events per pid) whatever the tag's selectivity or layout, and
+     * a walk takes (distinct pids / window) statements. The tag is matched with {@code $2 = ANY(tags)}, which the GIN
+     * tag index cannot serve: a GIN scan for a frequent tag reads every tagged row of the table, per statement.
      * </p>
-     * <p>
-     * Both variants are unbounded and stream through a server-side portal ({@link #STREAMING_FETCH_SIZE}), whose
-     * implicit transaction and snapshot stay open until the stream is drained. With {@code considerOnlyLatest} the only
-     * consumer is connection-id retrieval, which drains the stream into a collection at once. Without it, the consumer
-     * is the ID-order persistence ping, which throttles the stream (by default to one pid per second): with more pids
-     * than one fetch, the snapshot stays open while the ping iterates, until {@code statement_timeout}, which keeps
-     * counting across the suspended portal, cancels the stream with SQLSTATE {@code 57014} (known issue of that
-     * consumer).
-     * </p>
+     *
+     * @param lowerBoundPid the exclusive lower bound (the last pid of the previous window, or {@code ""}).
+     * @param tag the tag, or {@code ""} for all pids.
+     * @param considerOnlyLatest whether only the newest event of a pid counts.
+     * @param window the number of distinct pids examined by this statement.
+     * @return a {@code Source} of the window's pids, in pid order.
      */
-    public Source<String, NotUsed> getPidsWithTag(final String tag, final boolean considerOnlyLatest) {
+    public Source<WindowedPid, NotUsed> getPidWindowAbove(final String lowerBoundPid, final String tag,
+            final boolean considerOnlyLatest, final int window) {
+        final String windowPids = "SELECT DISTINCT pid FROM " + tables.journalTable()
+                + " WHERE pid > $1 ORDER BY pid LIMIT $3";
         final String sql;
         if (considerOnlyLatest) {
-            sql = "SELECT p.pid AS pid FROM ("
-                    + "SELECT DISTINCT pid FROM " + tables.journalTable()
-                    + ") p CROSS JOIN LATERAL ("
-                    + "SELECT tags FROM " + tables.journalTable() + " WHERE pid = p.pid ORDER BY sn DESC LIMIT 1"
-                    + ") latest WHERE ($1 = '' OR latest.tags @> ARRAY[$1]::text[]) "
-                    + "ORDER BY p.pid";
+            sql = "SELECT w.pid AS pid, ($2 = '' OR $2 = ANY(n.tags)) AS qualifies FROM (" + windowPids
+                    + ") w CROSS JOIN LATERAL ("
+                    + "SELECT tags FROM " + tables.journalTable() + " WHERE pid = w.pid ORDER BY sn DESC LIMIT 1"
+                    + ") n ORDER BY w.pid";
         } else {
-            sql = "SELECT DISTINCT pid FROM " + tables.journalTable()
-                    + " WHERE ($1 = '' OR tags @> ARRAY[$1]::text[]) ORDER BY pid";
+            sql = "SELECT w.pid AS pid, ($2 = '' OR EXISTS ("
+                    + "SELECT 1 FROM " + tables.journalTable() + " t WHERE t.pid = w.pid AND $2 = ANY(t.tags)"
+                    + ")) AS qualifies FROM (" + windowPids + ") w ORDER BY w.pid";
         }
-        // Unbounded (no LIMIT) pid scan -> stream via a server-side portal (positive fetchSize) for backpressure.
-        return streamingQuerySource(sql, stmt -> stmt.bind(0, tag), row -> getString(row, "pid"));
+        return pageQuerySource(sql,
+                stmt -> {
+                    stmt.bind(0, lowerBoundPid);
+                    stmt.bind(1, tag);
+                    stmt.bind(2, window);
+                },
+                row -> new WindowedPid(getString(row, "pid"), Boolean.TRUE.equals(row.get("qualifies",
+                        Boolean.class))));
     }
 
     /**
      * All distinct pids in pid order, above an (exclusive) lower-bound pid for cursor pagination.
      */
     public Source<String, NotUsed> getPidsAbove(final String lowerBoundPid, final int batchSize) {
-        return querySource("SELECT DISTINCT pid FROM " + tables.journalTable()
+        return pageQuerySource("SELECT DISTINCT pid FROM " + tables.journalTable()
                         + " WHERE pid > $1 ORDER BY pid LIMIT $2",
                 stmt -> {
                     stmt.bind(0, lowerBoundPid);
                     stmt.bind(1, batchSize);
-                },
-                row -> getString(row, "pid"));
-    }
-
-    /**
-     * All distinct pids in pid order, above an (exclusive) lower-bound pid AND carrying {@code tag}.
-     * An empty {@code tag} selects ALL pids (Mongo parity — the PersistencePingActor default journal-tag is empty).
-     */
-    public Source<String, NotUsed> getPidsAboveWithTag(final String lowerBoundPid, final String tag,
-            final int batchSize) {
-        return querySource("SELECT DISTINCT pid FROM " + tables.journalTable()
-                        + " WHERE pid > $1 AND ($2 = '' OR tags @> ARRAY[$2]::text[]) ORDER BY pid LIMIT $3",
-                stmt -> {
-                    stmt.bind(0, lowerBoundPid);
-                    stmt.bind(1, tag);
-                    stmt.bind(2, batchSize);
                 },
                 row -> getString(row, "pid"));
     }
@@ -586,7 +577,7 @@ public final class PostgresPersistenceOperations {
             final java.time.Duration minAgeFromNow, final String pidFilterRegex) {
         final boolean noAgeFilter = minAgeFromNow.isZero();
         final String interval = minAgeFromNow.toSeconds() + " seconds";
-        return querySource("SELECT p.pid, s.sn, s.snapshot, s.lifecycle, s.written_at FROM ("
+        return pageQuerySource("SELECT p.pid, s.sn, s.snapshot, s.lifecycle, s.written_at FROM ("
                         + "SELECT pid FROM " + tables.snapsTable()
                         + " WHERE pid > $1"
                         + " AND ($2 = '' OR pid ~ $2)"
@@ -784,6 +775,35 @@ public final class PostgresPersistenceOperations {
     }
 
     /**
+     * Like {@link #querySource}, for a statement whose whole result the caller reads at once (a keyset window bounded
+     * by its {@code LIMIT}, or the per-walk priority statement): the rows are collected into a list by a Reactor
+     * subscriber that requests them all, and the list is handed to the stream when the statement has completed. Client
+     * memory is bounded by the statement's result.
+     * <p>
+     * This matters for correctness, not only for speed. r2dbc-postgresql 1.0.7 can deliver a row out of order when
+     * demand for rows is signalled from another thread while rows are being received: the fast path of
+     * {@code ReactorNettyClient.BackendMessageSubscriber#onNext} does not take the drain guard, so a newer row can
+     * overtake one that the drain loop on the requesting thread has dequeued but not yet emitted (fixed in 1.1.2). A
+     * Pekko subscriber signals demand exactly that way, in small batches from the stream's own thread. Here the only
+     * subscriber is the collecting one; the driver still receives requests in batches (32, then 24, from the
+     * {@code flatMap} in {@code DittoPostgresClient#executeSqlPublisher}), but they are issued on the driver's own
+     * event-loop thread while it emits a row, never from another thread. Measured on a 1,000,000-pid journal with
+     * 256-row pages: 1 page in about 60,000 to 200,000 had one row up to 26 positions late when read through Pekko or
+     * with bounded Reactor demand from another thread, none in 400,000 pages read this way. A window must arrive in the
+     * statement's order, because its last row is the cursor of the next one.
+     * </p>
+     */
+    private <T> Source<T, NotUsed> pageQuerySource(final String sql,
+            @Nullable final java.util.function.Consumer<Statement> binder,
+            final java.util.function.Function<Row, T> rowMapper) {
+        return Source.lazyCompletionStage(() -> Flux.from(
+                                client.executeSqlPublisher(sql, binder, (row, meta) -> rowMapper.apply(row)))
+                        .collectList()
+                        .toFuture())
+                .mapConcat(rows -> rows);
+    }
+
+    /**
      * Like {@link #querySource} but binds a positive {@link Statement#fetchSize(int)} ({@link #STREAMING_FETCH_SIZE}) so
      * an unbounded streaming read-journal query opens a server-side portal and is driven by Pekko-stream demand instead
      * of being fully materialised onto the heap (see {@link #STREAMING_FETCH_SIZE}). Use ONLY for read-journal streaming
@@ -851,5 +871,13 @@ public final class PostgresPersistenceOperations {
             tags = tags == null ? List.of() : List.copyOf(tags);
         }
     }
+
+    /**
+     * A pid of a window of {@link #getPidWindowAbove}.
+     *
+     * @param pid the persistence id; the last one of a window is the cursor of the next window.
+     * @param qualifies whether the pid carries the tag as the stream requires (any event, or the newest event).
+     */
+    public record WindowedPid(String pid, boolean qualifies) {}
 
 }

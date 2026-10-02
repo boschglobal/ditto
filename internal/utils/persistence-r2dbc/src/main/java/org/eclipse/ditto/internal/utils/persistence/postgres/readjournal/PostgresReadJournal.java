@@ -20,27 +20,40 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import org.eclipse.ditto.internal.utils.persistence.api.DeleteOutcome;
 import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
 import org.eclipse.ditto.internal.utils.persistence.api.JournalEntry;
+import org.eclipse.ditto.internal.utils.persistence.api.ReadJournalRestarts;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotFilter;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.JournalRow;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
+import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations.WindowedPid;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.SnapshotRow;
 import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.r2dbc.spi.R2dbcException;
 
 import org.apache.pekko.Done;
 import org.apache.pekko.NotUsed;
+import org.apache.pekko.event.Logging;
 import org.apache.pekko.japi.Pair;
 import org.apache.pekko.persistence.query.EventEnvelope;
 import org.apache.pekko.persistence.query.Offset;
 import org.apache.pekko.persistence.query.Sequence;
 import org.apache.pekko.stream.Attributes;
+import org.apache.pekko.stream.KillSwitches;
 import org.apache.pekko.stream.Materializer;
+import org.apache.pekko.stream.RestartSettings;
+import org.apache.pekko.stream.SharedKillSwitch;
+import org.apache.pekko.stream.javadsl.RestartSource;
 import org.apache.pekko.stream.javadsl.Sink;
 import org.apache.pekko.stream.javadsl.Source;
 
@@ -61,6 +74,8 @@ import org.apache.pekko.stream.javadsl.Source;
  * </p>
  */
 public final class PostgresReadJournal implements DittoReadJournal {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(PostgresReadJournal.class);
 
     private final PostgresPersistenceOperations operations;
 
@@ -110,28 +125,64 @@ public final class PostgresReadJournal implements DittoReadJournal {
     // -------------------------------------------------------------------------------------------------
 
     /**
-     * Streams the FULL result set by repeating a bounded page query until an empty page arrives —
-     * the exact contract of {@code MongoReadJournal#unfoldBatchedSource}: {@code batchSize} is the page size,
-     * never a cap on the total. The seed of the next page is derived from the LAST element of the raw page
-     * (before any caller-side filtering), so filtered-out trailing rows cannot stall the cursor.
+     * Streams the FULL result set by repeating a bounded keyset page query until an empty page arrives — the contract
+     * of {@code MongoReadJournal#unfoldBatchedSource}: every page is one short query that is read completely before any
+     * of its rows is emitted, so no statement, transaction or snapshot spans the consumer's pace. The cursor of the
+     * next page is derived from the LAST row of the raw page (before any caller-side filtering), so filtered-out
+     * trailing rows cannot stall it, and it only moves forward: a pid is never delivered twice by an ID-order walk.
+     * That relies on each page arriving in the statement's order, which the page queries of
+     * {@link PostgresPersistenceOperations} guarantee by collecting the whole page before emitting it.
+     * <p>
+     * A failed page is retried as a whole, with exponential back-off, from the same cursor ({@link PageRetry}); rows
+     * of a failed attempt are discarded, so a retry neither repeats nor skips rows. When the retries are exhausted
+     * the stream fails with the page's error. When the stream ends (completed, failed or cancelled by its consumer),
+     * a page that is still being retried is stopped.
+     * </p>
+     *
+     * @param streamName names the stream in failure logs.
+     * @param firstCursor the cursor of the first page.
+     * @param pageQuery builds the page query after a cursor.
+     * @param cursorOf derives the next cursor from the last row of a page.
+     * @param retry how failed pages are retried.
      */
-    private static <T> Source<List<T>, NotUsed> unfoldBatchedSource(final String lowerBoundPid,
-            final Materializer mat,
-            final Function<T, String> seedCreator,
-            final Function<String, Source<T, NotUsed>> pageCreator) {
-        return Source.unfoldAsync("",
-                        startPid -> {
-                            final String actualStart =
-                                    lowerBoundPid.compareTo(startPid) >= 0 ? lowerBoundPid : startPid;
-                            return pageCreator.apply(actualStart)
-                                    .runWith(Sink.<T>seq(), mat)
-                                    .thenApply(page -> page.isEmpty()
-                                            ? Optional.<Pair<String, List<T>>>empty()
-                                            : Optional.of(Pair.create(
-                                                    seedCreator.apply(page.get(page.size() - 1)),
-                                                    (List<T>) page)));
-                        })
-                .withAttributes(Attributes.inputBuffer(1, 1));
+    private static <C, T> Source<List<T>, NotUsed> keysetPages(final String streamName,
+            final C firstCursor,
+            final Function<C, Source<T, NotUsed>> pageQuery,
+            final Function<T, C> cursorOf,
+            final PageRetry retry) {
+        return Source.fromMaterializer((mat, attributes) -> {
+                    final SharedKillSwitch pageRetries = KillSwitches.shared(streamName);
+                    return Source.unfoldAsync(firstCursor,
+                                    cursor -> retry.fetch(streamName, cursor, () -> pageQuery.apply(cursor),
+                                                    pageRetries, mat)
+                                            .thenApply(page -> page.isEmpty()
+                                                    ? Optional.<Pair<C, List<T>>>empty()
+                                                    : Optional.of(Pair.create(
+                                                            cursorOf.apply(page.get(page.size() - 1)), page))))
+                            .withAttributes(Attributes.inputBuffer(1, 1))
+                            .watchTermination((notUsed, done) -> stopOnTermination(notUsed, done, pageRetries));
+                })
+                .mapMaterializedValue(ignored -> NotUsed.getInstance());
+    }
+
+    /**
+     * One statement whose whole result is read at once, with the retries of a page.
+     */
+    private static <T> Source<T, NotUsed> singleStatement(final String streamName,
+            final Supplier<Source<T, NotUsed>> query, final PageRetry retry) {
+        return Source.fromMaterializer((mat, attributes) -> {
+                    final SharedKillSwitch retries = KillSwitches.shared(streamName);
+                    return Source.completionStage(retry.fetch(streamName, "", query, retries, mat))
+                            .<T>mapConcat(rows -> rows)
+                            .watchTermination((notUsed, done) -> stopOnTermination(notUsed, done, retries));
+                })
+                .mapMaterializedValue(ignored -> NotUsed.getInstance());
+    }
+
+    private static <M> M stopOnTermination(final M materialized, final CompletionStage<Done> streamTermination,
+            final SharedKillSwitch retries) {
+        streamTermination.whenComplete((done, error) -> retries.shutdown());
+        return materialized;
     }
 
     @Override
@@ -149,24 +200,88 @@ public final class PostgresReadJournal implements DittoReadJournal {
                 .map(row -> JournalEntry.of(row.pid(), row.manifest(), parse(row.eventJson())));
     }
 
+    /**
+     * The pids carrying {@code tag}, in pid order ({@code COLLATE "C"}), read window by window: each statement
+     * examines the next {@code batchSize} distinct pids after the previous window, tagged or not, and the stream emits
+     * those that qualify (see {@link PostgresPersistenceOperations#getPidWindowAbove}). Every statement is short and
+     * read completely before its pids are emitted (as {@code MongoReadJournal} reads one page per query), so a
+     * throttled consumer such as the persistence ping holds no statement, transaction or snapshot between statements,
+     * and {@code statement_timeout} applies to one window at a time.
+     * <p>
+     * On PostgreSQL {@code batchSize} bounds the pids EXAMINED per statement, not the pids delivered: a window over
+     * untagged pids delivers none and the walk moves on, so the cost of a statement does not depend on how the tagged
+     * pids are spread over the key space (MongoDB pages over the tagged entries through its tag index; the PostgreSQL
+     * schema has no index on (tag, pid)). A walk takes (distinct pids / batchSize) statements.
+     * </p>
+     * <p>
+     * Without {@code considerOnlyLatest} a pid qualifies if any of its events carries the tag; with it, only if its
+     * newest event does. Changes made while the stream runs, relative to the last window READ (at most one window ahead
+     * of what the consumer has received): a pid that starts to qualify after it is delivered, before it in the next
+     * walk; a pid deleted after it is not delivered; no pid is delivered twice.
+     * </p>
+     * <p>
+     * A failed window is retried with exponential back-off from the same cursor; {@code maxIdleTime} bounds the number
+     * of retries with the formula of the MongoDB read journal ({@link ReadJournalRestarts#computeMaxRestarts}). When
+     * they are exhausted, the stream fails with the window's error.
+     * </p>
+     * <p>
+     * {@code mat} is not used: the windows are read with the materializer that runs the returned source.
+     * </p>
+     */
     @Override
     public Source<String, NotUsed> getJournalPidsWithTag(final String tag, final int batchSize,
             final Duration maxIdleTime, final Materializer mat, final boolean considerOnlyLatest) {
-        return operations.getPidsWithTag(tag, considerOnlyLatest);
+        return pidWindows(considerOnlyLatest
+                        ? "pids with tag <" + tag + "> on the newest event"
+                        : "pids with tag <" + tag + ">",
+                "", tag, considerOnlyLatest, batchSize, PageRetry.forMaxIdleTime(maxIdleTime));
     }
 
+    private Source<String, NotUsed> pidWindows(final String streamName, final String lowerBoundPid, final String tag,
+            final boolean considerOnlyLatest, final int window, final PageRetry retry) {
+        return keysetPages(streamName, lowerBoundPid,
+                (String start) -> operations.getPidWindowAbove(start, tag, considerOnlyLatest, window),
+                WindowedPid::pid, retry)
+                .mapConcat(page -> page.stream()
+                        .filter(WindowedPid::qualifies)
+                        .map(WindowedPid::pid)
+                        .toList());
+    }
+
+    /**
+     * The pids carrying {@code tag} in descending priority order (see
+     * {@link PostgresPersistenceOperations#getPidsWithTagOrderedByPriority} for the semantics), as ONE statement per
+     * stream whose whole result is read before the first pid is emitted, as {@code MongoReadJournal} reads it with one
+     * aggregation.
+     * <p>
+     * The order needs every qualifying pid's priority, which is computed from the tags: paged, every page would compute
+     * all priorities again (a walk would cost (pages + 1) times the single statement). One statement per walk costs it
+     * once, and because its result is read at once, no transaction or snapshot stays open while the throttled
+     * connectivity ping walks it. The trade-off is client memory proportional to the number of qualifying pids (about
+     * 100 bytes per pid: about 10 MB for 100,000 connections) where the ID order needs only one window; this order
+     * exists for connections (thousands), the ID order for always-alive entities (up to millions).
+     * </p>
+     * <p>
+     * The walk sees the pids as of the statement: a pid created afterwards comes in the next walk, a pid deleted during
+     * the walk is still delivered (as on MongoDB). A failed statement is retried as for {@link #getJournalPidsWithTag};
+     * nothing has been delivered before it succeeds.
+     * </p>
+     */
     @Override
     public Source<String, NotUsed> getJournalPidsWithTagOrderedByPriorityTag(final String tag,
             final Duration maxIdleTime) {
-        return operations.getPidsWithTagOrderedByPriority(tag);
+        return singleStatement("pids with tag <" + tag + "> in priority order",
+                () -> operations.getPidsWithTagOrderedByPriority(tag), PageRetry.forMaxIdleTime(maxIdleTime));
     }
 
     @Override
     public Source<String, NotUsed> getJournalPidsAbove(final String lowerBoundPid, final int batchSize,
             final Materializer mat) {
-        // Cursor-paginated to exhaustion: batchSize is the page size, never a cap (Mongo parity).
-        return unfoldBatchedSource(lowerBoundPid, mat, Function.identity(),
-                start -> operations.getPidsAbove(start, batchSize))
+        // Cursor-paginated to exhaustion: batchSize is the page size, never a cap (Mongo parity, no retries).
+        // mat is not used: the pages are read with the materializer that runs the returned source.
+        return keysetPages("pids", lowerBoundPid,
+                (String start) -> operations.getPidsAbove(start, batchSize),
+                Function.identity(), PageRetry.NONE)
                 .mapConcat(page -> page);
     }
 
@@ -175,12 +290,15 @@ public final class PostgresReadJournal implements DittoReadJournal {
         return operations.getMostRecentTagsForPid(pid);
     }
 
+    /**
+     * Like {@link #getJournalPidsWithTag} (any tagged event, windows of {@code batchSize} pids), starting after
+     * {@code lowerBoundPid}, without retries (MongoDB parity: 0 restarts for this variant). {@code mat} is not used.
+     */
     @Override
     public Source<String, NotUsed> getJournalPidsAboveWithTag(final String lowerBoundPid, final String tag,
             final int batchSize, final Materializer mat) {
-        return unfoldBatchedSource(lowerBoundPid, mat, Function.identity(),
-                start -> operations.getPidsAboveWithTag(start, tag, batchSize))
-                .mapConcat(page -> page);
+        return pidWindows("pids with tag <" + tag + "> above <" + lowerBoundPid + ">", lowerBoundPid, tag, false,
+                batchSize, PageRetry.NONE);
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -227,8 +345,9 @@ public final class PostgresReadJournal implements DittoReadJournal {
     private Source<SnapshotEntry, NotUsed> newestSnapshots(final String lowerBoundPid, final String pidFilterRegex,
             final int batchSize, final boolean includeDeleted, final Duration minAgeFromNow,
             final Materializer mat) {
-        return unfoldBatchedSource(lowerBoundPid, mat, SnapshotRow::pid,
-                start -> operations.getNewestSnapshotsAbove(start, batchSize, minAgeFromNow, pidFilterRegex))
+        return keysetPages("newest snapshots", lowerBoundPid,
+                (String start) -> operations.getNewestSnapshotsAbove(start, batchSize, minAgeFromNow, pidFilterRegex),
+                SnapshotRow::pid, PageRetry.NONE)
                 .mapConcat(page -> page.stream()
                         .filter(row -> includeDeleted || !"DELETED".equals(row.lifecycle()))
                         .map(PostgresReadJournal::toSnapshotEntry)
@@ -346,6 +465,97 @@ public final class PostgresReadJournal implements DittoReadJournal {
 
     private static JsonObject parse(final String json) {
         return JsonFactory.newObject(json);
+    }
+
+    /**
+     * How a failed page query is retried: the whole page again, from the same cursor, after an exponential back-off,
+     * with the values the MongoDB read journal uses for its per-query restarts ({@link ReadJournalRestarts}: minimum
+     * back-off 1 s, maximum 128 s, random factor 0.1, and the number of restarts derived from {@code maxIdleTime}).
+     * Each failed attempt is logged at WARN with its SQLSTATE.
+     * <p>
+     * One difference to MongoDB: its restart count is capped within a window of the minimum back-off, so an attempt
+     * that runs longer than one second before it fails resets the count, and a query that keeps failing slowly (for
+     * example cancelled by {@code statement_timeout}) is retried without bound. Here every failed attempt of a page
+     * counts ({@link #RESTART_COUNT_WINDOW}), so the retries end and the stream fails with the page's error; its
+     * consumer (the persistence ping) then starts its next iteration as scheduled.
+     * </p>
+     */
+    static final class PageRetry {
+
+        /** No retry: the first failure of a page fails the stream (MongoDB parity for the unbounded lookups). */
+        static final PageRetry NONE = new PageRetry(0);
+
+        /**
+         * The restart count resets only if a single attempt runs longer than this before it fails. One attempt is one
+         * page query, bounded by {@code statement_timeout} and the pool's acquire timeout, so the count of a page is
+         * never reset and a page gets at most {@code maxRestarts} retries.
+         */
+        static final Duration RESTART_COUNT_WINDOW = Duration.ofDays(1L);
+
+        private final int maxRestarts;
+
+        private PageRetry(final int maxRestarts) {
+            this.maxRestarts = maxRestarts;
+        }
+
+        /**
+         * @param maxIdleTime how long a stream may go without delivering a pid; bounds the retries of one page.
+         * @return the retry policy of a page.
+         */
+        static PageRetry forMaxIdleTime(final Duration maxIdleTime) {
+            return new PageRetry(ReadJournalRestarts.computeMaxRestarts(maxIdleTime));
+        }
+
+        /**
+         * Reads one page completely, retrying failed attempts. The attempts run as a stream of their own; it stops
+         * (no further attempt, no back-off left waiting) when {@code stop} is shut down, which the paged stream does
+         * when it ends.
+         *
+         * @return the page, or the error of the last attempt once the retries are exhausted.
+         */
+        <C, T> CompletionStage<List<T>> fetch(final String streamName, final C cursor,
+                final Supplier<Source<T, NotUsed>> pageQuery, final SharedKillSwitch stop, final Materializer mat) {
+            final AtomicInteger attempts = new AtomicInteger();
+            final Supplier<Source<List<T>, NotUsed>> attempt = () -> {
+                final int attemptNumber = attempts.incrementAndGet();
+                final CompletionStage<List<T>> page = pageQuery.get().runWith(Sink.<T>seq(), mat);
+                page.whenComplete((rows, error) -> {
+                    if (error != null) {
+                        LOGGER.warn("Page query of read-journal stream <{}> after <{}> failed on attempt <{}> (at most "
+                                        + "<{}> retries with back-off): {}", streamName, describeCursor(cursor),
+                                attemptNumber, maxRestarts, describe(error));
+                    }
+                });
+                return Source.completionStage(page);
+            };
+            final Source<List<T>, ?> pageSource;
+            if (maxRestarts <= 0) {
+                pageSource = Source.lazySource(attempt::get);
+            } else {
+                final RestartSettings settings = RestartSettings.create(ReadJournalRestarts.MIN_BACKOFF,
+                                ReadJournalRestarts.MAX_BACKOFF, ReadJournalRestarts.RANDOM_FACTOR)
+                        .withMaxRestarts(maxRestarts, RESTART_COUNT_WINDOW)
+                        // each failed attempt is logged above with its SQLSTATE; avoid a second WARN per attempt.
+                        .withLogSettings(RestartSettings.createLogSettings(Logging.DebugLevel()));
+                pageSource = RestartSource.onFailuresWithBackoff(settings, attempt::get);
+            }
+            return pageSource.via(stop.flow()).runWith(Sink.head(), mat);
+        }
+
+        private static Object describeCursor(final Object cursor) {
+            final Object unwrapped = cursor instanceof Optional<?> optional ? optional.orElse(null) : cursor;
+            return unwrapped == null || "".equals(unwrapped) ? "the start" : unwrapped;
+        }
+
+        private static String describe(final Throwable error) {
+            for (Throwable t = error; t != null; t = t.getCause() == t ? null : t.getCause()) {
+                if (t instanceof R2dbcException r2dbc && r2dbc.getSqlState() != null) {
+                    return "SQLSTATE <" + r2dbc.getSqlState() + "> " + t;
+                }
+            }
+            return error.toString();
+        }
+
     }
 
 }

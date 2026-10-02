@@ -115,12 +115,10 @@ Before this role default existed, a PgBouncer with `ignore_startup_parameters`
 ran Ditto's statements without any timeout. With it, statements that run longer
 than 60 s are cancelled there too (SQLSTATE `57014`), as on a direct connection.
 That includes streaming reads that are consumed slowly, because the timeout
-counts across the whole stream, not per fetch. The policies service's
-`always-alive` persistence ping is such a read: it streams the tagged policy
-ids in fetches of 256 and pings about one per second, so with more than 256
-always-alive policies its stream is cancelled after about the first 256 ids,
-and the ping then stops until the service restarts. On a direct connection this
-already happens; a follow-up change pages the ping.
+counts across the whole stream, not per fetch. The persistence ping, which is
+consumed at about one entity per second, therefore reads its entity ids in
+short statements that are read completely before the ping uses them (see
+[Persistence ping](#persistence-ping-on-postgresql)).
 
 - **PgBouncer must log in to PostgreSQL as the client's role.** A role default
   applies only to server sessions opened *as that role*. A `[databases]` entry
@@ -151,6 +149,110 @@ already happens; a follow-up change pages the ping.
   afterwards: the role default behind a PgBouncer with
   `ignore_startup_parameters`, `ditto.postgresql.statement-timeout` elsewhere.
   Per-path search index builds are not affected either way.
+
+### Persistence ping on PostgreSQL
+
+The persistence ping keeps entities running that must always be started: the
+policies service walks every policy tagged `always-alive` in ID order, the
+connectivity service walks every connection in priority order (`persistence-ping`
+in `policies.conf` and `connectivity.conf`). Both walks are throttled, by
+default to one entity per second. Nothing of a walk runs on the database while
+the ping waits: no statement, no open transaction, no snapshot holding back
+VACUUM, and `statement_timeout` applies to one short statement at a time.
+(Before, the ID-order walk read through one server-side cursor, which
+`statement_timeout` cancelled after about the first 256 ids; the ping then
+stopped until the service restarted.)
+
+**ID order (policies): windows of ids.** Each statement reads the next
+`read-journal-batch-size` entity ids (default 500) after the previous window,
+tagged or not, and keeps the tagged ones; the statement is read completely before
+its entities are pinged. A window costs the same wherever it lies and however the
+tagged entities are spread, also when they are a small minority clustered in one
+part of the id space (one namespace among many): a window over untagged ids
+simply delivers nothing, and a walk takes (all entity ids / batch size)
+statements. Measured at 1,000,000 entities with 2 events each, 500 ids per
+window, warm cache: about 1 ms per window and 2–3 s for the whole walk without
+the throttle, flat from the first to the last window, with every entity tagged
+(heap in id order or not) and with 1 % tagged clustered at the end
+(`internal/utils/persistence-bench/src/test/resources/bench/results/ping-keyset-paging-1m.md`).
+
+What a window and a walk cost grows with the number of events each entity keeps
+in the journal: a window reads the index entries of its ids and, to check the
+tag, every journal row of each untagged entity in it, so a walk reads every
+journal row of every entity it examines, once per walk. That matters with very
+many entities of which few are always-alive. For example, 10,000,000 policies
+with 500 ids per window are about 20,000 statements per walk, run one after the
+other on one connection: about 20–30 s of database time with 2 events per entity
+and a warm cache, up to about 160 s cold, and correspondingly more with long
+event histories (hundreds of events per policy with the default history
+retention). At 2 events per entity each statement stays far below
+`statement_timeout`; with long histories a window that is not in the cache can
+take seconds, because it reads every row of its untagged entities: lower
+`read-journal-batch-size` well before a window approaches `statement_timeout`,
+and size the ping `interval` so that this read once per interval is acceptable.
+
+**Priority order (connectivity): one statement per walk.** The priority comes
+from the tags and is not stored, so ordering needs every connection's priority;
+one statement computes it once, and its whole result is read into memory before
+the first connection is pinged. Measured: about 11 ms for 5,000 connections,
+50 ms for 20,000, 0.3 s for 100,000. The price is memory in the connectivity
+service: about 80–100 bytes per connection for the duration of a walk, about
+10 MB for 100,000 connections. (The ID order needs only one window in memory; it
+is the order for millions of entities.)
+
+**Changes during a walk.**
+
+- ID order: every window reads the current state. "The walk's position" is the
+  last window read, which is at most one window ahead of what has been pinged.
+  An entity that starts to qualify (created, or tagged) after that position is
+  pinged in this walk, otherwise in the next walk; an entity deleted before the
+  walk reaches it is not pinged; no entity is pinged twice in one walk.
+- Priority order: the walk pings the connections as of its statement. A
+  connection created during the walk is pinged in the next walk; one deleted
+  during the walk is still pinged (as on MongoDB, whose priority order is one
+  query too).
+
+**Failures.** A failed statement (for example `57014` from `statement_timeout`,
+a lost connection, or the pool's acquire timeout under overload) is retried from
+the same position after an exponential back-off: 1 s, doubling up to 128 s, plus
+up to 10 % jitter. The number of retries per statement follows the ping
+`interval`: the binary logarithm of its seconds up to 128 s, beyond that
+`6 + interval / 128 s` and at least 7, i.e. 10 retries for the default `10m`.
+These are the values the MongoDB read journal uses; they are not configurable.
+One difference: MongoDB stops counting an attempt that ran longer than one second
+before it failed, so a query that keeps failing slowly is retried there without
+end; on PostgreSQL every failed attempt counts, so the retries do end. Each failed
+attempt logs a WARN with its SQLSTATE (`Page query of read-journal stream …
+failed on attempt …`). When the retries are exhausted, the walk ends with a WARN
+of the ping actor (`Ping iteration failed after pinging <n> …`) and the next walk
+starts at the next `interval`. In ID order it continues after the last
+persistence id the failed walk reached (pinged or skipped, on either backend), so
+an intermittent failure does not keep a long walk from reaching its end. If the
+continued walk fails before it reaches a new persistence id, it gives that
+position up (WARN `… giving that position up: the next iteration starts from the
+beginning`) and the walk after it starts from the beginning again. That happens
+with any such failure, also a database outage that is still going on when the
+continued walk starts: the entities after the position then wait one more full
+walk, but pinging does not stop. A failure that recurs at the same position
+cannot be walked past this way: the entities before it keep being pinged at least
+every other walk, the ones after it are reached once the failure is gone. The position is kept in memory only: after
+a restart of the service the next walk starts from the beginning. In priority
+order a failed walk is followed by one from the beginning. Every completed walk
+logs one INFO line with the number of entities pinged and the duration.
+
+**Ids that are no entity ids.** A persistence id in the journal that the ping
+cannot turn into an entity id (no entity-type prefix, or an id the entity type
+rejects) is skipped with a WARN (`Skipping persistence id <…>`), on either
+backend; the walk goes on.
+
+**Throughput.** At one entity per second a walk takes as many seconds as there
+are entities, on either backend: 100,000 always-alive policies take about 28
+hours, 1,000,000 about 11.6 days. A scheduled walk that finds the previous one
+still running is skipped. To walk faster, raise the rate: `rate.entities` per
+`rate.frequency` of `persistence-ping` (`POLICIES_PERSISTENCE_PING_RATE_ENTITIES`
+and `POLICIES_PERSISTENCE_PING_RATE_FREQUENCY` for policies,
+`RECONNECT_RATE_ENTITIES` and `RECONNECT_RATE_FREQUENCY` for connections). The
+defaults are unchanged.
 
 ## 2. TLS / certificate mount
 
