@@ -244,6 +244,8 @@ Snapshot encoding switches automatically when the Postgres backend is active —
 
 Schema tables are created automatically on first boot.
 
+**Statement timeout and PgBouncer.** `ditto.postgresql.statement-timeout` (`POSTGRES_STATEMENT_TIMEOUT`, default `60s`) is sent as a connection startup parameter. PgBouncer, in session and transaction mode, refuses the connection unless `statement_timeout` is listed in `track_extra_parameters` (the value then applies) or in `ignore_startup_parameters` (the value is then dropped). This was verified with PgBouncer 1.26.0; how PgBouncer tracks a parameter that PostgreSQL does not report to clients, such as `statement_timeout`, may differ between versions. The driver also always sends `extra_float_digits`, so `ignore_startup_parameters` must list it in either case, e.g. `ignore_startup_parameters = extra_float_digits,statement_timeout`. For the case in which the value is dropped, the provisioning script `deployment/postgres/provisioning/01-roles-and-grants.sql` gives the runtime role `ditto_app` a `statement_timeout` default of `60s`, which PostgreSQL applies to every server session opened as that role; PgBouncer must therefore log in as the client's role (no `user=` in its `[databases]` entry; an `auth_user=` is fine). Because of that default, `statement-timeout = 0` (no startup parameter) means "use the role default", not "no timeout". The DDL role deliberately has no such default, so the schema bootstrap and per-path index builds are not cut off by it; without a separate DDL role (`POSTGRES_DDL_USER`), the bootstrap runs as the runtime role and its default applies. Details, including how to lift the timeout: `deployment/postgres/README.md`.
+
 #### 4. Docker Compose volume mount example
 
 ```yaml

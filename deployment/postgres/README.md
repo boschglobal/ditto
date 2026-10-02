@@ -45,6 +45,9 @@ The order is load-bearing because PostgreSQL `ALTER DEFAULT PRIVILEGES` applies
    and `PUBLIC`, and sets `ALTER DEFAULT PRIVILEGES FOR ROLE ditto_ddl … GRANT
    SELECT, INSERT, UPDATE, DELETE ON TABLES TO ditto_app`. The default-privileges
    statement **must** be set here, before the app boots — see comment in the SQL.
+   It also sets the role defaults `search_path = ditto` (both roles) and
+   `statement_timeout = '60s'` (`ditto_app` only, see
+   [Statement timeout](#statement-timeout-role-default-and-pgbouncer)).
 
 2. **App boots → schema manager runs bootstrap DDL as `ditto_ddl`.**
    On first boot `PostgresSchemaManager` connects with the `ddl-credentials`
@@ -66,7 +69,88 @@ Notes on the role model (all intentional, see SQL comments):
 Re-provisioning an existing schema: skip `CREATE ROLE`/`CREATE SCHEMA` (they
 already exist) and run the GRANT/REVOKE/ALTER block; the
 `GRANT … ON ALL TABLES IN SCHEMA ditto` line covers tables that predate the
-default-privileges setting.
+default-privileges setting. That block also sets the `statement_timeout` default
+of `ditto_app` back to `60s`.
+
+### Statement timeout: role default and PgBouncer
+
+The script gives the runtime role a server-side statement timeout, the same value
+as the `ditto.postgresql.statement-timeout` default:
+
+```sql
+ALTER ROLE ditto_app SET statement_timeout = '60s';
+```
+
+Ditto also sends `ditto.postgresql.statement-timeout` (`POSTGRES_STATEMENT_TIMEOUT`)
+as a connection startup parameter. Which of the two a statement runs under depends
+on the path to PostgreSQL:
+
+| Path | Timeout in effect |
+|---|---|
+| Direct connection | the startup parameter; it overrides the role default |
+| PgBouncer with `track_extra_parameters = statement_timeout` and `ignore_startup_parameters = extra_float_digits` | the startup parameter: PgBouncer applies each client's value to the server connection it hands out |
+| PgBouncer with `ignore_startup_parameters = extra_float_digits,statement_timeout` | the role default only: PgBouncer drops the startup parameter |
+| PgBouncer with `statement_timeout` in neither | n/a: PgBouncer refuses the connection (`unsupported startup parameter: statement_timeout`) |
+
+- The PgBouncer rows hold for session and transaction pooling alike. They were
+  verified with PgBouncer 1.26.0; `PgBouncerStatementTimeoutIT` covers the
+  `ignore_startup_parameters` case in transaction mode. PostgreSQL does not
+  report `statement_timeout` to clients, and how PgBouncer tracks such a
+  parameter may differ between versions: check the `track_extra_parameters` row
+  on your version.
+- The driver always sends `extra_float_digits` as well, which PgBouncer refuses
+  in the same way unless it is listed; hence `extra_float_digits` in
+  `ignore_startup_parameters` in both setups.
+- **`statement-timeout = 0` does not mean "no timeout".** It sends no startup
+  parameter, so the role default (60 s) applies on every path. To lift the cap:
+  on a direct connection, or behind a PgBouncer with `track_extra_parameters`,
+  set a large `statement-timeout`, which overrides the role default (Ditto
+  cannot send an explicit `0`). Behind a PgBouncer with
+  `ignore_startup_parameters` only the role default counts: run
+  `ALTER ROLE ditto_app SET statement_timeout = 0` (or `… RESET
+  statement_timeout`), then `RECONNECT` PgBouncer. With `statement-timeout = 0`
+  that role change lifts the cap on every path.
+
+Before this role default existed, a PgBouncer with `ignore_startup_parameters`
+ran Ditto's statements without any timeout. With it, statements that run longer
+than 60 s are cancelled there too (SQLSTATE `57014`), as on a direct connection.
+That includes streaming reads that are consumed slowly, because the timeout
+counts across the whole stream, not per fetch. The policies service's
+`always-alive` persistence ping is such a read: it streams the tagged policy
+ids in fetches of 256 and pings about one per second, so with more than 256
+always-alive policies its stream is cancelled after about the first 256 ids,
+and the ping then stops until the service restarts. On a direct connection this
+already happens; a follow-up change pages the ping.
+
+- **PgBouncer must log in to PostgreSQL as the client's role.** A role default
+  applies only to server sessions opened *as that role*. A `[databases]` entry
+  with a forced `user=` makes PgBouncer open every server connection as that
+  user, and the default of `ditto_app` never applies. Use an entry without
+  `user=`, e.g. `ditto = host=<pg-host> port=5432 dbname=ditto`, and let
+  PgBouncer authenticate clients via `auth_file` or `auth_query`. An `auth_user=`
+  in the entry (some images generate one) is fine: it only names the role that
+  runs the auth query.
+- **A changed value applies to new server sessions only.** PostgreSQL reads role
+  defaults when a session starts. After `ALTER ROLE ditto_app SET
+  statement_timeout = …`, open sessions keep the old value until they reconnect;
+  behind PgBouncer, run `RECONNECT` on its admin console.
+- **The DDL role deliberately gets no timeout default.** The schema bootstrap and
+  `CREATE INDEX CONCURRENTLY` builds (per-path search indexes) run as the DDL role
+  and must not be cut off by a role-level timeout. The bootstrap is still bounded
+  by `ditto.postgresql.statement-timeout` wherever that startup parameter reaches
+  the server; the per-path index builds set `statement_timeout = 0` for their own
+  session.
+- **Without a separate DDL role the default also applies to DDL.** When
+  `ddl-credentials` are empty (`POSTGRES_DDL_USER` unset), Ditto runs the schema
+  bootstrap as the runtime role, so the runtime role's timeout default applies to
+  it as well, also behind a PgBouncer with `ignore_startup_parameters`, where the
+  bootstrap would otherwise run without a timeout. A schema upgrade that builds an
+  index on a large table can then be cancelled. Configure a separate DDL role
+  (`ditto_ddl` from this script) via `POSTGRES_DDL_USER`/`POSTGRES_DDL_PASSWORD`.
+  Otherwise raise the timeout for the boot that runs such DDL and restore it
+  afterwards: the role default behind a PgBouncer with
+  `ignore_startup_parameters`, `ditto.postgresql.statement-timeout` elsewhere.
+  Per-path search index builds are not affected either way.
 
 ## 2. TLS / certificate mount
 

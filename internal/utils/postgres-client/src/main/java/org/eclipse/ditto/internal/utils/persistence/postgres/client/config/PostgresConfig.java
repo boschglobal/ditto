@@ -68,8 +68,11 @@ public interface PostgresConfig {
     Duration getConnectTimeout();
 
     /**
-     * The server-side {@code statement_timeout}, applied via the r2dbc-postgresql {@code options} startup parameter (so
-     * it survives PgBouncer {@code RESET} between transaction-pooled borrows). {@code Duration.ZERO} disables it.
+     * The server-side {@code statement_timeout}, sent as a connection startup parameter (via the r2dbc-postgresql
+     * {@code options} map). Behind PgBouncer it only takes effect if PgBouncer lists {@code statement_timeout} in
+     * {@code track_extra_parameters}; see {@code ditto-postgres-client.conf}. {@code Duration.ZERO} sends no startup
+     * parameter, so the server-side default of the connecting role applies (60s for the runtime role from the
+     * provisioning script); it does not disable the timeout.
      *
      * @return the configured statement timeout.
      */

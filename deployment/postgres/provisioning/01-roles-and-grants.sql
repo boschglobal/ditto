@@ -92,3 +92,21 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ditto TO ditto_app;
 -- So unqualified table names resolve to the ditto schema for both roles.
 ALTER ROLE ditto_ddl SET search_path = ditto;
 ALTER ROLE ditto_app SET search_path = ditto;
+
+-- --- statement_timeout ------------------------------------------------------
+-- Server-side cap on every statement of the runtime role (SQLSTATE 57014 once
+-- exceeded), same value as the ditto.postgresql.statement-timeout default.
+-- Ditto also sends that setting as a connection startup parameter, but a
+-- PgBouncer that lists statement_timeout in ignore_startup_parameters drops it
+-- (in any pool mode), and the timeout is then silently not enforced.
+-- A role default applies to every server session opened AS ditto_app, also
+-- behind PgBouncer, as long as PgBouncer logs in to PostgreSQL as the client's
+-- role (no forced user= in its [databases] entry). Where the startup parameter
+-- reaches the server, it overrides this default; statement-timeout = 0 sends
+-- none, so this default applies.
+-- Deliberately NO default for ditto_ddl: the schema bootstrap and CREATE INDEX
+-- CONCURRENTLY builds run as the DDL role and must not be cut off by a
+-- role-level timeout. Without a separate DDL role (empty ddl-credentials),
+-- Ditto runs its DDL as the runtime role and that role's default applies to it
+-- too; see deployment/postgres/README.md.
+ALTER ROLE ditto_app SET statement_timeout = '60s';

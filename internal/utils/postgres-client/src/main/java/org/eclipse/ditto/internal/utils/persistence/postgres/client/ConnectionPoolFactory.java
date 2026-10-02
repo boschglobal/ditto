@@ -170,31 +170,35 @@ public final class ConnectionPoolFactory {
         builder.option(ConnectionFactoryOptions.CONNECT_TIMEOUT, config.getConnectTimeout());
 
         // Bind statement_timeout as an r2dbc "options" STARTUP parameter (a GUC name->value Map) rather than a plain
-        // per-session "SET", which PgBouncer's server_reset_query would wipe between transaction-pooled borrows. NOTE:
-        // r2dbc-postgresql's OPTIONS is a Map<String,String> of GUC name->value (e.g. {"statement_timeout":"60000"}),
-        // NOT a libpq "-c statement_timeout=..." string. Value is milliseconds (the unit-less GUC default unit).
-        // statement-timeout=0 disables the timeout (Postgres semantics), so we skip the option entirely in that case.
+        // per-session "SET", which under transaction pooling would only reach the one server connection that ran it.
+        // NOTE: r2dbc-postgresql's OPTIONS is a Map<String,String> of GUC name->value (e.g.
+        // {"statement_timeout":"60000"}), NOT a libpq "-c statement_timeout=..." string. Value is milliseconds (the
+        // unit-less GUC default unit). statement-timeout=0 sends no startup parameter at all, so the server-side
+        // default of the connecting role applies (60s for the runtime role from
+        // deployment/postgres/provisioning/01-roles-and-grants.sql); it does not mean "no timeout".
         //
-        // PgBouncer caveat (see ditto-postgres-persistence.conf): the GUC rides inside libpq's startup "options" field, which
-        // PgBouncer does NOT forward across TRANSACTION-pooled borrows (even with track_extra_parameters). This option
-        // is therefore enforced for DIRECT/SESSION pooling and direct Postgres; under TRANSACTION-mode PgBouncer set the
-        // timeout server-side (e.g. ALTER ROLE ... SET statement_timeout).
+        // PgBouncer caveat (see statement-timeout in ditto-postgres-client.conf): each OPTIONS entry is sent as a
+        // startup parameter of its own. PgBouncer (in any pool mode) refuses it unless it is listed in
+        // track_extra_parameters (then applied to each server connection it hands out) or ignore_startup_parameters
+        // (then dropped; what is enforced is the connecting role's statement_timeout default, if any: the
+        // provisioning script sets one for the runtime role only, none for the DDL role).
         // Build the r2dbc-postgresql OPTIONS startup-GUC map ONCE, MERGING with any startup GUCs the operator supplied
         // via the URI's options= query parameter (e.g. search_path) — a bare Map.of(...) would REPLACE the parsed
         // OPTIONS value wholesale. Both statement_timeout and the plancache guard (plan_cache_mode) are layered on top.
         final Map<String, String> options = parseUriStartupOptions(config.getUri());
 
         final Duration statementTimeout = config.getStatementTimeout();
-        // statement-timeout=0 disables the timeout (Postgres semantics), so we skip the option entirely in that case.
+        // statement-timeout=0: send nothing, the connecting role's server-side default applies (see above).
         if (statementTimeout != null && !statementTimeout.isZero() && !statementTimeout.isNegative()) {
             options.put("statement_timeout", Long.toString(statementTimeout.toMillis()));
         }
 
         // Plancache generic-plan-flip guard (search plan §3.5, bench-results doc §8.2 — HARD Phase-D requirement).
-        // Binding plan_cache_mode as a startup GUC (rather than a per-session SET) makes it survive PgBouncer RESET
-        // between transaction-pooled borrows, exactly like statement_timeout above; it applies to every connection this
-        // pool opens for the lifetime of the connection. Off by default; the search profile opts in via
-        // ditto.postgresql.force-custom-plan=true (see PostgresConfig#isForceCustomPlan).
+        // plan_cache_mode is bound as a startup GUC (rather than a per-session SET); on a direct connection it applies
+        // to every connection this pool opens for the lifetime of the connection. Behind PgBouncer it has the same
+        // caveat as statement_timeout above: refused unless listed in track_extra_parameters (then applied) or
+        // ignore_startup_parameters (then dropped, so the guard is off). Off by default; the search profile opts in
+        // via ditto.postgresql.force-custom-plan=true (see PostgresConfig#isForceCustomPlan).
         if (config.isForceCustomPlan()) {
             options.put("plan_cache_mode", "force_custom_plan");
         }

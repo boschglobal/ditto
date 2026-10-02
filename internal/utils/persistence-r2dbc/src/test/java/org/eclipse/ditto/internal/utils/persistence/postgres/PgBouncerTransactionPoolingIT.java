@@ -216,14 +216,11 @@ public final class PgBouncerTransactionPoolingIT {
      * it — a {@code pg_sleep(10)} under a 1s {@code statement_timeout} aborts with SQLSTATE {@code 57014}
      * ({@code query_canceled}).
      * <p>
-     * <strong>PgBouncer caveat (verified here, 2026-06-16, PgBouncer 1.25.2):</strong> r2dbc-postgresql ships the GUC
-     * inside the libpq <em>startup {@code options} field</em>. PgBouncer does NOT propagate GUCs carried in that field
-     * across transaction-pooled borrows — not even with {@code track_extra_parameters = statement_timeout} (which only
-     * tracks <em>protocol-level</em> parameter fields such as {@code application_name}/{@code IntervalStyle}). So under
-     * TRANSACTION-mode PgBouncer the same {@code pg_sleep(10)} runs to completion. The enforcement therefore holds for
-     * DIRECT / SESSION pooling (and against Postgres directly); under TRANSACTION-mode PgBouncer the timeout must be set
-     * server-side (e.g. a per-role {@code ALTER ROLE ... SET statement_timeout}). This is documented in
-     * {@code ditto-postgres-persistence.conf}.
+     * <strong>PgBouncer caveat:</strong> r2dbc-postgresql sends the GUC as a startup parameter of its own. PgBouncer
+     * (in any pool mode) refuses it unless it lists {@code statement_timeout} in {@code track_extra_parameters} (then
+     * applies it to each server connection it hands out) or {@code ignore_startup_parameters} (then drops it, and the
+     * same {@code pg_sleep(10)} runs to completion unless the role has a {@code statement_timeout} default).
+     * {@link PgBouncerStatementTimeoutIT} covers that case; it is documented in {@code ditto-postgres-client.conf}.
      */
     @Test
     public void statementTimeoutFromOptionsStartupParameterIsEnforced() {
