@@ -11,9 +11,10 @@ naming, and evidence rules). Design: `docs/superpowers/specs/2026-07-10-postgres
 |---|---|
 | Bench harness (Java, JUnit-based) | `internal/utils/persistence-bench/src/test/java/org/eclipse/ditto/internal/utils/persistence/bench/` |
 | Committed evidence (results, plans) | `internal/utils/persistence-bench/src/test/resources/bench/results/` |
+| Superseded schema-v1 evidence (C1, W2) | `internal/utils/persistence-bench/src/test/resources/bench/results/history/2026-07-13-schema-v1/` |
 | Reproduction script | `internal/utils/persistence-bench/benchmark/run-benchmark.sh` |
 | Design the bench validates | `docs/superpowers/specs/2026-07-10-postgres-persistence-bench-design.md` |
-| Implementation plan (incl. deviation list) | `docs/superpowers/plans/2026-07-10-postgres-persistence-bench.md` |
+| Plan deviations cited by the evidence ("plan deviation N") | `internal/utils/persistence-bench/benchmark/PLAN-DEVIATIONS.md` (extracted from the implementation plan, which is not committed) |
 
 Each run overwrites its evidence file — `git diff` shows run-to-run movement.
 
@@ -58,8 +59,8 @@ would need days for this corpus; evidence quotes the computed default-pace durat
 
 ## 5. Headline results
 
-From the committed full-scale evidence, re-run 2026-07-13/14 at `--count 250000` (~34.75M
-journal rows, ~15 GB PG / ~14 GB Mongo steady per backend; 250k chosen for this machine's disk —
+From the committed full-scale evidence, re-run 2026-07-13/14 at `--count 250000` (35,070,304 [`35070304` in the evidence files]
+journal rows loaded per backend, ~15 GB PG / ~14 GB Mongo steady per backend; 250k chosen for this machine's disk —
 see the sweep-bloat note below) on the loose-index-scan query rewrite + schema v2 (snaps DESC
 index dropped). Verdict rule (design §7): flag any scenario where PG p95 > 2× Mongo p95. All
 values are p95 ms unless noted; full tables + plans live in the evidence files. C1's former 21×
@@ -73,13 +74,24 @@ flag was closed by the loose-index-scan rewrite
 | R2b full replay, outlier 40-50k events | 522 | 531 | parity; absolute < 2 s bar MET |
 | R3 highest sn | 0.84 | 1.34 | PG faster |
 | W1 single append | 2.71 | 3.03 | parity |
-| W2 snapshot write (fresh / overwrite) | 2.96 / 2.33 | 4.79 / 4.25 | PG faster (one snaps index fewer since v2) |
+| W2 snapshot write (fresh / overwrite) | 2.96 / 2.33 | 4.79 / 4.25 | PG faster (one snaps index fewer since v2; see the noise caveat below) |
 | W3 sustained churn (achieved of 500/s) | 499.8/s | 499.9/s | both hold target |
 | C1 cleanup pid-stream page | 8.50 | 10.71 | PG faster — former 21× FLAG closed (loose index scan; plan: index-only pid page + backward PK top-1, no sort/temp) |
 | C2 single-pid cleanup (outlier total) | 993 | 1163 | parity |
 | C3 full sweep (21.05M rows) | 797 s | 488 s | Mongo 1.6× faster (delete-batch bound); identical deletions both sides |
 | **C4 post-sweep replay before reclamation** | **16.9 (tail) / 98.5 (full-scan)** | **13.2 / 6.7** | **FLAG: PG replays walk dead space until vacuum (worst-case: unthrottled sweep, §7.5)** |
 | M1 churn under live sweep (achieved of 500/s) | 499.8/s | 499.9/s | both hold; 296,576 rows swept live on each |
+
+History (schema v1, before the rewrite and the v2 index drop): C1 was 887.14 ms PG vs 42.47 ms
+Mongo p95 (242 MB temp spill per page; Seq Scan + Sort over ~40k rows) and W2 was 4.31 / 3.30 ms
+PG vs 6.25 / 3.35 ms Mongo. Those runs are kept verbatim, with provenance headers, in
+`../src/test/resources/bench/results/history/2026-07-13-schema-v1/` (`c1-pid-stream-page.md`,
+`w2-snapshot-write.md`); they are superseded by the current files above.
+
+W2 noise caveat: the v1 -> v2 W2 gain (4.31 -> 2.96 and 3.30 -> 2.33 ms, about 30 %) compares two
+separate runs, and the unchanged Mongo numbers moved between them as well (fresh 6.25 -> 4.79 ms,
+overwrite 3.35 -> 4.25 ms), by about the size of the claimed gain. Treat "PG faster since v2" as
+directional, not as a measured 30 % improvement.
 
 Cross-backend determinism: C3 deleted identical 21,054,465 event + 33,613 snapshot rows on both
 backends; M1 swept identical 296,576. Credit-pace projection for C3: ~105 h (the real Ditto pace —
