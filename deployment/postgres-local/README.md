@@ -175,7 +175,7 @@ before the thingsearch allinone — the CLI equivalent of mounting the `ditto-po
 `ditto-postgres-search-extension` JAR pair in `/opt/ditto/extensions/`.
 
 On first boot the search schema (`search_things`, `search_flat`, `search_sync`, component row
-`ditto-postgres-search` version 1 in `schema_version`) is bootstrapped by the search service's own schema
+`ditto-postgres-search` in `schema_version`) is bootstrapped by the search service's own schema
 manager, and the delete-at reaper starts. Verified end-to-end (Phase G3, fresh DB, zero ERROR lines in all
 five service logs):
 

@@ -33,14 +33,16 @@ import org.junit.Test;
 public final class ProductionConfigSchemaTest {
 
     @Test
-    public void preLoadIsTheExtensionAndTheThreeTablesInProductionOrder() {
+    public void preLoadIsTheExtensionTheThreeTablesAndTheirReloptionsInProductionOrder() {
         final List<String> pre = ProductionConfigSchema.preLoadStatements();
 
-        assertThat(pre).hasSize(4);
+        assertThat(pre).hasSize(6);
         assertThat(pre.get(0)).isEqualTo("CREATE EXTENSION IF NOT EXISTS pg_trgm");
         assertThat(pre.get(1)).startsWith("CREATE TABLE IF NOT EXISTS search_things (");
         assertThat(pre.get(2)).startsWith("CREATE TABLE IF NOT EXISTS search_flat (");
         assertThat(pre.get(3)).startsWith("CREATE TABLE IF NOT EXISTS search_sync (");
+        assertThat(pre.get(4)).isEqualTo("ALTER TABLE search_things SET (autovacuum_vacuum_scale_factor = 0.01)");
+        assertThat(pre.get(5)).isEqualTo("ALTER TABLE search_flat SET (autovacuum_vacuum_scale_factor = 0.01)");
     }
 
     @Test

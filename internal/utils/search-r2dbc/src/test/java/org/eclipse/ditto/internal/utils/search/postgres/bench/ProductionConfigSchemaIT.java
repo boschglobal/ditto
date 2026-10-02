@@ -83,8 +83,8 @@ public final class ProductionConfigSchemaIT {
         assertThat(check.productionVerdict()).isEqualTo("true");
         assertThat(check.actualIndexes()).containsExactlyInAnyOrderElementsOf(
                 ProductionConfigSchema.expectedIndexNames());
-        // 14 indexes + 25 columns + 4 constraints at least.
-        assertThat(check.comparedItems()).isGreaterThanOrEqualTo(43);
+        // 14 indexes + 25 columns + 4 constraints + 2 table reloptions at least.
+        assertThat(check.comparedItems()).isGreaterThanOrEqualTo(45);
         assertThat(connection.getAutoCommit()).isTrue();
         try (Statement statement = connection.createStatement();
                 var rs = statement.executeQuery("SELECT count(*) FROM pg_namespace "
@@ -130,10 +130,30 @@ public final class ProductionConfigSchemaIT {
 
     @Test
     public void reloptionIsReported() throws SQLException {
-        execute("ALTER TABLE search_flat SET (autovacuum_vacuum_scale_factor = 0.01)");
+        execute("ALTER TABLE search_sync SET (autovacuum_vacuum_scale_factor = 0.01)");
 
         assertThat(ProductionConfigSchema.verify(connection).differences())
-                .anyMatch(d -> d.startsWith("reloptions search_flat: live=autovacuum_vacuum_scale_factor=0.01"));
+                .anyMatch(d -> d.equals(
+                        "reloptions search_sync: live=autovacuum_vacuum_scale_factor=0.01 production=null"));
+    }
+
+    @Test
+    public void changedProductionReloptionIsReported() throws SQLException {
+        execute("ALTER TABLE search_flat SET (autovacuum_vacuum_scale_factor = 0.05)");
+
+        assertThat(ProductionConfigSchema.verify(connection).differences())
+                .anyMatch(d -> d.equals("reloptions search_flat: live=autovacuum_vacuum_scale_factor=0.05 "
+                        + "production=autovacuum_vacuum_scale_factor=0.01"));
+    }
+
+    @Test
+    public void missingProductionReloptionIsReported() throws SQLException {
+        // e.g. a corpus loaded with an older schema version's DDL
+        execute("ALTER TABLE search_things RESET (autovacuum_vacuum_scale_factor)");
+
+        assertThat(ProductionConfigSchema.verify(connection).differences())
+                .anyMatch(d -> d.equals("reloptions search_things: live=null "
+                        + "production=autovacuum_vacuum_scale_factor=0.01"));
     }
 
     @Test

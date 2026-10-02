@@ -30,10 +30,10 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.Pa
 /**
  * The production-config bench mode's schema: exactly {@link PostgresSearchSchema#ddlStatements()} — the SHIPPED search
  * DDL — and nothing else. The only liberty taken is ordering: the statements are split into an order-preserving
- * pre-load phase (the {@code pg_trgm} extension and the three tables) and post-load phase (every {@code CREATE INDEX}),
- * so the 1M-thing bulk {@code COPY} does not maintain 12 indexes row by row. The resulting catalog is the same as a
- * production bootstrap's; {@link #verify(Connection)} proves that after the load (index set, default statistics
- * targets, no reloptions).
+ * pre-load phase (the {@code pg_trgm} extension, the three tables and the tables' autovacuum reloptions) and post-load
+ * phase (every {@code CREATE INDEX}), so the 1M-thing bulk {@code COPY} does not maintain 12 indexes row by row. The
+ * resulting catalog is the same as a production bootstrap's; {@link #verify(Connection)} proves that after the load
+ * (index set, default statistics targets, exactly the production reloptions).
  */
 final class ProductionConfigSchema {
 

@@ -27,6 +27,12 @@ import java.util.List;
  * {@code CREATE TABLE} before the bulk {@code COPY} and defer every {@code CREATE INDEX} until after it. The
  * DDL resource itself stays a single verbatim copy of the target schema; the split is done here, at
  * statement-parse time, rather than by maintaining two separately-edited resource files that could drift.
+ * <p>
+ * This Phase-0 DDL is <strong>not</strong> a copy of the production search schema, and it deliberately carries none of
+ * production's autovacuum reloptions: the committed Phase-0 evidence was measured with the server's global autovacuum
+ * defaults, and a re-run must measure the same thing. Production-equivalent loads go through
+ * {@link ProductionConfigSchema}, which applies {@code PostgresSearchSchema.ddlStatements()} itself.
+ * </p>
  */
 final class SearchSchemaDdl {
 

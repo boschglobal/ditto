@@ -42,6 +42,10 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
  *     <li>{@code search_sync} — the background-sync bookmark (Mongo {@code MongoTimestampPersistence} replacement).</li>
  * </ul>
  * <p>
+ * {@code search_things} and {@code search_flat} additionally get {@code ALTER TABLE … SET
+ * (autovacuum_vacuum_scale_factor = 0.01)}, in the same bootstrap transaction, like the event-sourcing tables.
+ * </p>
+ * <p>
  * Implements the backend-agnostic {@link PostgresSchemaDescriptor} (via {@link #descriptor()}) so the generic
  * {@code PostgresSchemaManager} — which owns the shared {@code schema_version} table and the cluster-wide advisory lock —
  * can bootstrap it exactly like the event-sourcing {@code PostgresSchema}, without any hard dependency on this class.
@@ -71,16 +75,28 @@ public final class PostgresSearchSchema {
 
     /**
      * Bumped on any DDL change (the checksum covers every statement), per the schema-evolution policy; each bump also
-     * declares {@link #MIN_COMPATIBLE_VERSION}.
+     * declares {@link #MIN_COMPATIBLE_VERSION} and adds a literal test fixture of the version it replaces (see
+     * {@code SearchSchemaChecksumPreservationTest}).
+     * v2: {@code autovacuum_vacuum_scale_factor = 0.01} on {@code search_things} and {@code search_flat}.
      */
-    public static final int VERSION = 1;
+    public static final int VERSION = 2;
 
     /**
      * The oldest code schema version that can run against the {@link #VERSION} schema (stored as
      * {@code schema_version.min_compatible_version}); see {@code PostgresSchemaDescriptor#minCompatibleVersion()} for
-     * the bump rules.
+     * the bump rules. Still 1: v2 only adds reloptions, which v1 code runs against unchanged.
      */
     public static final int MIN_COMPATIBLE_VERSION = 1;
+
+    /**
+     * The per-table {@code autovacuum_vacuum_scale_factor} of {@code search_things} and {@code search_flat} (server
+     * default 0.2), as on the event-sourcing tables: autovacuum starts once about 1&nbsp;% of the rows are dead instead
+     * of 20&nbsp;%. Every thing update leaves dead rows in both tables (its replaced {@code search_things} row and its
+     * changed {@code search_flat} rows); at 20&nbsp;%, a {@code search_flat} of tens of millions of rows collects
+     * millions of dead rows before autovacuum even starts. The TOAST table of {@code search_things} (the JSONB
+     * documents) inherits the value. Vacuum cost limit and delay stay at the server's settings.
+     */
+    private static final String AUTOVACUUM_VACUUM_SCALE_FACTOR = "0.01";
 
     /**
      * The byte-ordered collation ({@code information_schema.columns.collation_name = 'C'}) that every string column
@@ -172,9 +188,9 @@ public final class PostgresSearchSchema {
 
     /**
      * @return this component's own ordered list of DDL statements (the {@code pg_trgm} extension, the two search tables
-     * with their indexes, and the background-sync bookmark table), <strong>excluding</strong> the shared
-     * {@code schema_version} table (owned by {@code PostgresSchemaManager}). Order is stable so the checksum is
-     * deterministic.
+     * with their indexes, the background-sync bookmark table, then the autovacuum reloptions of the two search
+     * tables), <strong>excluding</strong> the shared {@code schema_version} table (owned by
+     * {@code PostgresSchemaManager}). Order is stable so the checksum is deterministic.
      */
     public static List<String> ddlStatements() {
         final List<String> statements = new ArrayList<>();
@@ -205,6 +221,11 @@ public final class PostgresSearchSchema {
                 + "WHERE val_text IS NOT NULL");
 
         statements.add(createSearchSyncTable());
+
+        // v2: autovacuum tuning of the two write-heavy tables. Appended after every v1 statement, so the v1 DDL stays
+        // a prefix of this list. Catalog-only (no table rewrite); search_sync (one bookmark row) keeps the defaults.
+        statements.add(autovacuum("search_things"));
+        statements.add(autovacuum("search_flat"));
 
         return List.copyOf(statements);
     }
@@ -264,6 +285,11 @@ public final class PostgresSearchSchema {
                 + "id TEXT PRIMARY KEY, "
                 + "ts TIMESTAMPTZ NOT NULL, "
                 + "tag TEXT"
+                + ")";
+    }
+
+    private static String autovacuum(final String table) {
+        return "ALTER TABLE " + table + " SET (autovacuum_vacuum_scale_factor = " + AUTOVACUUM_VACUUM_SCALE_FACTOR
                 + ")";
     }
 

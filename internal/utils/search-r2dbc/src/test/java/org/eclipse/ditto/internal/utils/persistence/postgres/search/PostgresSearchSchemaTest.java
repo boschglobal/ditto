@@ -30,7 +30,8 @@ public final class PostgresSearchSchemaTest {
     @Test
     public void descriptorIdentity() {
         assertThat(PostgresSearchSchema.descriptor().component()).isEqualTo("ditto-postgres-search");
-        assertThat(PostgresSearchSchema.descriptor().version()).isEqualTo(1);
+        assertThat(PostgresSearchSchema.descriptor().version()).isEqualTo(2);
+        // v2 only adds reloptions, which v1 code runs against unchanged
         assertThat(PostgresSearchSchema.descriptor().minCompatibleVersion()).isEqualTo(1);
         assertThat(PostgresSearchSchema.COMPONENT).isEqualTo("ditto-postgres-search");
     }
@@ -75,7 +76,30 @@ public final class PostgresSearchSchemaTest {
     }
 
     @Test
-    public void scopedPerPathTrigramIndexIsNotPartOfV1Ddl() {
+    public void searchThingsAndSearchFlatLowerTheAutovacuumScaleFactorAfterTheirCreation() {
+        final List<String> ddl = PostgresSearchSchema.ddlStatements();
+        final String things = "ALTER TABLE search_things SET (autovacuum_vacuum_scale_factor = 0.01)";
+        final String flat = "ALTER TABLE search_flat SET (autovacuum_vacuum_scale_factor = 0.01)";
+
+        assertThat(ddl).containsOnlyOnce(things, flat);
+        assertThat(ddl.indexOf(things)).isGreaterThan(indexOfStatementStartingWith(ddl,
+                "CREATE TABLE IF NOT EXISTS search_things"));
+        assertThat(ddl.indexOf(flat)).isGreaterThan(indexOfStatementStartingWith(ddl,
+                "CREATE TABLE IF NOT EXISTS search_flat"));
+    }
+
+    @Test
+    public void onlySearchThingsAndSearchFlatCarryReloptions() {
+        // search_sync (one bookmark row) keeps the server's autovacuum settings; so do cost limit and delay.
+        assertThat(PostgresSearchSchema.ddlStatements())
+                .filteredOn(s -> s.startsWith("ALTER TABLE"))
+                .hasSize(2)
+                .noneMatch(s -> s.contains("search_sync"))
+                .allMatch(s -> s.endsWith(" SET (autovacuum_vacuum_scale_factor = 0.01)"));
+    }
+
+    @Test
+    public void scopedPerPathTrigramIndexIsNotPartOfTheChecksummedDdl() {
         // Operator-configured per-path indexes are built by PathIndexMaintenance with CREATE INDEX CONCURRENTLY after
         // the bootstrap, outside the checksummed DDL (a path list change must never alter the schema checksum).
         assertThat(PostgresSchemaManager.effectiveDdl(PostgresSearchSchema.descriptor()))
@@ -121,5 +145,14 @@ public final class PostgresSearchSchemaTest {
         assertThat(PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor()))
                 .isEqualTo(PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor()))
                 .hasSize(64);
+    }
+
+    private static int indexOfStatementStartingWith(final List<String> ddl, final String prefix) {
+        for (int i = 0; i < ddl.size(); i++) {
+            if (ddl.get(i).startsWith(prefix)) {
+                return i;
+            }
+        }
+        throw new AssertionError("no statement starts with " + prefix);
     }
 }
