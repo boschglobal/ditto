@@ -106,27 +106,38 @@ public final class AppendBench {
         final int rate = BenchConfig.writeTargetRate();
         final int workers = BenchConfig.writeWorkers();
         final int pidsPerWorker = BenchConfig.writePidsPerWorker();
+        final String pidPrefix = BenchConfig.w3PidPrefix();
+        final PgAppendShape pgShape = BenchConfig.w3PgShape();
+        final String mongoWriteConcern = BenchConfig.w3MongoWriteConcern();
+        final int waitSampleMillis = BenchConfig.w3WaitSampleMillis();
+        final boolean stagger = BenchConfig.w3Stagger();
         final StringBuilder md = new StringBuilder(BenchProtocol.runHeader("W3 — sustained churn"))
-                .append(String.format("- target rate %d/s, %d workers x %d pids, %d s per backend%n%n",
-                        rate, workers, pidsPerWorker, duration));
+                .append(String.format("- target rate %d/s, %d workers x %d pids, %d s per backend%n",
+                        rate, workers, pidsPerWorker, duration))
+                .append(String.format("- churn pid prefix %s; PG append shape %s; Mongo journal write concern %s; "
+                        + "PG wait-event sampler %s; worker schedules %s%n%n", pidPrefix, pgShape.label(),
+                        mongoWriteConcern, waitSampleMillis > 0 ? "every " + waitSampleMillis + " ms" : "off",
+                        stagger ? "staggered" : "unstaggered"));
         if (BenchConfig.runPg()) {
-            final ChurnEngine.ChurnResult r =
-                    ChurnEngine.runPg("thing:bench.churn", duration, rate, workers, pidsPerWorker);
+            final ChurnEngine.ChurnResult r = ChurnEngine.runPg(pidPrefix, duration, rate, workers, pidsPerWorker,
+                    pgShape, waitSampleMillis, stagger);
             md.append("## PostgreSQL\n\n")
                     .append(String.format("- total ops %d (+%d snapshots), achieved %.1f/s%n%n",
                             r.totalOps(), r.totalSnapshots(), r.achievedRate()))
-                    .append(ChurnEngine.samplesMarkdown(r)).append('\n');
+                    .append(ChurnEngine.samplesMarkdown(r)).append('\n')
+                    .append(r.profile()).append('\n');
         }
         if (BenchConfig.runMongo()) {
-            final ChurnEngine.ChurnResult r =
-                    ChurnEngine.runMongo("thing:bench.churn", duration, rate, workers, pidsPerWorker);
+            final ChurnEngine.ChurnResult r = ChurnEngine.runMongo(pidPrefix, duration, rate, workers,
+                    pidsPerWorker, "w1".equals(mongoWriteConcern) ? WriteConcern.W1 : WriteConcern.JOURNALED, stagger);
             md.append("## MongoDB\n\n")
                     .append(String.format("- total ops %d (+%d snapshots), achieved %.1f/s%n%n",
                             r.totalOps(), r.totalSnapshots(), r.achievedRate()))
-                    .append(ChurnEngine.samplesMarkdown(r)).append('\n');
+                    .append(ChurnEngine.samplesMarkdown(r)).append('\n')
+                    .append(r.profile()).append('\n');
         }
         md.append("\nNote: standalone mongod has no oplog — WAL-delta column applies to PG only; "
                 + "Mongo growth is tracked via collStats storage+index size (plan deviation list).\n");
-        BenchProtocol.writeEvidence("w3-sustained-churn.md", md.toString());
+        BenchProtocol.writeEvidence(BenchConfig.w3EvidenceFile(), md.toString());
     }
 }

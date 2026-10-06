@@ -106,6 +106,50 @@ public final class BenchConfig {
         return Integer.parseInt(property("bench.write.pidsPerWorker", "BENCH_WRITE_PIDS_PER_WORKER", "100"));
     }
 
+    /**
+     * W3 churn pid prefix. A distinct prefix per run lets W3 be repeated on one corpus without a
+     * reload (the default prefix collides with the previous run's rows).
+     */
+    public static String w3PidPrefix() {
+        return property("bench.w3.pidPrefix", "BENCH_W3_PID_PREFIX", "thing:bench.churn");
+    }
+
+    /** W3 PostgreSQL append shape (see {@link PgAppendShape}); default the plugin's transaction shape. */
+    public static PgAppendShape w3PgShape() {
+        return PgAppendShape.parse(property("bench.w3.pgShape", "BENCH_W3_PG_SHAPE", PgAppendShape.TXN.label()));
+    }
+
+    /** W3 Mongo journal write concern: journaled (the plugin default) | w1 (no journal wait, what-if). */
+    public static String w3MongoWriteConcern() {
+        final String value = property("bench.w3.mongoWriteConcern", "BENCH_W3_MONGO_WRITE_CONCERN", "journaled")
+                .toLowerCase(Locale.ROOT);
+        if (!"journaled".equals(value) && !"w1".equals(value)) {
+            throw new IllegalArgumentException("bench.w3.mongoWriteConcern must be journaled or w1: '" + value + "'");
+        }
+        return value;
+    }
+
+    /**
+     * Interval of the W3 PostgreSQL wait-event sampler (pg_stat_activity of the churn backends);
+     * 0 (default) disables it so the canonical W3 run carries no extra server load.
+     */
+    public static int w3WaitSampleMillis() {
+        return Integer.parseInt(property("bench.w3.waitSampleMillis", "BENCH_W3_WAIT_SAMPLE_MILLIS", "0"));
+    }
+
+    /**
+     * W3 staggered start: spread the workers' op schedules evenly over one pacing period instead of letting
+     * each worker start its schedule when its connection is ready (which can align them into bursts).
+     */
+    public static boolean w3Stagger() {
+        return Boolean.parseBoolean(property("bench.w3.stagger", "BENCH_W3_STAGGER", "false"));
+    }
+
+    /** W3 evidence file, relative to the results folder (default the canonical w3-sustained-churn.md). */
+    public static String w3EvidenceFile() {
+        return property("bench.w3.evidenceFile", "BENCH_W3_EVIDENCE_FILE", "w3-sustained-churn.md");
+    }
+
     /** unthrottled | credits — see design deviation 3. */
     public static String sweepPace() {
         return property("bench.sweep.pace", "BENCH_SWEEP_PACE", "unthrottled").toLowerCase(Locale.ROOT);
@@ -178,10 +222,18 @@ public final class BenchConfig {
      * bench's generic-plan-flip finding, adopted as protocol.
      */
     public static Connection openPg() throws SQLException {
+        return openPg(null);
+    }
+
+    /** Like {@link #openPg()}, tagged with an application_name (null: the driver default). */
+    public static Connection openPg(final String applicationName) throws SQLException {
         final Properties props = new Properties();
         props.setProperty("user", pgUser());
         props.setProperty("password", pgPassword());
         props.setProperty("prepareThreshold", "0");
+        if (applicationName != null) {
+            props.setProperty("ApplicationName", applicationName);
+        }
         return DriverManager.getConnection(pgUrl(), props);
     }
 

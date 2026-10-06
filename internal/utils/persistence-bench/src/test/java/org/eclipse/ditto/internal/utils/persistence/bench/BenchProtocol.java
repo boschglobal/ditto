@@ -196,7 +196,7 @@ public final class BenchProtocol {
     public static void writeEvidence(final String fileName, final String content) {
         final Path dir = Paths.get("src", "test", "resources", "bench", "results");
         try {
-            Files.createDirectories(dir);
+            Files.createDirectories(dir.resolve(fileName).getParent());
             Files.writeString(dir.resolve(fileName), content, StandardCharsets.UTF_8);
         } catch (final IOException e) {
             throw new UncheckedIOException(e);

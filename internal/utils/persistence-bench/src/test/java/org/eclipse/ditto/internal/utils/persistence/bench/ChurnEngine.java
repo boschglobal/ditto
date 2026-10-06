@@ -13,17 +13,18 @@
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
 import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import org.bson.Document;
@@ -40,6 +41,11 @@ import com.mongodb.client.model.ReplaceOptions;
  * churn pids round-robin, rate-paced appends in the exact plugin write shape (PG: event INSERT +
  * journal_seq upsert in one txn; Mongo: 1-doc ordered bulkWrite JOURNALED + async realtime insert),
  * plus a snapshot write every 500 events per pid. A sampler thread captures 30 s windows.
+ * <p>
+ * Profiling knobs (W3 only, see {@link PgAppendShape}): the PG append shape, the Mongo journal write
+ * concern and a pg_stat_activity wait-event sampler. Every run also records server-side counter
+ * deltas, and PG runs the heap placement of the run's rows.
+ * </p>
  */
 public final class ChurnEngine {
 
@@ -49,87 +55,274 @@ public final class ChurnEngine {
     public record Sample(int windowIndex, long ops, double p50Ms, double p95Ms, double maxMs,
             long walBytesDelta, long journalTotalBytes, long snapsTotalBytes, long deadTuples) {}
 
+    /**
+     * @param profile markdown with the run's server-side evidence and, for PostgreSQL, the per-step timings
+     * (printed by W3; M1 prints only the windows).
+     */
     public record ChurnResult(String backend, long totalOps, long totalSnapshots, double achievedRate,
-            List<Sample> samples) {}
+            List<Sample> samples, String profile) {}
 
+    /** The canonical shape: the plugin's append transaction on pgjdbc, no wait-event sampler, no stagger. */
     public static ChurnResult runPg(final String pidPrefix, final int durationSeconds,
             final int targetRate, final int workers, final int pidsPerWorker) throws Exception {
+        return runPg(pidPrefix, durationSeconds, targetRate, workers, pidsPerWorker, PgAppendShape.TXN, 0, false);
+    }
+
+    public static ChurnResult runPg(final String pidPrefix, final int durationSeconds,
+            final int targetRate, final int workers, final int pidsPerWorker, final PgAppendShape shape,
+            final int waitSampleMillis, final boolean stagger) throws Exception {
         final Recorder recorder = new Recorder();
         final AtomicLong snapshots = new AtomicLong();
         final List<Thread> threads = new ArrayList<>();
-        final long endNanos = System.nanoTime() + durationSeconds * 1_000_000_000L;
+        final PhaseRecorder phaseRecorder = new PhaseRecorder();
+        final List<List<String>> windowPhaseRows = new ArrayList<>();
+        final List<Exception> failures = Collections.synchronizedList(new ArrayList<>());
+        final int phaseCount = shape.phases().size();
+        final PgAppenders.R2dbcPath r2dbc = shape.usesR2dbc() ? PgAppenders.R2dbcPath.open() : null;
+        final Schedule schedule = new Schedule(workers, targetRate, durationSeconds, stagger);
         for (int w = 0; w < workers; w++) {
             final int worker = w;
             final Thread t = new Thread(() -> {
-                try (Connection c = BenchConfig.openPg()) {
-                    c.setAutoCommit(false);
-                    try (PreparedStatement insert = c.prepareStatement(PersistenceShapes.PG_INSERT_EVENT);
-                            PreparedStatement upsert = c.prepareStatement(PersistenceShapes.PG_UPSERT_SEQ);
-                            PreparedStatement snap = c.prepareStatement(PersistenceShapes.PG_SAVE_SNAPSHOT)) {
-                        final long[] sns = new long[pidsPerWorker];
-                        final double nanosPerOp = 1_000_000_000.0 * workers / targetRate;
-                        final long start = System.nanoTime();
-                        long opIdx = 0;
-                        int pidCursor = 0;
-                        while (System.nanoTime() < endNanos) {
-                            final long scheduled = start + (long) (opIdx * nanosPerOp);
-                            long now;
-                            while ((now = System.nanoTime()) < scheduled) {
-                                LockSupport.parkNanos(Math.min(scheduled - now, 1_000_000L));
-                            }
-                            final int k = pidCursor;
-                            pidCursor = (pidCursor + 1) % pidsPerWorker;
-                            final String pid = pidPrefix + ":w" + worker + "-p" + k;
-                            final long sn = ++sns[k];
-                            final long t0 = System.nanoTime();
-                            insert.setString(1, pid);
-                            insert.setLong(2, sn);
-                            insert.setString(3, CorpusGenerator.MANIFEST_ATTRIBUTE);
-                            insert.setObject(4, c.createArrayOf("text", new String[0]));
-                            insert.setString(5, churnEventJson(pid, sn));
-                            insert.executeUpdate();
-                            upsert.setString(1, pid);
-                            upsert.setLong(2, sn);
-                            upsert.executeUpdate();
-                            c.commit();
-                            if (sn % CorpusGenerator.SNAPSHOT_EVERY == 0) {
-                                snap.setString(1, pid);
-                                snap.setLong(2, sn);
-                                snap.setString(3, churnSnapshotJson(pid, sn));
-                                snap.setString(4, null);
-                                snap.setObject(5, Instant.now().atOffset(ZoneOffset.UTC));
-                                snap.executeUpdate();
-                                c.commit();
-                                snapshots.incrementAndGet();
-                            }
-                            recorder.record((System.nanoTime() - t0) / 1_000_000.0);
-                            opIdx++;
+                try (PgAppenders.PgAppender appender =
+                        r2dbc != null ? r2dbc.appender(shape) : PgAppenders.jdbc(shape)) {
+                    final long[] sns = new long[pidsPerWorker];
+                    final double nanosPerOp = schedule.nanosPerOp;
+                    final long endNanos = schedule.endNanos;
+                    final long start = schedule.start(worker);
+                    long opIdx = 0;
+                    int pidCursor = 0;
+                    while (System.nanoTime() < endNanos) {
+                        final long scheduled = start + (long) (opIdx * nanosPerOp);
+                        long now;
+                        while ((now = System.nanoTime()) < scheduled) {
+                            LockSupport.parkNanos(Math.min(scheduled - now, 1_000_000L));
                         }
+                        final int k = pidCursor;
+                        pidCursor = (pidCursor + 1) % pidsPerWorker;
+                        final String pid = churnPid(pidPrefix, worker, k);
+                        final long sn = ++sns[k];
+                        final long t0 = System.nanoTime();
+                        final long[] phases = new long[phaseCount];
+                        appender.append(pid, sn, churnEventJson(pid, sn), phases);
+                        if (sn % CorpusGenerator.SNAPSHOT_EVERY == 0) {
+                            appender.saveSnapshot(pid, sn, churnSnapshotJson(pid, sn));
+                            snapshots.incrementAndGet();
+                        }
+                        recorder.record((System.nanoTime() - t0) / 1_000_000.0);
+                        if (phaseCount > 0) {
+                            phaseRecorder.record(phases);
+                        }
+                        opIdx++;
                     }
                 } catch (final Exception e) {
+                    failures.add(e);
                     throw new IllegalStateException("pg churn worker failed", e);
                 }
             }, "pg-churn-" + w);
             threads.add(t);
         }
         final List<Sample> samples = new ArrayList<>();
+        final StringBuilder profile = new StringBuilder();
         try (Connection sampler = BenchConfig.openPg()) {
-            runAndSample(threads, durationSeconds, recorder, samples,
-                    windowIndex -> pgWindowStats(sampler, windowIndex));
+            final Map<String, Double> before = PgServerProbe.counters(sampler);
+            final long blocksAtStart = PgServerProbe.relationBlocks(sampler, PersistenceShapes.JOURNAL);
+            final PgServerProbe.WaitSampler waits =
+                    waitSampleMillis > 0 ? new PgServerProbe.WaitSampler(waitSampleMillis) : null;
+            final AtomicReference<Map<String, Double>> lastCounters = new AtomicReference<>(before);
+            final AtomicLong lastOps = new AtomicLong();
+            try {
+                runAndSample(threads, durationSeconds, recorder, samples,
+                        windowIndex -> {
+                            failFast(failures, "pg");
+                            final List<String> row = windowPhaseRow(shape, windowIndex, phaseRecorder.swap());
+                            final Map<String, Double> now = PgServerProbe.counters(sampler);
+                            final long ops = recorder.total();
+                            row.addAll(PgServerProbe.windowCells(lastCounters.getAndSet(now), now,
+                                    ops - lastOps.getAndSet(ops)));
+                            windowPhaseRows.add(row);
+                            System.out.println("[bench] window " + windowIndex + " steps/server: " + row);
+                            return pgWindowStats(sampler, windowIndex);
+                        });
+            } finally {
+                if (waits != null) {
+                    waits.close();
+                }
+                if (r2dbc != null) {
+                    profile.append("- r2dbc pool (production ConnectionPoolFactory, shipped pool defaults) at the "
+                            + "end of the run: ").append(r2dbc.poolMetrics()).append('\n');
+                    r2dbc.close();
+                }
+            }
+            failFast(failures, "pg");
+            // closed backends report their statistics on exit; give that a moment before the final read
+            Thread.sleep(2_000);
+            final Map<String, Double> after = PgServerProbe.counters(sampler);
+            final List<String> pids = new ArrayList<>();
+            for (int w = 0; w < workers; w++) {
+                for (int k = 0; k < pidsPerWorker; k++) {
+                    pids.add(churnPid(pidPrefix, w, k));
+                }
+            }
+            profile.append(schedule.markdown())
+                    .append(PgServerProbe.placementMarkdown(sampler, pids, blocksAtStart)).append('\n')
+                    .append(phaseMarkdown(shape, phaseRecorder.all())).append('\n');
+            if (!windowPhaseRows.isEmpty()) {
+                final List<String> header = new ArrayList<>(List.of("window"));
+                shape.phases().forEach(phase -> header.add(phase + " p50 ms"));
+                header.addAll(PgServerProbe.WINDOW_HEADERS);
+                profile.append("Per-window step p50s, WAL flushes and buffer write-back:\n\n")
+                        .append(BenchProtocol.table(header, windowPhaseRows)).append('\n');
+            }
+            profile.append("Server-side counters over the run:\n\n")
+                    .append(PgServerProbe.deltaMarkdown(before, after, recorder.total()));
+            if (waits != null) {
+                profile.append("\nWait events of the churn backends (pg_stat_activity, every ")
+                        .append(waitSampleMillis).append(" ms):\n\n").append(waits.markdown());
+            }
         }
-        return finish("pg", recorder, snapshots.get(), durationSeconds, samples);
+        return finish("pg", recorder, snapshots.get(), durationSeconds, samples, profile.toString());
+    }
+
+    /** A run with a dead worker measures fewer workers than it reports: abort it instead of writing evidence. */
+    private static void failFast(final List<Exception> failures, final String backend) {
+        if (!failures.isEmpty()) {
+            throw new IllegalStateException(failures.size() + " " + backend + " churn worker(s) failed",
+                    failures.get(0));
+        }
+    }
+
+    static String churnPid(final String pidPrefix, final int worker, final int k) {
+        return pidPrefix + ":w" + worker + "-p" + k;
+    }
+
+    /** p50/p95/mean per timed step over all ops of the run; empty when the shape times only the total. */
+    static String phaseMarkdown(final PgAppendShape shape, final List<long[]> samples) {
+        if (shape.phases().isEmpty()) {
+            return "- per-step timings: n/a for shape " + shape.label() + " (total only)\n";
+        }
+        final List<List<String>> rows = new ArrayList<>();
+        for (int p = 0; p < shape.phases().size(); p++) {
+            final List<Double> ms = stepMillis(samples, p);
+            if (ms.isEmpty()) {
+                continue;
+            }
+            final BenchProtocol.Timing t = BenchProtocol.of(ms);
+            rows.add(List.of(shape.phases().get(p), String.valueOf(t.n()), String.format("%.3f", t.p50Ms()),
+                    String.format("%.3f", t.p95Ms()), String.format("%.3f", t.meanMs())));
+        }
+        return "Per-step client timings over the whole run (shape " + shape.label() + "):\n\n"
+                + BenchProtocol.table(List.of("step", "n", "p50 ms", "p95 ms", "mean ms"), rows);
+    }
+
+    private static List<String> windowPhaseRow(final PgAppendShape shape, final int windowIndex,
+            final List<long[]> samples) {
+        final List<String> row = new ArrayList<>(List.of(String.valueOf(windowIndex)));
+        for (int p = 0; p < shape.phases().size(); p++) {
+            final List<Double> ms = stepMillis(samples, p);
+            row.add(ms.isEmpty() ? "—" : String.format("%.3f", BenchProtocol.of(ms).p50Ms()));
+        }
+        return row;
+    }
+
+    private static List<Double> stepMillis(final List<long[]> samples, final int step) {
+        final List<Double> ms = new ArrayList<>(samples.size());
+        for (final long[] phases : samples) {
+            ms.add(phases[step] / 1_000_000.0);
+        }
+        return ms;
+    }
+
+    /** Step timings of every op (whole run) and of the current sampling window. */
+    static final class PhaseRecorder {
+
+        private final List<long[]> all = new ArrayList<>();
+        private List<long[]> window = new ArrayList<>();
+
+        synchronized void record(final long[] phases) {
+            all.add(phases);
+            window.add(phases);
+        }
+
+        synchronized List<long[]> swap() {
+            final List<long[]> old = window;
+            window = new ArrayList<>();
+            return old;
+        }
+
+        synchronized List<long[]> all() {
+            return new ArrayList<>(all);
+        }
+    }
+
+    /**
+     * The workers' op schedules: worker w issues op k at {@code start(w) + k * nanosPerOp}. By default each worker
+     * starts its schedule when its connection is ready, as W3 always did; staggered, the starts are spread evenly
+     * over one period from a common base, so the target rate arrives as an even stream instead of in bursts.
+     */
+    static final class Schedule {
+
+        /** Lead time for the staggered common base, so every worker's connection is open before it. */
+        private static final long STAGGER_LEAD_NANOS = 1_000_000_000L;
+
+        final double nanosPerOp;
+        final long endNanos;
+        private final boolean stagger;
+        private final long base;
+        private final long[] starts;
+
+        Schedule(final int workers, final int targetRate, final int durationSeconds, final boolean stagger) {
+            this.nanosPerOp = 1_000_000_000.0 * workers / targetRate;
+            this.stagger = stagger;
+            final long now = System.nanoTime();
+            this.base = now + (stagger ? STAGGER_LEAD_NANOS : 0L);
+            this.endNanos = base + durationSeconds * 1_000_000_000L;
+            this.starts = new long[workers];
+        }
+
+        long start(final int worker) {
+            final long start = stagger ? base + (long) (worker * nanosPerOp / starts.length) : System.nanoTime();
+            synchronized (starts) {
+                starts[worker] = start;
+            }
+            return start;
+        }
+
+        /** Each worker's schedule offset within one period, relative to the earliest worker, ascending. */
+        String markdown() {
+            final long[] copy;
+            synchronized (starts) {
+                copy = starts.clone();
+            }
+            final long min = java.util.Arrays.stream(copy).min().orElse(0L);
+            final String offsets = java.util.Arrays.stream(copy)
+                    .mapToDouble(s -> ((s - min) % (long) nanosPerOp) / 1_000_000.0)
+                    .sorted()
+                    .mapToObj(ms -> String.format("%.2f", ms))
+                    .collect(java.util.stream.Collectors.joining(", "));
+            return String.format("- worker schedules (%s): offsets within the %.1f ms period: %s ms%n",
+                    stagger ? "staggered evenly" : "each worker starts when its connection is ready",
+                    nanosPerOp / 1_000_000.0, offsets);
+        }
     }
 
     public static ChurnResult runMongo(final String pidPrefix, final int durationSeconds,
             final int targetRate, final int workers, final int pidsPerWorker) throws Exception {
+        return runMongo(pidPrefix, durationSeconds, targetRate, workers, pidsPerWorker, WriteConcern.JOURNALED,
+                false);
+    }
+
+    public static ChurnResult runMongo(final String pidPrefix, final int durationSeconds,
+            final int targetRate, final int workers, final int pidsPerWorker, final WriteConcern journalWriteConcern,
+            final boolean stagger) throws Exception {
         final Recorder recorder = new Recorder();
         final AtomicLong snapshots = new AtomicLong();
         final List<Thread> threads = new ArrayList<>();
-        final long endNanos = System.nanoTime() + durationSeconds * 1_000_000_000L;
+        final List<Exception> failures = Collections.synchronizedList(new ArrayList<>());
+        final Schedule schedule = new Schedule(workers, targetRate, durationSeconds, stagger);
         try (MongoClient client = BenchConfig.openMongo()) {
             final MongoDatabase db = client.getDatabase(BenchConfig.mongoDbName());
             final MongoCollection<Document> journal =
-                    db.getCollection(PersistenceShapes.JOURNAL).withWriteConcern(WriteConcern.JOURNALED);
+                    db.getCollection(PersistenceShapes.JOURNAL).withWriteConcern(journalWriteConcern);
             final MongoCollection<Document> realtime =
                     db.getCollection(PersistenceShapes.REALTIME).withWriteConcern(WriteConcern.JOURNALED);
             final MongoCollection<Document> snaps =
@@ -142,48 +335,72 @@ public final class ChurnEngine {
             for (int w = 0; w < workers; w++) {
                 final int worker = w;
                 final Thread t = new Thread(() -> {
-                    final long[] sns = new long[pidsPerWorker];
-                    final double nanosPerOp = 1_000_000_000.0 * workers / targetRate;
-                    final long start = System.nanoTime();
-                    long opIdx = 0;
-                    int pidCursor = 0;
-                    while (System.nanoTime() < endNanos) {
-                        final long scheduled = start + (long) (opIdx * nanosPerOp);
-                        long now;
-                        while ((now = System.nanoTime()) < scheduled) {
-                            LockSupport.parkNanos(Math.min(scheduled - now, 1_000_000L));
-                        }
-                        final int k = pidCursor;
-                        pidCursor = (pidCursor + 1) % pidsPerWorker;
-                        final String pid = pidPrefix + ":w" + worker + "-p" + k;
-                        final long sn = ++sns[k];
-                        final long t0 = System.nanoTime();
-                        final Document atom = PersistenceShapes.journalAtom(pid, sn,
-                                CorpusGenerator.MANIFEST_ATTRIBUTE, Document.parse(churnEventJson(pid, sn)));
-                        journal.bulkWrite(List.of(new InsertOneModel<>(atom)));
-                        // plugin batchAppend: realtime insert is fire-and-forget, same doc instance
-                        realtimeExecutor.submit(() -> realtime.insertOne(atom));
-                        if (sn % CorpusGenerator.SNAPSHOT_EVERY == 0) {
-                            final long ts = System.currentTimeMillis();
-                            snaps.replaceOne(
-                                    new Document("pid", pid).append("sn", sn).append("ts", ts),
-                                    PersistenceShapes.snapshotDoc(pid, sn, ts,
-                                            Document.parse(churnSnapshotJson(pid, sn))),
-                                    new ReplaceOptions().upsert(true));
-                            snapshots.incrementAndGet();
-                        }
-                        recorder.record((System.nanoTime() - t0) / 1_000_000.0);
-                        opIdx++;
+                    try {
+                        mongoWorker(worker, pidPrefix, pidsPerWorker, schedule, journal, realtime, snaps,
+                                realtimeExecutor, recorder, snapshots);
+                    } catch (final RuntimeException e) {
+                        failures.add(e);
+                        throw e;
                     }
                 }, "mongo-churn-" + w);
                 threads.add(t);
             }
             final List<Sample> samples = new ArrayList<>();
+            final Map<String, Double> before = MongoServerProbe.counters(db);
             runAndSample(threads, durationSeconds, recorder, samples,
-                    windowIndex -> mongoWindowStats(db, windowIndex));
+                    windowIndex -> {
+                        failFast(failures, "mongo");
+                        return mongoWindowStats(db, windowIndex);
+                    });
             realtimeExecutor.shutdown();
             realtimeExecutor.awaitTermination(30, TimeUnit.SECONDS);
-            return finish("mongo", recorder, snapshots.get(), durationSeconds, samples);
+            failFast(failures, "mongo");
+            final Map<String, Double> after = MongoServerProbe.counters(db);
+            final String profile = "- journal write concern: " + journalWriteConcern.asDocument().toJson()
+                    + " (realtime + snapshot writes stay JOURNALED)\n" + schedule.markdown()
+                    + "\nServer-side counters over the run:\n\n"
+                    + MongoServerProbe.deltaMarkdown(before, after, recorder.total());
+            return finish("mongo", recorder, snapshots.get(), durationSeconds, samples, profile);
+        }
+    }
+
+    private static void mongoWorker(final int worker, final String pidPrefix, final int pidsPerWorker,
+            final Schedule schedule, final MongoCollection<Document> journal, final MongoCollection<Document> realtime,
+            final MongoCollection<Document> snaps, final ExecutorService realtimeExecutor, final Recorder recorder,
+            final AtomicLong snapshots) {
+        final long[] sns = new long[pidsPerWorker];
+        final double nanosPerOp = schedule.nanosPerOp;
+        final long endNanos = schedule.endNanos;
+        final long start = schedule.start(worker);
+        long opIdx = 0;
+        int pidCursor = 0;
+        while (System.nanoTime() < endNanos) {
+            final long scheduled = start + (long) (opIdx * nanosPerOp);
+            long now;
+            while ((now = System.nanoTime()) < scheduled) {
+                LockSupport.parkNanos(Math.min(scheduled - now, 1_000_000L));
+            }
+            final int k = pidCursor;
+            pidCursor = (pidCursor + 1) % pidsPerWorker;
+            final String pid = churnPid(pidPrefix, worker, k);
+            final long sn = ++sns[k];
+            final long t0 = System.nanoTime();
+            final Document atom = PersistenceShapes.journalAtom(pid, sn,
+                    CorpusGenerator.MANIFEST_ATTRIBUTE, Document.parse(churnEventJson(pid, sn)));
+            journal.bulkWrite(List.of(new InsertOneModel<>(atom)));
+            // plugin batchAppend: realtime insert is fire-and-forget, same doc instance
+            realtimeExecutor.submit(() -> realtime.insertOne(atom));
+            if (sn % CorpusGenerator.SNAPSHOT_EVERY == 0) {
+                final long ts = System.currentTimeMillis();
+                snaps.replaceOne(
+                        new Document("pid", pid).append("sn", sn).append("ts", ts),
+                        PersistenceShapes.snapshotDoc(pid, sn, ts,
+                                Document.parse(churnSnapshotJson(pid, sn))),
+                        new ReplaceOptions().upsert(true));
+                snapshots.incrementAndGet();
+            }
+            recorder.record((System.nanoTime() - t0) / 1_000_000.0);
+            opIdx++;
         }
     }
 
@@ -248,9 +465,9 @@ public final class ChurnEngine {
     }
 
     private static ChurnResult finish(final String backend, final Recorder recorder,
-            final long snapshotCount, final int durationSeconds, final List<Sample> samples) {
+            final long snapshotCount, final int durationSeconds, final List<Sample> samples, final String profile) {
         return new ChurnResult(backend, recorder.total(), snapshotCount,
-                recorder.total() / (double) durationSeconds, samples);
+                recorder.total() / (double) durationSeconds, samples, profile);
     }
 
     private static String lastWal;

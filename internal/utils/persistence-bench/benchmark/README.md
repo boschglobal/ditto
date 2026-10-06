@@ -12,6 +12,7 @@ naming, and evidence rules). Design: `docs/superpowers/specs/2026-07-10-postgres
 | Bench harness (Java, JUnit-based) | `internal/utils/persistence-bench/src/test/java/org/eclipse/ditto/internal/utils/persistence/bench/` |
 | Committed evidence (results, plans) | `internal/utils/persistence-bench/src/test/resources/bench/results/` |
 | Superseded schema-v1 evidence (C1, W2) | `internal/utils/persistence-bench/src/test/resources/bench/results/history/2026-07-13-schema-v1/` |
+| W3 per-op latency profile (50k corpus, 2026-10-06) | `internal/utils/persistence-bench/src/test/resources/bench/results/w3-latency/` (start with its `README.md`) |
 | Reproduction script | `internal/utils/persistence-bench/benchmark/run-benchmark.sh` |
 | Design the bench validates | `docs/superpowers/specs/2026-07-10-postgres-persistence-bench-design.md` |
 | Plan deviations cited by the evidence ("plan deviation N") | `internal/utils/persistence-bench/benchmark/PLAN-DEVIATIONS.md` (extracted from the implementation plan, which is not committed) |
@@ -75,7 +76,7 @@ flag was closed by the loose-index-scan rewrite
 | R3 highest sn | 0.84 | 1.34 | PG faster |
 | W1 single append | 2.71 | 3.03 | parity |
 | W2 snapshot write (fresh / overwrite) | 2.96 / 2.33 | 4.79 / 4.25 | PG faster (one snaps index fewer since v2; see the noise caveat below) |
-| W3 sustained churn (achieved of 500/s) | 499.8/s | 499.9/s | both hold target |
+| W3 sustained churn (achieved of 500/s) | 499.8/s | 499.9/s | both hold target; per-op latency: see the W3 note below |
 | C1 cleanup pid-stream page | 8.50 | 10.71 | PG faster — former 21× FLAG closed (loose index scan; plan: index-only pid page + backward PK top-1, no sort/temp) |
 | C2 single-pid cleanup (outlier total) | 993 | 1163 | parity |
 | C3 full sweep (21.05M rows) | 797 s | 488 s | Mongo 1.6× faster (delete-batch bound); identical deletions both sides |
@@ -92,6 +93,38 @@ W2 noise caveat: the v1 -> v2 W2 gain (4.31 -> 2.96 and 3.30 -> 2.33 ms, about 3
 separate runs, and the unchanged Mongo numbers moved between them as well (fresh 6.25 -> 4.79 ms,
 overwrite 3.35 -> 4.25 ms), by about the size of the claimed gain. Treat "PG faster since v2" as
 directional, not as a measured 30 % improvement.
+
+W3 note (per-op latency): in the committed W3 run PG's per-op p50 is 6.53–7.40 ms (p95 9.99–12.43)
+against MongoDB's 1.79–3.20 ms (p95 2.85–14.13), although both hold the rate. A profiling re-run on a
+50k corpus (`../src/test/resources/bench/results/w3-latency/README.md`) found the gap to be mostly a
+bench artefact, not the append path:
+- W3's eight workers start their 16 ms pacing schedules when their connections are ready, which
+  happens nearly at once (0.06–2.0 ms apart in the re-run's recorded schedules), so every 16 ms eight
+  appends arrive together. PostgreSQL flushes WAL under one lock, so such a burst waits for two WAL
+  fsyncs back to back (3.9–4.0 commits per flush in the durable aligned 8-worker runs, 3.1 in one
+  whose schedules spread over 2 ms, 1.0 with even arrivals) and the commit step takes 1.6–2.1 fsyncs.
+  MongoDB's journaled writes absorb the same bursts better.
+- With the schedules spread evenly over the period (`-Dbench.w3.stagger=true`), PG's p50 is
+  1.0–1.7 ms vs MongoDB's 1.0–1.1 ms; in same-period interleaved runs PG stays ≈ 0.5 ms above
+  MongoDB (1.56 / 1.60 vs 1.10 / 1.02 ms). PG's p95 is 2.2–2.7 ms on W3's pgjdbc shape (2.2–4.9 ms
+  on the production append path; the 4.9 ms run overlapped an autovacuum) vs MongoDB's 3.3–6.4 ms.
+  Even arrivals are the best case and lock-step the worst; production appends arrive at random
+  times and were not measured, so production latency lies in between.
+- Run-to-run variance in the re-run: aligned runs of the same shape ranged from 2.9 to 6.5 ms p50,
+  even ones from 1.0 to 1.6 ms. Differences between single runs smaller than that are not effects.
+- The committed run's 124–131 MB WAL per window come from the bulk-loaded corpus: COPY leaves a few
+  hundred bytes free on most pages and the load leaves them in the free space map, so each churn
+  insert lands on a different old page and writes a full-page image (≈ 8.7 kB WAL per op instead of
+  ≈ 1.3 kB). Whether this state, or the write-back after a bulk load, also costs latency was not
+  isolated: a re-run during the post-load autovacuum (100 % page reuse, heavy write-back) ran at
+  3.8 ms p50, inside the aligned spread.
+- Neither the journal_seq upsert, nor the number of connections, nor a one-statement append changes
+  the result. W3 times a pgjdbc transcription, not the production path; the production
+  `PostgresPersistenceOperations` append (BEGIN as an extra round trip) was ≈ 0.1 ms slower in
+  interleaved runs with even arrivals. Under the lock-step bursts it was slower in single runs, which
+  does not isolate the effect.
+Quote W3 latency with this note. A representative W3 protocol would need randomized arrivals, with
+lock-step and even arrivals as bounds, on a settled corpus (autovacuum finished).
 
 Cross-backend determinism: C3 deleted identical 21,054,465 event + 33,613 snapshot rows on both
 backends; M1 swept identical 296,576. Credit-pace projection for C3: ~105 h (the real Ditto pace —
@@ -124,6 +157,24 @@ W1/W3/M1 write fixed, deterministic probe pids with plain inserts, so a second r
 first run's leftover rows fails on duplicate keys.
 
 `--backend pg|mongo` restricts any stage.
+
+W3 profiling knobs (opt-in Maven `-D` properties for `AppendBench#w3SustainedChurn`; the defaults
+reproduce the committed W3 run): `bench.w3.stagger=true` (spread the worker schedules evenly),
+`bench.w3.pgShape=txn|no-hwm|one-statement|r2dbc|r2dbc-phased` (`r2dbc` drives the production
+`PostgresPersistenceOperations` on a pool from the production `ConnectionPoolFactory`),
+`bench.w3.mongoWriteConcern=journaled|w1`, `bench.w3.waitSampleMillis=10` (pg_stat_activity
+sampler), `bench.w3.pidPrefix=<unique per run>` (repeat W3 without a reload) and
+`bench.w3.evidenceFile=<path under results/>`. Every PG churn run (W3 and M1, knobs or not) also
+records per-step timings, per-window WAL flush counts, the heap placement of its rows and server
+counter deltas, all outside the timed path: per 30 s window the sampler connection reads a few
+`pg_stat_*` views (the `pg_stat_checkpointer` read fails on PostgreSQL 16, is skipped and shows up
+in the server log), and after the run it pauses 2 s and runs one placement query. M1 shares this
+churn engine, so its concurrent sweep keeps running for those extra ≥ 2 s before it is stopped
+(slightly more rows deleted than before), its churn connections are tagged
+`application_name=w3-churn`, and a dead churn worker now aborts the run instead of being ignored.
+With `bench.w3.stagger=true` the schedules start 1 s after the run's clock, so window 0 holds about
+29 s of ops and the last second is counted in the totals only. The r2dbc shapes append
+`?applicationName=…` to `bench.pg.url` and need a URL without a query string.
 
 ## 7. Caveats — read before quoting numbers
 

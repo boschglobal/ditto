@@ -50,6 +50,13 @@
             <artifactId>postgresql</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- W3's r2dbc shapes drive the production append path (PostgresPersistenceOperations on a pool from the
+             production ConnectionPoolFactory) to compare it with the pgjdbc transcription. -->
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-internal-utils-persistence-r2dbc</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.mongodb</groupId>
             <artifactId>mongodb-driver-sync</artifactId>
