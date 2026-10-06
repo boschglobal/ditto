@@ -290,7 +290,7 @@ public final class CleanupShapeBench {
         ps.setString(8, interval);
     }
 
-    /** One PG cleanup page as (pid, sn); the payload columns are fetched as production fetches them. */
+    /** One PG cleanup page as (pid, sn); the payload columns are transferred as in production but, unlike production, never decoded or parsed. */
     static List<NewestSnapshotOracle.PidSn> pgPage(final PreparedStatement ps, final String lowerBound,
             final Duration minAge, final int limit) throws SQLException {
         bindPgPage(ps, lowerBound, minAge, limit);

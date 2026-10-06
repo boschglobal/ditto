@@ -100,7 +100,7 @@ public final class MongoLoadBench {
             final Iterator<CorpusGenerator.SnapshotRow> it = gen.snapshots(i);
             while (it.hasNext()) {
                 final CorpusGenerator.SnapshotRow s = it.next();
-                // _id carries the write time, as a driver-generated _id does in production: the cleanup
+                // _id carries the write time, as the mongod-generated _id does on the snapshot upsert in production: the cleanup
                 // min-age filter reads _id, not ts
                 final Document doc = new Document("_id",
                         PersistenceShapes.snapshotObjectId(i, s.sn(), s.timestampMillis()));
