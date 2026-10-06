@@ -296,6 +296,8 @@ Thing-search can **optionally** run its search index on PostgreSQL instead of Mo
 
 **PostgreSQL version:** PostgreSQL 16 or newer (tested: 16, 17, 18). Older versions log a warning at startup, but the service still starts; technically, persistence needs PostgreSQL ≥ 10 and search PostgreSQL ≥ 13 (from 13 on, `pg_trgm` is a trusted extension, see [Prerequisites](#prerequisites-migration-and-known-limitations)).
 
+**Database encoding and locale:** the search database must be UTF8-encoded, with a UTF-8-based `LC_CTYPE` (e.g. `C.UTF-8` or `en_US.UTF-8`) and the libc collation `C.utf8`. The search service checks this at every start, before it touches the schema, and refuses to start otherwise; CloudNativePG's `initdb` default `LC_CTYPE` `C` does not qualify. See [Prerequisites](#prerequisites-migration-and-known-limitations).
+
 #### 1. Provide the extension JARs
 
 Running search on Postgres mounts **two** JARs: the SAME shared `ditto-postgres-client-extension` base the persistence services use, plus the thin `ditto-postgres-search-extension` (search read/write/aggregation classes only):
@@ -444,6 +446,28 @@ To see whether a build or drop is running:
 #### Prerequisites, migration and known limitations
 
 * **`pg_trgm` extension:** the search schema requires the `pg_trgm` extension (used for `like`/`ilike` trigram indexes). It is a *trusted* extension on PostgreSQL ≥ 13, so `CREATE EXTENSION IF NOT EXISTS pg_trgm` on the target database succeeds for the DDL role without superuser; the schema bootstrap fails with an actionable error if the role is not permitted to create it.
+* **UTF8 database with a UTF-8 `LC_CTYPE`:** the PostgreSQL search backend needs a UTF8-encoded database with a UTF-8-based `LC_CTYPE` (e.g. `C.UTF-8` or `en_US.UTF-8`; the official `postgres` image's default, `en_US.utf8`, qualifies), the libc collation `C.utf8` (present on glibc-based images, absent on non-UTF8 databases and on musl/Alpine images), and the `pg_trgm` extension.
+  * Why the `LC_CTYPE` matters: `pg_trgm` lower-cases and splits words with the database's `LC_CTYPE`, whatever the index collation, while `ilike` compares under `C.utf8`. On a `C`/`POSIX` `LC_CTYPE` every non-ASCII character separates words for `pg_trgm`. An `ilike` that the planner serves from the trigram index then silently misses things whose value differs from the pattern by a character that lower-cases to an ASCII letter (`İ` U+0130 → `i`, the Kelvin sign `K` U+212A → `k`), and patterns made only of non-ASCII letters read the whole index.
+  * At every start, before any schema change, the search service reads the database's encoding, its `LC_CTYPE` (judged by name: its codeset must be UTF-8) and whether `C.utf8` exists. It refuses to start with an error that names every unmet prerequisite and the remedy.
+
+  Check your database (connected to the search database):
+
+  ```sql
+  SELECT pg_encoding_to_char(d.encoding) AS encoding,        -- must be UTF8
+         d.datctype                       AS ctype,           -- must be UTF-8 based (e.g. C.UTF-8, en_US.UTF-8), not C/POSIX
+         EXISTS (SELECT 1 FROM pg_collation c
+                 WHERE c.collname = 'C.utf8' AND c.collencoding IN (-1, d.encoding)) AS has_c_utf8,   -- must be true
+         EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_trgm')      AS pg_trgm_available  -- must be true
+  FROM pg_database d WHERE d.datname = current_database();
+  ```
+
+  To fix it, create the search database with UTF8 encoding and a UTF-8 `LC_CTYPE`. This also works inside a cluster initialised with `C`:
+
+  ```sql
+  CREATE DATABASE ditto_search TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8';
+  ```
+
+  On CloudNativePG, whose `initdb` default `LC_CTYPE` is `C`, set `spec.bootstrap.initdb.localeCType: C.UTF-8` (the default encoding is already `UTF8`). An existing search database that does not qualify cannot be changed in place: point the search service at a new, qualifying database and let it re-index (next bullet).
 * **Migration = re-index only:** the search index is a rebuildable projection of the things data, so the cutover to Postgres is simply to point search at an empty PostgreSQL database and let the background-sync stream regenerate the index. There is no copy tooling and none is needed. Search results are incomplete until the initial re-index (background sync) finishes — plan this re-index window into the cutover.
 * **Speeding up very large re-indexes (optional):** every row written during the initial re-index pays incremental maintenance on the `sf_trgm` trigram GIN index, and a bulk GIN build after the data is loaded is much faster than the same work done insert-by-insert. For very large populations an operator may `DROP INDEX sf_trgm` before starting the backfill and recreate it once the re-index has caught up:
 
@@ -454,6 +478,7 @@ To see whether a build or drop is running:
 
   While the index is absent, `like`/`ilike` queries fall back to scans — everything else is unaffected. Recreate it **before** the next search-service restart: a start that finds a built-in index missing runs the schema DDL, which would rebuild `sf_trgm` as a plain (blocking, non-concurrent) build against the by-then-populated table. This is purely an optimisation — by default GIN's `fastupdate` pending list amortises per-insert cost, and the re-index works fine with the index in place.
 * **`like`/`ilike` performance caveat:** sub-3-character `like`/`ilike` patterns cannot be served by the trigram index and degrade to a scan — mirroring MongoDB's own unanchored-regex degradation. The slow-query log catches abuse. `ilike` on a path that many things carry is slow with the table-wide `sf_trgm` alone: on the 1M-thing benchmark corpus, infix `ilike` on `features/*/properties/prop0` took **305.8–391.5 ms p95** in three runs (most patterns about 200 ms, some 300–420 ms when the planner adds a scan of all rows of the path). Configure a [per-path search index](#per-path-search-indexes-optional) for such paths.
+* **`ilike` case folding:** `ilike` lower-cases value and pattern character by character under `C.utf8`; it does not apply full Unicode case folding. So `ß` does not match `ss`/`SS` (the capital `ẞ` does match `ß`), the dotless `ı` matches neither `i` nor `I`, and the final sigma `ς` does not match `σ`/`Σ`, while the dotted `İ` (U+0130) matches `i` and the Kelvin sign `K` (U+212A) matches `k`. MongoDB's case-insensitive regex folds some of these characters differently.
 * **Sort performance caveat:** sorting by any field other than `thingId` or `namespace` (an attribute, a feature property such as `sort(+features/env/properties/temperature)`, `_modified`, …) cannot be served by an index. To return any page, the search looks up the sort value of **every** thing that matches the filter and is visible to the caller, then orders them. The cost grows with the number of matching visible things, not with the page size, and neither `limit(offset,size)` nor cursor paging reduces it.
   * On the 1M-thing search benchmark (PostgreSQL 16 defaults: 128 MB `shared_buffers`, `jit = on`; no filter; about 29,400 things visible to the caller), one sorted page took about **350 ms p95** for page 1 and about **360–390 ms p95** for page 100 via `limit`. Page 100 via the cursor took about **680 ms p95**. That is above the 200 ms target the other read shapes are measured against.
   * The cursor page costs more because its resume filter is evaluated for every visible thing.

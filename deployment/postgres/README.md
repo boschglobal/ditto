@@ -37,6 +37,20 @@ still starts. Technically, the persistence backend needs PostgreSQL ≥ 10 and
 the search backend PostgreSQL ≥ 13 (from 13 on `pg_trgm` is a trusted
 extension, so the DDL role can create it without superuser).
 
+## Search database: encoding and locale
+
+The PostgreSQL search backend needs a UTF8-encoded database with a UTF-8-based
+`LC_CTYPE` (e.g. `C.UTF-8`, `en_US.UTF-8`) and the libc collation `C.utf8`; at
+every start `things-search` checks this and refuses to start otherwise. If the
+cluster's default `LC_CTYPE` is `C`/`POSIX` (CloudNativePG's `initdb` default),
+create the search database with
+
+    CREATE DATABASE <db> TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8';
+
+or, on CloudNativePG, set `bootstrap.initdb.localeCType: C.UTF-8`. A query to
+check a database: the installation guide's "Prerequisites, migration and known
+limitations" of the PostgreSQL search backend.
+
 ## Connection budget
 
 Every instance of a PostgreSQL-backed service opens its own connection pool:

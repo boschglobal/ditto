@@ -58,7 +58,7 @@ public class PostgresSearchBenchSmokeIT {
     @Before
     public void setUp() {
         try {
-            container = new PostgreSQLContainer<>(PostgresDbResource.configuredImageName())
+            container = PostgresDbResource.newContainer()
                     .withDatabaseName("bench_smoke")
                     .withUsername("bench")
                     .withPassword("bench");

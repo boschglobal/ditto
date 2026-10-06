@@ -12,6 +12,8 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit;
 
+import java.util.Optional;
+
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -29,8 +31,9 @@ import io.r2dbc.spi.ConnectionFactoryOptions;
  * <p>
  * The image of a resource created without an explicit one is chosen by the system property
  * {@value #IMAGE_PROPERTY}, e.g. {@code mvn verify -Dditto.test.postgres.image=postgres:17} (failsafe passes command
- * line properties on to the forked test JVM); without it, {@value #DEFAULT_IMAGE}. ITs that start their own
- * {@code PostgreSQLContainer} use {@link #configuredImageName()} so that they follow the same property.
+ * line properties on to the forked test JVM); without it, {@value #DEFAULT_IMAGE}. The {@code initdb} arguments are
+ * chosen the same way, by {@value #INITDB_ARGS_PROPERTY} or {@link #withInitdbArgs(String)}. ITs that start their own
+ * {@code PostgreSQLContainer} use {@link #newContainer()} so that both properties reach them.
  * </p>
  * <p>
  * The Docker API version is left to Testcontainers' own negotiation (no {@code api.version} pin), so the ITs follow the
@@ -55,6 +58,18 @@ public final class PostgresDbResource extends ExternalResource {
      */
     public static final String IMAGE_PROPERTY = "ditto.test.postgres.image";
 
+    /**
+     * The system property that sets {@value #INITDB_ARGS_ENV} (the official image's {@code initdb} arguments) for every
+     * resource that does not set its own ({@link #withInitdbArgs(String)}) and for every {@link #newContainer()}
+     * container, e.g. {@code -Dditto.test.postgres.initdb-args="--encoding=UTF8 --locale=C.UTF-8"}. Unset or blank:
+     * none, i.e. the image's own cluster ({@code en_US.utf8} for the official image). Independent of
+     * {@value #IMAGE_PROPERTY}.
+     */
+    public static final String INITDB_ARGS_PROPERTY = "ditto.test.postgres.initdb-args";
+
+    /** The environment variable the official {@code postgres} image's entrypoint passes on to {@code initdb}. */
+    public static final String INITDB_ARGS_ENV = "POSTGRES_INITDB_ARGS";
+
     /** The schema-owning DDL role (mirrors the two-role split between schema-owner and runtime user; the tests run DDL as this role). */
     public static final String DDL_USER = "ditto_ddl";
     public static final String DDL_PASSWORD = "ddl_secret";
@@ -62,6 +77,7 @@ public final class PostgresDbResource extends ExternalResource {
 
     private final String imageName;
     private final DockerImageName image;
+    @Nullable private String initdbArgs;
 
     @Nullable
     private PostgreSQLContainer<?> container;
@@ -82,6 +98,7 @@ public final class PostgresDbResource extends ExternalResource {
     public PostgresDbResource(final String dockerImage) {
         this.imageName = dockerImage;
         this.image = compatibleImageName(dockerImage);
+        this.initdbArgs = configuredInitdbArgs().orElse(null);
     }
 
     /**
@@ -107,10 +124,64 @@ public final class PostgresDbResource extends ExternalResource {
     }
 
     /**
+     * @return the {@code initdb} arguments chosen by the {@value #INITDB_ARGS_PROPERTY} system property (trimmed), or
+     * empty when it is unset or blank.
+     */
+    public static Optional<String> configuredInitdbArgs() {
+        return normalizedInitdbArgs(System.getProperty(INITDB_ARGS_PROPERTY));
+    }
+
+    /**
+     * A not yet started container of the configured image ({@link #configuredImageName()}) with the configured
+     * {@code initdb} arguments ({@link #configuredInitdbArgs()}), for ITs that start their own container (custom
+     * database, credentials or network); they add those settings and start it themselves.
+     *
+     * @return the container.
+     */
+    public static PostgreSQLContainer<?> newContainer() {
+        return newContainer(configuredImageName(), configuredInitdbArgs().orElse(null));
+    }
+
+    private static PostgreSQLContainer<?> newContainer(final DockerImageName image, @Nullable final String initdbArgs) {
+        final PostgreSQLContainer<?> container = new PostgreSQLContainer<>(image);
+        if (initdbArgs != null) {
+            container.withEnv(INITDB_ARGS_ENV, initdbArgs);
+        }
+        return container;
+    }
+
+    private static Optional<String> normalizedInitdbArgs(@Nullable final String initdbArgs) {
+        return initdbArgs == null || initdbArgs.isBlank() ? Optional.empty() : Optional.of(initdbArgs.trim());
+    }
+
+    /**
      * @return the image this resource starts, e.g. {@code postgres:16}.
      */
     public String getImage() {
         return imageName;
+    }
+
+    /**
+     * Sets this resource's {@code initdb} arguments ({@value #INITDB_ARGS_ENV}), regardless of
+     * {@value #INITDB_ARGS_PROPERTY}; {@code null} or blank means none (the image's own cluster).
+     *
+     * @param initdbArgs e.g. {@code --encoding=UTF8 --locale=C}.
+     * @return this resource.
+     * @throws IllegalStateException if the container is already started.
+     */
+    public PostgresDbResource withInitdbArgs(@Nullable final String initdbArgs) {
+        if (container != null) {
+            throw new IllegalStateException("The initdb arguments of a started PostgresDbResource cannot change.");
+        }
+        this.initdbArgs = normalizedInitdbArgs(initdbArgs).orElse(null);
+        return this;
+    }
+
+    /**
+     * @return the {@code initdb} arguments this resource starts its cluster with, or empty for the image's own.
+     */
+    public Optional<String> getInitdbArgs() {
+        return Optional.ofNullable(initdbArgs);
     }
 
     /**
@@ -119,7 +190,7 @@ public final class PostgresDbResource extends ExternalResource {
      */
     public void start() {
         if (container == null) {
-            container = new PostgreSQLContainer<>(image)
+            container = newContainer(image, initdbArgs)
                     .withDatabaseName(DATABASE)
                     .withUsername(DDL_USER)
                     .withPassword(DDL_PASSWORD);

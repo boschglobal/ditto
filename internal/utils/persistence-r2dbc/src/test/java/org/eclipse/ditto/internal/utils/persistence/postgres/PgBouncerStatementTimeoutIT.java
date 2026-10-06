@@ -154,7 +154,7 @@ public final class PgBouncerStatementTimeoutIT {
                 DockerClientFactory.instance().isDockerAvailable());
 
         network = Network.newNetwork();
-        postgres = new PostgreSQLContainer<>(PostgresDbResource.configuredImageName())
+        postgres = PostgresDbResource.newContainer()
                 .withNetwork(network)
                 .withNetworkAliases("postgres")
                 .withDatabaseName(DATABASE)

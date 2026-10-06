@@ -88,7 +88,7 @@ public final class PgBouncerTransactionPoolingIT {
     public static void start() {
         try {
             network = Network.newNetwork();
-            postgres = new PostgreSQLContainer<>(PostgresDbResource.configuredImageName())
+            postgres = PostgresDbResource.newContainer()
                     .withNetwork(network)
                     .withNetworkAliases("postgres")
                     .withDatabaseName(PG_DB)

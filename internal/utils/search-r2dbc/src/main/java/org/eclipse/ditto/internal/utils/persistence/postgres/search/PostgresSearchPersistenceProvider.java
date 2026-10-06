@@ -35,6 +35,7 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresHeal
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.DefaultPostgresSearchPathIndexConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexMaintenance;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PostgresSearchPathIndexConfig;
@@ -170,7 +171,13 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
                 actorSystem.settings().config().getConfig("ditto"), simpleFieldMappings());
         final ConnectionFactory ddlConnectionFactory = ConnectionPoolFactory.createDdlConnectionFactory(config);
         try {
+            // Refuses a database the search schema cannot work correctly on (encoding, LC_CTYPE, the "C.utf8"
+            // collation) before the bootstrap touches it — at every start, also when the schema is up to date.
+            PostgresSearchDatabasePrerequisites.verify(ddlConnectionFactory);
             PostgresSchemaManager.of(ddlConnectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+        } catch (final SchemaBootException e) {
+            // A refusal is already actionable; its text mentions pg_trgm, so it must not be re-classified below.
+            throw e;
         } catch (final RuntimeException e) {
             if (indicatesMissingTrgmExtension(e)) {
                 throw new IllegalStateException("PostgreSQL search schema bootstrap failed: the DDL role could not "

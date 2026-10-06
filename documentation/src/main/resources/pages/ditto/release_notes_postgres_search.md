@@ -54,6 +54,15 @@ The PostgreSQL search schema requires the `pg_trgm` extension (used for the `lik
 for the DDL role without superuser privileges. The schema bootstrap fails with an actionable error if the role is not
 permitted to create it.
 
+## Prerequisite — a UTF8 database with a UTF-8 `LC_CTYPE`
+
+The search database must be UTF8-encoded, with a UTF-8-based `LC_CTYPE` (e.g. `C.UTF-8` or `en_US.UTF-8`; the official
+`postgres` image's default qualifies) and the libc collation `C.utf8`. The search service checks this at every start
+and refuses to start otherwise, with an error that names what is missing and how to create a qualifying database.
+CloudNativePG's `initdb` default `LC_CTYPE` is `C`: set `bootstrap.initdb.localeCType: C.UTF-8`. Details and a query
+to check a database:
+[Installation / extending — PostgreSQL search backend](installation-extending.html#prerequisites-migration-and-known-limitations).
+
 ## Migration — re-index cutover (no copy tooling)
 
 The search index is a **rebuildable projection** of the things data, so there is no data-migration step and no copy

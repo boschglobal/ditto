@@ -22,25 +22,33 @@ import org.junit.Test;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * Unit tests for the image selection of {@link PostgresDbResource} (no container is started): the
+ * Unit tests for the image and initdb-argument selection of {@link PostgresDbResource} (no container is started): the
  * {@value PostgresDbResource#IMAGE_PROPERTY} system property chooses the image of every resource created without an
- * explicit one.
+ * explicit one, and {@value PostgresDbResource#INITDB_ARGS_PROPERTY} the {@code initdb} arguments.
  */
 public final class PostgresDbResourceTest {
 
-    @Nullable private String originalProperty;
+    @Nullable private String originalImageProperty;
+    @Nullable private String originalInitdbArgsProperty;
 
     @Before
-    public void rememberProperty() {
-        originalProperty = System.getProperty(PostgresDbResource.IMAGE_PROPERTY);
+    public void rememberProperties() {
+        originalImageProperty = System.getProperty(PostgresDbResource.IMAGE_PROPERTY);
+        originalInitdbArgsProperty = System.getProperty(PostgresDbResource.INITDB_ARGS_PROPERTY);
+        System.clearProperty(PostgresDbResource.INITDB_ARGS_PROPERTY);
     }
 
     @After
-    public void restoreProperty() {
-        if (originalProperty == null) {
-            System.clearProperty(PostgresDbResource.IMAGE_PROPERTY);
+    public void restoreProperties() {
+        restore(PostgresDbResource.IMAGE_PROPERTY, originalImageProperty);
+        restore(PostgresDbResource.INITDB_ARGS_PROPERTY, originalInitdbArgsProperty);
+    }
+
+    private static void restore(final String property, @Nullable final String value) {
+        if (value == null) {
+            System.clearProperty(property);
         } else {
-            System.setProperty(PostgresDbResource.IMAGE_PROPERTY, originalProperty);
+            System.setProperty(property, value);
         }
     }
 
@@ -85,6 +93,56 @@ public final class PostgresDbResourceTest {
         // Testcontainers' PostgreSQLContainer only accepts images declared compatible with "postgres".
         assertThat(PostgresDbResource.configuredImageName().isCompatibleWith(DockerImageName.parse("postgres")))
                 .isTrue();
+    }
+
+    @Test
+    public void noInitdbArgumentsByDefault() {
+        assertThat(PostgresDbResource.INITDB_ARGS_PROPERTY).isEqualTo("ditto.test.postgres.initdb-args");
+        assertThat(PostgresDbResource.INITDB_ARGS_ENV).isEqualTo("POSTGRES_INITDB_ARGS");
+        assertThat(PostgresDbResource.configuredInitdbArgs()).isEmpty();
+        assertThat(new PostgresDbResource().getInitdbArgs()).isEmpty();
+        // Containers are only configured here, never started; getDockerImageName() would resolve (pull) the image.
+        assertThat(PostgresDbResource.newContainer().getEnvMap()).doesNotContainKey("POSTGRES_INITDB_ARGS");
+    }
+
+    @Test
+    public void initdbArgumentsPropertyReachesResourcesAndOwnContainers() {
+        System.setProperty(PostgresDbResource.INITDB_ARGS_PROPERTY, " --encoding=UTF8 --locale=C.UTF-8 ");
+
+        assertThat(PostgresDbResource.configuredInitdbArgs()).contains("--encoding=UTF8 --locale=C.UTF-8");
+        assertThat(new PostgresDbResource().getInitdbArgs()).contains("--encoding=UTF8 --locale=C.UTF-8");
+        assertThat(PostgresDbResource.newContainer().getEnvMap())
+                .containsEntry("POSTGRES_INITDB_ARGS", "--encoding=UTF8 --locale=C.UTF-8");
+    }
+
+    @Test
+    public void blankInitdbArgumentsPropertyMeansNone() {
+        System.setProperty(PostgresDbResource.INITDB_ARGS_PROPERTY, "  ");
+
+        assertThat(PostgresDbResource.configuredInitdbArgs()).isEmpty();
+        assertThat(PostgresDbResource.newContainer().getEnvMap()).doesNotContainKey("POSTGRES_INITDB_ARGS");
+    }
+
+    @Test
+    public void explicitInitdbArgumentsWinOverTheProperty() {
+        System.setProperty(PostgresDbResource.INITDB_ARGS_PROPERTY, "--locale=C");
+
+        assertThat(new PostgresDbResource().withInitdbArgs("--locale=C.UTF-8").getInitdbArgs())
+                .contains("--locale=C.UTF-8");
+        assertThat(new PostgresDbResource().withInitdbArgs(null).getInitdbArgs()).isEmpty();
+        assertThat(new PostgresDbResource().withInitdbArgs(" ").getInitdbArgs()).isEmpty();
+    }
+
+    @Test
+    public void initdbArgumentsAreOrthogonalToTheImage() {
+        System.setProperty(PostgresDbResource.IMAGE_PROPERTY, "postgres:18");
+        System.setProperty(PostgresDbResource.INITDB_ARGS_PROPERTY, "--locale=C.UTF-8");
+
+        assertThat(PostgresDbResource.configuredImageName().asCanonicalNameString()).isEqualTo("postgres:18");
+        assertThat(PostgresDbResource.newContainer().getEnvMap())
+                .containsEntry("POSTGRES_INITDB_ARGS", "--locale=C.UTF-8");
+        assertThat(new PostgresDbResource("postgres:17").getInitdbArgs()).contains("--locale=C.UTF-8");
+        assertThat(new PostgresDbResource("postgres:17").getImage()).isEqualTo("postgres:17");
     }
 
 }
