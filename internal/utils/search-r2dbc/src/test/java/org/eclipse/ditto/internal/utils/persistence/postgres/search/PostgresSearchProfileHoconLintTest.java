@@ -14,10 +14,14 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.search;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Duration;
+
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSchemaBootstrapper;
 import org.junit.Test;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigUtil;
 
 /**
  * HOCON lint over the effective {@code ditto-postgres-search.conf} profile (Phase F requirement 2) — the
@@ -128,6 +132,23 @@ public final class PostgresSearchProfileHoconLintTest {
                 .as("search.conf's own Mongo defaults must remain untouched by the opt-in Postgres overlay")
                 .isTrue();
         assertThat(config.getString("ditto.mongodb.database")).isEqualTo("search");
+    }
+
+    /**
+     * The search profile carries the shared {@code ditto.postgresql.bootstrap} block of the client conf (wait for an
+     * unreachable PostgreSQL at start, then stop the service) and the exit code 1 of its shutdown reason.
+     */
+    @Test
+    public void profileCarriesTheSharedSchemaBootstrapBlock() {
+        final Config config = loadConfig();
+
+        assertThat(config.getDuration("ditto.postgresql.bootstrap.attempt-timeout")).isEqualTo(Duration.ofSeconds(60));
+        assertThat(config.getBoolean("ditto.postgresql.bootstrap.retry.enabled")).isTrue();
+        assertThat(config.getDuration("ditto.postgresql.bootstrap.retry.max-duration"))
+                .isEqualTo(Duration.ofSeconds(60));
+        assertThat(config.getBoolean("ditto.postgresql.bootstrap.exit-on-failure")).isTrue();
+        assertThat(config.getInt(ConfigUtil.joinPath("pekko", "coordinated-shutdown", "reason-overrides",
+                PostgresSchemaBootstrapper.BootstrapFailed.class.getName(), "exit-code"))).isEqualTo(1);
     }
 
 }

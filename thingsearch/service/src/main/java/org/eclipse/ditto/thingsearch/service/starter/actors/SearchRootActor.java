@@ -60,7 +60,8 @@ public final class SearchRootActor extends DittoRootActor {
                 .execute(getContext());
 
         // bootstrap the backend search schema/indices before any persistence is used (mirrors ThingsRootActor's
-        // PersistenceBackendProvider.bootstrapSchema() call order).
+        // PersistenceBackendProvider.bootstrapSchema() call order). On PostgreSQL it waits a bounded, configured time
+        // while the database is not reachable yet and throws otherwise.
         searchPersistenceProvider.bootstrapSchema();
 
         final ThingsSearchPersistence thingsSearchPersistence = searchPersistenceProvider.createSearchPersistence();

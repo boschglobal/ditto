@@ -191,7 +191,11 @@ The order is load-bearing because PostgreSQL `ALTER DEFAULT PRIVILEGES` applies
    (DDL role) and runs all `CREATE TABLE`/`CREATE INDEX` inside one
    `pg_advisory_xact_lock`'d transaction `[H2]`. Because step 1 already set the
    default privileges, every new table is born with the DML grant to `ditto_app`
-   — no post-boot re-grant pass is needed.
+   — no post-boot re-grant pass is needed. If PostgreSQL is not reachable yet,
+   the service waits for it (`ditto.postgresql.bootstrap.retry.max-duration`,
+   default 60 s) and then stops so that its orchestrator restarts it;
+   authentication, unknown-database, TLS and schema errors stop it at once.
+   Settings: `ditto-postgres-client.conf`, block `bootstrap`.
 
 3. **Runtime traffic uses `ditto_app`.** The hot-path `uri` (`${POSTGRES_URI}`)
    authenticates as `ditto_app`, which has DML only — it cannot run DDL.
@@ -482,9 +486,10 @@ the advisory lock: each DDL statement waits at most 500 ms for a table lock, bel
 `deadlock_timeout` (1 s). A boot that meets a conflicting lock — a running `CREATE INDEX CONCURRENTLY` or
 `DROP INDEX CONCURRENTLY` (per-path search indexes), a long transaction, or an autovacuum of that table (a lock
 wait shorter than `deadlock_timeout` does not make PostgreSQL cancel the autovacuum) — fails with SQLSTATE `55P03`,
-changes nothing, logs a WARN naming the component, and is retried at the next start. On large, busy tables a
-schema upgrade may therefore need several start attempts; cancelling the blocking autovacuum worker
-(`pg_cancel_backend`) lets the next one through.
+changes nothing, logs a WARN naming the component, and is retried at the next start (the failed start stops the
+service, see `bootstrap.exit-on-failure`, and its orchestrator restarts it). On large, busy tables a schema upgrade
+may therefore need several start attempts; cancelling the blocking autovacuum worker (`pg_cancel_backend`) lets the
+next one through.
 
 Consequence of the same-version rule: a manually dropped table or index is re-created at the next start, but a
 manually changed or reset reloption (e.g. `autovacuum_vacuum_scale_factor`) is not re-applied until the next

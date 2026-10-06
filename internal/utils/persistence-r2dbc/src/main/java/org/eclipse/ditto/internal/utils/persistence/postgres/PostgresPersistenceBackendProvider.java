@@ -31,10 +31,10 @@ import org.eclipse.ditto.internal.utils.persistence.api.PersistencePluginConfig;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotCodec;
 import org.eclipse.ditto.internal.utils.persistence.api.streaming.NoOpCloseable;
 import org.eclipse.ditto.internal.utils.persistence.api.streaming.SnapshotStreamingActor;
-import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresClientExtension;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresHealthChecker;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSchemaBootstrapper;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
@@ -48,10 +48,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.typesafe.config.Config;
-
-import io.r2dbc.spi.Closeable;
-import io.r2dbc.spi.ConnectionFactory;
-import reactor.core.publisher.Mono;
 
 /**
  * PostgreSQL-backed implementation of {@link PersistenceBackendProvider}.
@@ -273,22 +269,31 @@ public final class PostgresPersistenceBackendProvider implements PersistenceBack
     }
 
     /**
-     * Bootstraps the PostgreSQL persistence schema, the production entry point for {@link PostgresSchemaManager}.
+     * Bootstraps the PostgreSQL persistence schema through {@link PostgresSchemaBootstrapper}, the production entry
+     * point for {@link PostgresSchemaManager} shared with the search backend.
      * <p>
-     * Builds a one-shot DDL-role {@link ConnectionFactory} from {@code ditto.postgresql.pool.ddl-credentials} (falling
-     * back to the runtime credentials when the DDL role is empty, per {@code ditto-postgres-persistence.conf}) and runs the
-     * single-transaction bootstrap (CREATE … IF NOT EXISTS + live-catalog verification + {@code schema_version}
-     * checksum guard). The DDL connection factory is disposed afterwards so no DDL-privileged connection lingers.
+     * The bootstrapper builds a one-shot DDL-role connection factory from {@code ditto.postgresql.pool.ddl-credentials}
+     * (falling back to the runtime credentials when the DDL role is empty), runs the single-transaction bootstrap
+     * (CREATE … IF NOT EXISTS + live-catalog verification + {@code schema_version} guard) and disposes the factory, so
+     * no DDL-privileged connection lingers. While PostgreSQL is not reachable yet it retries for up to
+     * {@code ditto.postgresql.bootstrap.retry.max-duration}; any other failure is not retried.
      * </p>
      * <p>
      * This must be called once, before the persistent actors start writing journals, so a fresh database has its tables
      * created (rather than the first journal write hitting {@code relation does not exist}). Because the bootstrap
      * verifies the live catalog and refuses to boot on a checksum/PK divergence, a successful return is itself the
-     * guarantee that the required tables exist; a failure throws and fails boot fast.
+     * guarantee that the required tables exist; a failure throws and, with
+     * {@code ditto.postgresql.bootstrap.exit-on-failure}, also stops the service.
      * </p>
      *
-     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException on a checksum mismatch or
-     * a live-catalog divergence.
+     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException on a checksum
+     * mismatch, an incompatible newer schema or a live-catalog divergence.
+     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootstrapUnavailableException
+     * when PostgreSQL stayed unreachable for the whole retry budget.
+     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootstrapTimeoutException when
+     * an attempt did not finish within the attempt timeout.
+     * @throws org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootstrapAbortedException when
+     * the service shuts down during the wait.
      * @throws org.eclipse.ditto.internal.utils.config.DittoConfigError if the SSL configuration is unsafe.
      */
     @Override
@@ -297,31 +302,11 @@ public final class PostgresPersistenceBackendProvider implements PersistenceBack
         final boolean ddlRoleConfigured = config.getPoolConfig().getDdlCredentials().isConfigured();
         LOGGER.info("Bootstrapping PostgreSQL persistence schema (ddl-credentials {}).",
                 ddlRoleConfigured ? "configured -> dedicated DDL role" : "empty -> reusing runtime role");
-        final ConnectionFactory ddlConnectionFactory = ConnectionPoolFactory.createDdlConnectionFactory(config);
-        try {
-            PostgresSchemaManager.of(ddlConnectionFactory, PostgresSchema.descriptor()).bootstrap();
-        } finally {
-            disposeQuietly(ddlConnectionFactory);
-        }
+        PostgresSchemaBootstrapper.bootstrap(actorSystem, config, PostgresSchema.descriptor());
         // Register the persistence schema with the shared client's runtime self-heal: a statement hitting a missing
         // table (42P01) then recreates exactly this descriptor's tables and retries. Registration is here, after a
         // successful bootstrap and before the plugins issue runtime statements.
         PostgresClientExtension.get(actorSystem).getClient().registerSchemaDescriptor(PostgresSchema.descriptor());
-    }
-
-    private static void disposeQuietly(final ConnectionFactory ddlConnectionFactory) {
-        // The DDL factory is a one-shot, non-pooled factory; r2dbc factories implement Closeable.close() which returns
-        // a Publisher. Subscribe so it actually closes, but never let a close failure mask a bootstrap outcome.
-        if (ddlConnectionFactory instanceof Closeable closeable) {
-            try {
-                Mono.from(closeable.close()).onErrorResume(error -> {
-                    LOGGER.warn("Failed to close the DDL connection factory after schema bootstrap.", error);
-                    return Mono.empty();
-                }).block();
-            } catch (final RuntimeException e) {
-                LOGGER.warn("Failed to close the DDL connection factory after schema bootstrap.", e);
-            }
-        }
     }
 
     private String requireMapping(final String entityType, final String key) {

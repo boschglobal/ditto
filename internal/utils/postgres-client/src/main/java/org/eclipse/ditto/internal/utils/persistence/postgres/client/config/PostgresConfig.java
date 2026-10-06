@@ -22,7 +22,7 @@ import org.eclipse.ditto.internal.utils.config.KnownConfigValue;
 /**
  * Provides the configuration settings of the PostgreSQL (R2DBC) persistence backend.
  * <p>
- * Lives under the HOCON namespace {@code ditto.postgresql.{uri, pooler-mode, pool.*, ssl.*}}. Defaults:
+ * Lives under the HOCON namespace {@code ditto.postgresql.{uri, pooler-mode, pool.*, ssl.*, bootstrap.*}}. Defaults:
  * {@code pool.max-size=25} (connections per service instance; the sum over all replicas of all PostgreSQL-backed
  * services, the extra pods of a rolling update included, must fit {@code max_connections}, see
  * {@code ditto-postgres-client.conf}; confirm under load),
@@ -130,6 +130,12 @@ public interface PostgresConfig {
      * @return the TLS / SSL settings.
      */
     SslConfig getSslConfig();
+
+    /**
+     * @return the settings of the schema bootstrap that runs once at service start
+     * ({@code ditto.postgresql.bootstrap}).
+     */
+    BootstrapConfig getBootstrapConfig();
 
     /**
      * Settings of the R2DBC connection pool.
@@ -377,6 +383,132 @@ public interface PostgresConfig {
             private final Object defaultValue;
 
             SslConfigValue(final String thePath, final Object theDefaultValue) {
+                path = thePath;
+                defaultValue = theDefaultValue;
+            }
+
+            @Override
+            public String getConfigPath() {
+                return path;
+            }
+
+            @Override
+            public Object getDefaultValue() {
+                return defaultValue;
+            }
+
+        }
+
+    }
+
+    /**
+     * Settings of the schema bootstrap a PostgreSQL-backed service runs once at start: how long one attempt may take,
+     * whether and how long the start waits for a PostgreSQL that is not reachable yet, and whether a finally failed
+     * bootstrap stops the service.
+     */
+    @Immutable
+    interface BootstrapConfig {
+
+        /**
+         * How long one bootstrap attempt (connect, any precondition, the schema check/DDL and the catalog verification
+         * under the advisory lock) may take. An attempt that runs out of it is not retried: PostgreSQL accepted the
+         * connection, but the bootstrap is stuck.
+         *
+         * @return the attempt timeout, positive.
+         */
+        Duration getAttemptTimeout();
+
+        /**
+         * Whether a finally failed bootstrap (a failure that is not retried, exhausted retries, an attempt timeout or
+         * an invalid configuration) stops the service through Pekko's coordinated shutdown, so that its orchestrator
+         * restarts it. A wait ended by a shutdown that is already in progress never does.
+         *
+         * @return whether a failed bootstrap stops the service.
+         */
+        boolean isExitOnFailure();
+
+        /**
+         * @return the settings of the wait for a PostgreSQL that is not reachable yet.
+         */
+        RetryConfig getRetryConfig();
+
+        /**
+         * The wait for a PostgreSQL that is not reachable yet: exponential backoff from {@link #getMinBackoff()} to
+         * {@link #getMaxBackoff()} with ±20 % jitter, for at most {@link #getMaxDuration()} after the first attempt.
+         */
+        @Immutable
+        interface RetryConfig {
+
+            /**
+             * @return whether unreachable-PostgreSQL failures are retried at all ({@code false}: one attempt).
+             */
+            boolean isEnabled();
+
+            /**
+             * @return the total wait from the first attempt; the last attempt starts no later than this.
+             * {@code Duration.ZERO} means no limit.
+             */
+            Duration getMaxDuration();
+
+            /**
+             * @return the delay after the first failed attempt, positive.
+             */
+            Duration getMinBackoff();
+
+            /**
+             * @return the largest delay between two attempts (before jitter), not shorter than
+             * {@link #getMinBackoff()}.
+             */
+            Duration getMaxBackoff();
+
+            /**
+             * An enumeration of the known config path / default value pairs of {@code RetryConfig}.
+             */
+            enum RetryConfigValue implements KnownConfigValue {
+
+                ENABLED("enabled", true),
+
+                MAX_DURATION("max-duration", Duration.ofSeconds(60L)),
+
+                MIN_BACKOFF("min-backoff", Duration.ofSeconds(1L)),
+
+                MAX_BACKOFF("max-backoff", Duration.ofSeconds(10L));
+
+                private final String path;
+                private final Object defaultValue;
+
+                RetryConfigValue(final String thePath, final Object theDefaultValue) {
+                    path = thePath;
+                    defaultValue = theDefaultValue;
+                }
+
+                @Override
+                public String getConfigPath() {
+                    return path;
+                }
+
+                @Override
+                public Object getDefaultValue() {
+                    return defaultValue;
+                }
+
+            }
+
+        }
+
+        /**
+         * An enumeration of the known config path / default value pairs of {@code BootstrapConfig}.
+         */
+        enum BootstrapConfigValue implements KnownConfigValue {
+
+            ATTEMPT_TIMEOUT("attempt-timeout", Duration.ofSeconds(60L)),
+
+            EXIT_ON_FAILURE("exit-on-failure", true);
+
+            private final String path;
+            private final Object defaultValue;
+
+            BootstrapConfigValue(final String thePath, final Object theDefaultValue) {
                 path = thePath;
                 defaultValue = theDefaultValue;
             }

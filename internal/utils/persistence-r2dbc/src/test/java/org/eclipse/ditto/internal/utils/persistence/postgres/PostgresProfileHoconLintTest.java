@@ -19,9 +19,11 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSchemaBootstrapper;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -34,6 +36,7 @@ import com.typesafe.config.ConfigObject;
 import com.typesafe.config.ConfigParseOptions;
 import com.typesafe.config.ConfigRenderOptions;
 import com.typesafe.config.ConfigResolveOptions;
+import com.typesafe.config.ConfigUtil;
 
 /**
  * HOCON lint over the effective Postgres pg-dev profiles (switchability proof, layer 3).
@@ -497,5 +500,25 @@ public final class PostgresProfileHoconLintTest {
     public void profileSwitchesRememberEntitiesStoreToDdata() {
         final Config profile = ConfigFactory.parseResources("ditto-postgres-persistence.conf").resolve();
         assertThat(profile.getString("pekko.cluster.sharding.remember-entities-store")).isEqualTo("ddata");
+    }
+
+    // --------------------------------------------------
+    // Assertion 7: the profile carries the shared schema-bootstrap block
+    // --------------------------------------------------
+
+    /**
+     * Assertion 7: the profile carries the shared {@code ditto.postgresql.bootstrap} block of the client conf (wait
+     * for an unreachable PostgreSQL at start, then stop the service) and the exit code 1 of its shutdown reason.
+     */
+    @Test
+    public void profileCarriesTheSharedSchemaBootstrapBlock() {
+        final Config profile = ConfigFactory.parseResources("ditto-postgres-persistence.conf").resolve();
+        assertThat(profile.getDuration("ditto.postgresql.bootstrap.attempt-timeout")).isEqualTo(Duration.ofSeconds(60));
+        assertThat(profile.getBoolean("ditto.postgresql.bootstrap.retry.enabled")).isTrue();
+        assertThat(profile.getDuration("ditto.postgresql.bootstrap.retry.max-duration"))
+                .isEqualTo(Duration.ofSeconds(60));
+        assertThat(profile.getBoolean("ditto.postgresql.bootstrap.exit-on-failure")).isTrue();
+        assertThat(profile.getInt(ConfigUtil.joinPath("pekko", "coordinated-shutdown", "reason-overrides",
+                PostgresSchemaBootstrapper.BootstrapFailed.class.getName(), "exit-code"))).isEqualTo(1);
     }
 }

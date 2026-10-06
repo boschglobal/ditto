@@ -75,6 +75,7 @@ public final class DefaultPostgresConfig implements PostgresConfig {
     private final boolean forceCustomPlan;
     private final DefaultPoolConfig poolConfig;
     private final DefaultSslConfig sslConfig;
+    private final DefaultBootstrapConfig bootstrapConfig;
 
     private DefaultPostgresConfig(final ScopedConfig config) {
         uri = config.getString(PostgresConfigValue.URI.getConfigPath());
@@ -98,6 +99,7 @@ public final class DefaultPostgresConfig implements PostgresConfig {
         forceCustomPlan = config.getBoolean(PostgresConfigValue.FORCE_CUSTOM_PLAN.getConfigPath());
         poolConfig = DefaultPoolConfig.of(config);
         sslConfig = DefaultSslConfig.of(config);
+        bootstrapConfig = DefaultBootstrapConfig.of(config);
     }
 
     /**
@@ -163,6 +165,11 @@ public final class DefaultPostgresConfig implements PostgresConfig {
     }
 
     @Override
+    public DefaultBootstrapConfig getBootstrapConfig() {
+        return bootstrapConfig;
+    }
+
+    @Override
     public boolean equals(final Object o) {
         if (this == o) {
             return true;
@@ -180,13 +187,14 @@ public final class DefaultPostgresConfig implements PostgresConfig {
                 schemaSelfHealEnabled == that.schemaSelfHealEnabled &&
                 forceCustomPlan == that.forceCustomPlan &&
                 Objects.equals(poolConfig, that.poolConfig) &&
-                Objects.equals(sslConfig, that.sslConfig);
+                Objects.equals(sslConfig, that.sslConfig) &&
+                Objects.equals(bootstrapConfig, that.bootstrapConfig);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(uri, username, password, poolerMode, connectTimeout, statementTimeout, schemaSelfHealEnabled,
-                forceCustomPlan, poolConfig, sslConfig);
+                forceCustomPlan, poolConfig, sslConfig, bootstrapConfig);
     }
 
     /**
@@ -295,6 +303,7 @@ public final class DefaultPostgresConfig implements PostgresConfig {
                 ", forceCustomPlan=" + forceCustomPlan +
                 ", poolConfig=" + poolConfig +
                 ", sslConfig=" + sslConfig +
+                ", bootstrapConfig=" + bootstrapConfig +
                 "]";
     }
 

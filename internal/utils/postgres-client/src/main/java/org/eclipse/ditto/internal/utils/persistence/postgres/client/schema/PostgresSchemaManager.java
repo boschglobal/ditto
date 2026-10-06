@@ -24,10 +24,12 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -85,7 +87,9 @@ import reactor.core.publisher.Mono;
  * <p>
  * There is deliberately no {@code SELECT indisvalid} rebuild step: invalid indexes only arise from {@code CREATE INDEX
  * CONCURRENTLY}, which is never used here and cannot run in a transaction; plain {@code CREATE INDEX} rolls back
- * cleanly. The bootstrap blocks the calling (startup) thread — it is a one-time step run before any actor starts.
+ * cleanly. The bootstrap blocks the calling (startup) thread — it is a one-time step run before any actor starts. A
+ * manager created with a {@link PostgresConfig.BootstrapConfig} retries it while PostgreSQL is not reachable yet
+ * ({@link #bootstrap(Mono, Mono)}); the runtime self-heal is never retried.
  * </p>
  * <h2>Same-version boots</h2>
  * <p>
@@ -182,12 +186,15 @@ public final class PostgresSchemaManager {
     private final ConnectionFactory ddlConnectionFactory;
     private final PostgresSchemaDescriptor descriptor;
     private final Duration bootstrapTimeout;
+    @Nullable private final PostgresConfig.BootstrapConfig bootstrapConfig;
 
     private PostgresSchemaManager(final ConnectionFactory ddlConnectionFactory,
-            final PostgresSchemaDescriptor descriptor, final Duration bootstrapTimeout) {
+            final PostgresSchemaDescriptor descriptor, final Duration bootstrapTimeout,
+            @Nullable final PostgresConfig.BootstrapConfig bootstrapConfig) {
         this.ddlConnectionFactory = ddlConnectionFactory;
         this.descriptor = validate(Objects.requireNonNull(descriptor, "descriptor"));
         this.bootstrapTimeout = bootstrapTimeout;
+        this.bootstrapConfig = bootstrapConfig;
     }
 
     private static PostgresSchemaDescriptor validate(final PostgresSchemaDescriptor descriptor) {
@@ -209,7 +216,7 @@ public final class PostgresSchemaManager {
      */
     public static PostgresSchemaManager of(final ConnectionFactory ddlConnectionFactory,
             final PostgresSchemaDescriptor descriptor) {
-        return new PostgresSchemaManager(ddlConnectionFactory, descriptor, DEFAULT_BOOTSTRAP_TIMEOUT);
+        return new PostgresSchemaManager(ddlConnectionFactory, descriptor, DEFAULT_BOOTSTRAP_TIMEOUT, null);
     }
 
     /**
@@ -222,7 +229,26 @@ public final class PostgresSchemaManager {
      */
     public static PostgresSchemaManager of(final ConnectionFactory ddlConnectionFactory,
             final PostgresSchemaDescriptor descriptor, final Duration bootstrapTimeout) {
-        return new PostgresSchemaManager(ddlConnectionFactory, descriptor, bootstrapTimeout);
+        return new PostgresSchemaManager(ddlConnectionFactory, descriptor, bootstrapTimeout, null);
+    }
+
+    /**
+     * Creates a schema manager whose bootstrap waits for a PostgreSQL that is not reachable yet, as configured
+     * ({@code ditto.postgresql.bootstrap}): every attempt is bounded by the attempt timeout, failures that mean "not
+     * reachable or not ready (yet)" are retried with backoff within the retry budget, and every other failure ends the
+     * bootstrap at once. The production entry point is
+     * {@code org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSchemaBootstrapper}.
+     *
+     * @param ddlConnectionFactory a connection factory authenticated as the schema-owning DDL role.
+     * @param descriptor the component schema to bootstrap.
+     * @param bootstrapConfig the attempt timeout and retry settings.
+     * @return the manager.
+     */
+    public static PostgresSchemaManager of(final ConnectionFactory ddlConnectionFactory,
+            final PostgresSchemaDescriptor descriptor, final PostgresConfig.BootstrapConfig bootstrapConfig) {
+        Objects.requireNonNull(bootstrapConfig, "bootstrapConfig");
+        return new PostgresSchemaManager(ddlConnectionFactory, descriptor, bootstrapConfig.getAttemptTimeout(),
+                bootstrapConfig);
     }
 
     /**
@@ -262,13 +288,51 @@ public final class PostgresSchemaManager {
     }
 
     /**
-     * Runs the bootstrap synchronously, blocking until commit or failure.
+     * Runs the bootstrap synchronously, blocking until commit or failure. A manager created without a
+     * {@link PostgresConfig.BootstrapConfig} makes exactly one attempt bounded by its bootstrap timeout (unchanged);
+     * one created with it runs {@link #bootstrap(Mono, Mono)} without precondition and abort signal.
      *
      * @throws SchemaBootException on a same-version checksum mismatch, a newer stored version this code is not
      * compatible with, or a live-catalog divergence (refuse to boot).
      */
     public void bootstrap() {
-        final BootstrapOutcome outcome = bootstrapWithOutcome().block(bootstrapTimeout);
+        if (bootstrapConfig != null) {
+            bootstrap(Mono.empty(), Mono.never());
+        } else {
+            logOutcome(bootstrapWithOutcome(new AtomicBoolean()).block(bootstrapTimeout));
+        }
+    }
+
+    /**
+     * Runs the bootstrap synchronously with the configured retry (see
+     * {@link #of(ConnectionFactory, PostgresSchemaDescriptor, PostgresConfig.BootstrapConfig)}). The unit that is
+     * retried is the whole single-transaction bootstrap on a fresh connection, preceded by {@code precondition}; a
+     * failed attempt has rolled back completely, so the next attempt reads the {@code schema_version} row and decides
+     * again.
+     *
+     * @param precondition subscribed at the start of every attempt, before the bootstrap's connection is opened and
+     * inside the attempt timeout, e.g. a check of database prerequisites; its failures are classified like the
+     * bootstrap's own. It must be lazy, since it is re-subscribed for every attempt.
+     * @param abortSignal completing it ends the wait at once, cancelling an attempt in flight.
+     * @throws IllegalStateException if the manager was created without a {@link PostgresConfig.BootstrapConfig}.
+     * @throws SchemaBootException on a refusal to boot; never retried.
+     * @throws SchemaBootstrapUnavailableException when PostgreSQL stayed unreachable for the whole retry budget.
+     * @throws SchemaBootstrapTimeoutException when an attempt did not finish within the attempt timeout.
+     * @throws SchemaBootstrapAbortedException when {@code abortSignal} completed first.
+     */
+    public void bootstrap(final Mono<Void> precondition, final Mono<Void> abortSignal) {
+        if (bootstrapConfig == null) {
+            throw new IllegalStateException("The PostgreSQL schema manager of component '" + descriptor.component()
+                    + "' has no bootstrap configuration; create it with a BootstrapConfig to bootstrap with retries.");
+        }
+        final AtomicBoolean serverVersionChecked = new AtomicBoolean();
+        logOutcome(SchemaBootstrapRetry.of(descriptor.component(), bootstrapConfig)
+                .run(() -> precondition.then(Mono.defer(() -> bootstrapWithOutcome(serverVersionChecked))),
+                        abortSignal)
+                .block());
+    }
+
+    private void logOutcome(@Nullable final BootstrapOutcome outcome) {
         if (outcome != null && outcome.decision() == SchemaVersionDecision.COMPATIBLE_NEWER) {
             LOGGER.info("PostgreSQL schema bootstrap complete for component '{}': running against the newer, "
                             + "compatible stored schema version {} (code version {}); no DDL run, schema_version row "
@@ -288,13 +352,13 @@ public final class PostgresSchemaManager {
      * @return the bootstrap as a reactive pipeline (single transaction, released on every terminal path).
      */
     public Mono<Void> bootstrapReactive() {
-        return bootstrapWithOutcome().then();
+        return bootstrapWithOutcome(new AtomicBoolean()).then();
     }
 
-    private Mono<BootstrapOutcome> bootstrapWithOutcome() {
+    private Mono<BootstrapOutcome> bootstrapWithOutcome(final AtomicBoolean serverVersionChecked) {
         return Mono.usingWhen(
                 Mono.from(ddlConnectionFactory.create()),
-                this::bootstrapWithin,
+                connection -> bootstrapWithin(connection, serverVersionChecked),
                 Connection::close);
     }
 
@@ -368,11 +432,15 @@ public final class PostgresSchemaManager {
                         .then(Mono.error(error)));
     }
 
-    private Mono<BootstrapOutcome> bootstrapWithin(final Connection connection) {
+    private Mono<BootstrapOutcome> bootstrapWithin(final Connection connection,
+            final AtomicBoolean serverVersionChecked) {
         final String expectedChecksum = checksum(descriptor);
-        // 0) server version: WARN below PostgreSQL 16; never fails, and runs before the transaction so that even a
-        //    failing SHOW cannot abort it.
-        return checkServerVersion(connection, descriptor.component())
+        // 0) server version: WARN below PostgreSQL 16, once per bootstrap call even when attempts are retried; never
+        //    fails, and runs before the transaction so that even a failing SHOW cannot abort it.
+        final Mono<Void> serverVersionCheck = serverVersionChecked.compareAndSet(false, true)
+                ? checkServerVersion(connection, descriptor.component())
+                : Mono.empty();
+        return serverVersionCheck
                 .then(Mono.defer(() -> Mono.from(connection.beginTransaction())))
                 // 1) transaction-scoped advisory lock — serialises concurrent first-boot DDL across the cluster.
                 .then(executeUpdate(connection, "SELECT pg_advisory_xact_lock($1)", ADVISORY_LOCK_KEY))

@@ -15,6 +15,7 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.search;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.net.ConnectException;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
@@ -26,6 +27,7 @@ import org.eclipse.ditto.internal.utils.config.ScopedConfig;
 import org.eclipse.ditto.internal.utils.health.RetrieveHealth;
 import org.eclipse.ditto.internal.utils.health.StatusInfo;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresHealthChecker;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootstrapUnavailableException;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.PostgresDeleteAtReaperActor;
 import org.eclipse.ditto.thingsearch.persistence.api.SearchPersistenceProvider;
 import org.eclipse.ditto.thingsearch.persistence.api.ThingsSearchUpdaterPersistence;
@@ -35,6 +37,8 @@ import org.junit.Test;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+
+import io.r2dbc.spi.R2dbcException;
 
 /**
  * Unit tests for {@link PostgresSearchPersistenceProvider}: extension resolution via the shipped opt-in profile,
@@ -134,10 +138,15 @@ public final class PostgresSearchPersistenceProviderTest {
     public void bootstrapSchemaFailsFastAgainstAnUnreachableDatabase() {
         // Point at a closed port with SSL disabled so the connect (not the SSL boot-guard) is what fails: proves
         // bootstrapSchema() is synchronous and throws rather than silently returning against an unusable database.
+        // With the retry disabled it makes exactly one attempt. username/password are non-blank so that the connect
+        // is reached at all (see healthCheckActorReportsDownWithoutCrashingWhenTheDatabaseIsUnreachable).
         final Config unreachable = ConfigFactory.parseString(
-                        "ditto.postgresql.uri = \"r2dbc:postgresql://localhost:1/ditto\"\n"
+                        "ditto.postgresql.uri = \"r2dbc:postgresql://127.0.0.1:1/ditto\"\n"
                                 + "ditto.postgresql.ssl.mode = \"disable\"\n"
-                                + "ditto.postgresql.connect-timeout = 1s\n")
+                                + "ditto.postgresql.connect-timeout = 1s\n"
+                                + "ditto.postgresql.username = \"test\"\n"
+                                + "ditto.postgresql.password = \"test\"\n"
+                                + "ditto.postgresql.bootstrap.retry.enabled = false\n")
                 .withFallback(config);
         final ActorSystem unreachableSystem = ActorSystem.create("unreachablePgSearch", unreachable);
         try {
@@ -145,7 +154,33 @@ public final class PostgresSearchPersistenceProviderTest {
                     new PostgresSearchPersistenceProvider(unreachableSystem, ConfigFactory.empty());
             assertThatThrownBy(provider::bootstrapSchema)
                     .as("bootstrapSchema must fail fast (throw) when the database is unreachable")
-                    .isInstanceOf(RuntimeException.class);
+                    .isInstanceOf(R2dbcException.class)
+                    .hasRootCauseInstanceOf(ConnectException.class);
+        } finally {
+            TestKit.shutdownActorSystem(unreachableSystem);
+        }
+    }
+
+    @Test
+    public void bootstrapSchemaGivesUpAfterTheRetryBudgetAgainstAnUnreachableDatabase() {
+        // The database prerequisites check is the first database contact of every attempt, so it is retried as well.
+        final Config unreachable = ConfigFactory.parseString(
+                        "ditto.postgresql.uri = \"r2dbc:postgresql://127.0.0.1:1/ditto\"\n"
+                                + "ditto.postgresql.ssl.mode = \"disable\"\n"
+                                + "ditto.postgresql.connect-timeout = 1s\n"
+                                + "ditto.postgresql.username = \"test\"\n"
+                                + "ditto.postgresql.password = \"test\"\n"
+                                + "ditto.postgresql.bootstrap.retry { max-duration = 1s, min-backoff = 100ms, "
+                                + "max-backoff = 200ms }\n")
+                .withFallback(config);
+        final ActorSystem unreachableSystem = ActorSystem.create("unreachablePgSearchRetried", unreachable);
+        try {
+            final PostgresSearchPersistenceProvider provider =
+                    new PostgresSearchPersistenceProvider(unreachableSystem, ConfigFactory.empty());
+            final long start = System.nanoTime();
+            assertThatThrownBy(provider::bootstrapSchema).isInstanceOf(SchemaBootstrapUnavailableException.class);
+            assertThat(Duration.ofNanos(System.nanoTime() - start))
+                    .isBetween(Duration.ofSeconds(1), Duration.ofSeconds(5));
         } finally {
             TestKit.shutdownActorSystem(unreachableSystem);
         }

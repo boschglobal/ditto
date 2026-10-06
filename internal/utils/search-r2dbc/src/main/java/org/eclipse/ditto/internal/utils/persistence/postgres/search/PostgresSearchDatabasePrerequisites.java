@@ -12,7 +12,6 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres.search;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -28,8 +27,9 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
- * The database prerequisites of the PostgreSQL search schema that its DDL cannot check, verified at every start
- * before the schema bootstrap ({@link PostgresSearchPersistenceProvider#bootstrapSchema()}):
+ * The database prerequisites of the PostgreSQL search schema that its DDL cannot check, verified at the start of every
+ * schema-bootstrap attempt, before the bootstrap touches the database
+ * ({@link PostgresSearchPersistenceProvider#bootstrapSchema()}):
  * <ul>
  *     <li>the database encoding is {@code UTF8};</li>
  *     <li>the libc collation {@value PostgresSearchSchema#TRIGRAM_INDEX_COLLATION} exists for that encoding: the
@@ -65,30 +65,33 @@ final class PostgresSearchDatabasePrerequisites {
             + "FROM pg_database d WHERE d.datname = current_database()";
 
     private static final String REQUIRED_ENCODING = "UTF8";
-    private static final Duration TIMEOUT = Duration.ofSeconds(60L);
 
     private PostgresSearchDatabasePrerequisites() {
         throw new AssertionError();
     }
 
     /**
-     * Reads the facts of the database the given factory connects to and refuses it if it misses a prerequisite.
+     * Reads the facts of the database the given factory connects to and refuses it if it misses a prerequisite. Lazy:
+     * every subscription opens its own connection (the schema bootstrap subscribes once per attempt).
      *
      * @param ddlConnectionFactory the search schema's DDL connection factory.
-     * @throws SchemaBootException naming every unmet prerequisite and the remedy.
+     * @return completes when the database meets every prerequisite; fails with a {@link SchemaBootException} naming
+     * every unmet prerequisite and the remedy.
      */
-    static void verify(final ConnectionFactory ddlConnectionFactory) {
-        final Facts facts = Mono.usingWhen(Mono.from(ddlConnectionFactory.create()),
+    static Mono<Void> verify(final ConnectionFactory ddlConnectionFactory) {
+        return Mono.defer(() -> Mono.usingWhen(Mono.from(ddlConnectionFactory.create()),
                         PostgresSearchDatabasePrerequisites::read,
-                        Connection::close)
-                .block(TIMEOUT);
-        final Optional<String> refusal = refusal(facts);
-        if (refusal.isPresent()) {
-            throw new SchemaBootException(refusal.get());
-        }
-        LOGGER.debug("PostgreSQL search database '{}' (encoding {}, LC_CTYPE {}) has the collation \"{}\" and a UTF-8 "
-                        + "ctype.", facts.database(), facts.encoding(), facts.ctype(),
-                PostgresSearchSchema.TRIGRAM_INDEX_COLLATION);
+                        Connection::close))
+                .flatMap(facts -> {
+                    final Optional<String> refusal = refusal(facts);
+                    if (refusal.isPresent()) {
+                        return Mono.error(new SchemaBootException(refusal.get()));
+                    }
+                    LOGGER.debug("PostgreSQL search database '{}' (encoding {}, LC_CTYPE {}) has the collation "
+                                    + "\"{}\" and a UTF-8 ctype.", facts.database(), facts.encoding(), facts.ctype(),
+                            PostgresSearchSchema.TRIGRAM_INDEX_COLLATION);
+                    return Mono.empty();
+                });
     }
 
     private static Mono<Facts> read(final Connection connection) {

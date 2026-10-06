@@ -209,9 +209,11 @@ public interface PersistenceBackendProvider extends DittoExtensionPoint {
      * This is the single production entry point a service's {@code RootActor} calls exactly once during boot,
      * <em>before</em> {@link #getReadJournal()} and before the persistent-actor shard regions are started. A backend
      * with a managed, code-owned schema (e.g. PostgreSQL) creates and verifies its tables here so a fresh database is
-     * usable on first journal write rather than failing with {@code relation does not exist}. The call MUST fail fast
-     * (throw) when the schema cannot be established, so a service refuses to serve traffic against a database whose
-     * tables are absent and were never bootstrapped.
+     * usable on first journal write rather than failing with {@code relation does not exist}. The call blocks until
+     * the schema is established. While the database is not reachable yet, it may wait for a bounded,
+     * backend-configured time (PostgreSQL: {@code ditto.postgresql.bootstrap}); it MUST throw on any other failure and
+     * when that wait is exhausted, so a service refuses to serve traffic against a database whose tables are absent
+     * and were never bootstrapped.
      * </p>
      * <p>
      * The default implementation is a no-op: backends whose schema is managed by the storage engine itself (e.g.

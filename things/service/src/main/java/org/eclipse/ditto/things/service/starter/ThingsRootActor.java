@@ -121,8 +121,9 @@ public final class ThingsRootActor extends DittoRootActor {
         final PersistenceBackendProvider backendProvider =
                 PersistenceBackendProvider.get(actorSystem, ScopedConfig.dittoExtension(actorSystem.settings().config()));
         // Bootstrap the persistence backend's schema BEFORE the read journal / persistent-actor shard region start.
-        // Mongo is a no-op (default); Postgres creates+verifies its tables and throws on failure, failing boot fast so
-        // the service never serves traffic against a database whose tables are absent and were never bootstrapped.
+        // Mongo is a no-op (default); Postgres creates+verifies its tables, waits a bounded, configured time while the
+        // database is not reachable yet, and throws on any other failure, so the service never serves traffic against
+        // a database whose tables are absent and were never bootstrapped.
         backendProvider.bootstrapSchema();
         final DittoReadJournal readJournal = backendProvider.getReadJournal();
         // Boot-time active-backend self-check (switchability proof, layer 2): fail fast if the deployment HOCON wires

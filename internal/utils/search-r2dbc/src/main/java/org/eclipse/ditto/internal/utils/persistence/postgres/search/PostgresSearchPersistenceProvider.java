@@ -28,13 +28,12 @@ import org.apache.pekko.actor.Props;
 import org.eclipse.ditto.base.service.config.ThrottlingConfig;
 import org.eclipse.ditto.base.service.config.limits.LimitsConfig;
 import org.eclipse.ditto.internal.utils.pekko.streaming.TimestampPersistence;
-import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresClientExtension;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresHealthChecker;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.PostgresSchemaBootstrapper;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
-import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.DefaultPostgresSearchPathIndexConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexMaintenance;
@@ -68,11 +67,8 @@ import com.typesafe.config.ConfigObject;
 import com.typesafe.config.ConfigValue;
 import com.typesafe.config.ConfigValueType;
 
-import io.r2dbc.spi.Closeable;
-import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcException;
 import reactor.core.Disposable;
-import reactor.core.publisher.Mono;
 
 /**
  * PostgreSQL-backed implementation of {@link SearchPersistenceProvider} — the OPT-IN things-search backend, selected by
@@ -164,17 +160,17 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
 
     @Override
     public void bootstrapSchema() {
-        // SYNCHRONOUS, fail-fast (SPI contract): the service must refuse to serve traffic against an unusable index.
+        // Synchronous (SPI contract): waits a bounded time while PostgreSQL is not reachable yet, throws on anything
+        // else, so the service never serves traffic against an unusable index.
         final PostgresConfig config = postgresConfig();
         // Validated before any database work: an invalid per-path index entry fails the start with a config error.
         final PostgresSearchPathIndexConfig pathIndexConfig = DefaultPostgresSearchPathIndexConfig.of(
                 actorSystem.settings().config().getConfig("ditto"), simpleFieldMappings());
-        final ConnectionFactory ddlConnectionFactory = ConnectionPoolFactory.createDdlConnectionFactory(config);
         try {
-            // Refuses a database the search schema cannot work correctly on (encoding, LC_CTYPE, the "C.utf8"
-            // collation) before the bootstrap touches it — at every start, also when the schema is up to date.
-            PostgresSearchDatabasePrerequisites.verify(ddlConnectionFactory);
-            PostgresSchemaManager.of(ddlConnectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+            // Every bootstrap attempt first refuses a database the search schema cannot work correctly on (encoding,
+            // LC_CTYPE, the "C.utf8" collation) — at every start, also when the schema is up to date.
+            PostgresSchemaBootstrapper.bootstrap(actorSystem, config, PostgresSearchSchema.descriptor(),
+                    PostgresSearchDatabasePrerequisites::verify);
         } catch (final SchemaBootException e) {
             // A refusal is already actionable; its text mentions pg_trgm, so it must not be re-classified below.
             throw e;
@@ -187,8 +183,6 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
                         + "superuser pre-install it once: CREATE EXTENSION IF NOT EXISTS pg_trgm;", e);
             }
             throw e;
-        } finally {
-            disposeQuietly(ddlConnectionFactory);
         }
         // Register the search schema with the shared client's runtime self-heal: a statement hitting a missing table
         // (42P01) then recreates exactly this descriptor's tables and retries. Registration is here, after a
@@ -229,21 +223,6 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
     @Nullable
     CompletableFuture<PathIndexMaintenance.Outcome> pathIndexMaintenanceOutcome() {
         return pathIndexMaintenanceOutcome;
-    }
-
-    private static void disposeQuietly(final ConnectionFactory ddlConnectionFactory) {
-        // The DDL factory is a one-shot, non-pooled factory; r2dbc factories implement Closeable.close() which returns
-        // a Publisher. Subscribe so it actually closes, but never let a close failure mask a bootstrap outcome.
-        if (ddlConnectionFactory instanceof Closeable closeable) {
-            try {
-                Mono.from(closeable.close()).onErrorResume(error -> {
-                    LOGGER.warn("Failed to close the DDL connection factory after search schema bootstrap.", error);
-                    return Mono.empty();
-                }).block();
-            } catch (final RuntimeException e) {
-                LOGGER.warn("Failed to close the DDL connection factory after search schema bootstrap.", e);
-            }
-        }
     }
 
     @Override

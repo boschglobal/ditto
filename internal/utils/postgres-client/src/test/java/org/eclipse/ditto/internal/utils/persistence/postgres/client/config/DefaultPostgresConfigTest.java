@@ -49,6 +49,8 @@ public final class DefaultPostgresConfigTest {
         EqualsVerifier.forClass(DefaultPoolConfig.class).usingGetClass().verify();
         EqualsVerifier.forClass(DefaultSslConfig.class).usingGetClass().verify();
         EqualsVerifier.forClass(DefaultDdlCredentialsConfig.class).usingGetClass().verify();
+        EqualsVerifier.forClass(DefaultBootstrapConfig.class).usingGetClass().verify();
+        EqualsVerifier.forClass(DefaultBootstrapRetryConfig.class).usingGetClass().verify();
     }
 
     @Test
@@ -81,6 +83,18 @@ public final class DefaultPostgresConfigTest {
         softly.assertThat(ssl.getMode()).as("ssl.mode").isEqualTo("verify-full");
         softly.assertThat(ssl.getRootCert()).as("ssl.root-cert").isEmpty();
         softly.assertThat(ssl.isAllowSystemTruststore()).as("ssl.allow-system-truststore").isFalse();
+
+        final PostgresConfig.BootstrapConfig bootstrap = underTest.getBootstrapConfig();
+        softly.assertThat(bootstrap.getAttemptTimeout()).as("bootstrap.attempt-timeout")
+                .isEqualTo(Duration.ofSeconds(60));
+        softly.assertThat(bootstrap.isExitOnFailure()).as("bootstrap.exit-on-failure").isTrue();
+        softly.assertThat(bootstrap.getRetryConfig().isEnabled()).as("bootstrap.retry.enabled").isTrue();
+        softly.assertThat(bootstrap.getRetryConfig().getMaxDuration()).as("bootstrap.retry.max-duration")
+                .isEqualTo(Duration.ofSeconds(60));
+        softly.assertThat(bootstrap.getRetryConfig().getMinBackoff()).as("bootstrap.retry.min-backoff")
+                .isEqualTo(Duration.ofSeconds(1));
+        softly.assertThat(bootstrap.getRetryConfig().getMaxBackoff()).as("bootstrap.retry.max-backoff")
+                .isEqualTo(Duration.ofSeconds(10));
     }
 
     @Test
@@ -118,6 +132,43 @@ public final class DefaultPostgresConfigTest {
         softly.assertThat(ssl.getKey()).as("ssl.key").contains("/etc/ditto/pg-tls/client.key");
         softly.assertThat(ssl.getKeyPassword()).as("ssl.key-password").contains("key_secret");
         softly.assertThat(ssl.isAllowSystemTruststore()).as("ssl.allow-system-truststore").isFalse();
+
+        final PostgresConfig.BootstrapConfig bootstrap = underTest.getBootstrapConfig();
+        softly.assertThat(bootstrap.getAttemptTimeout()).as("bootstrap.attempt-timeout")
+                .isEqualTo(Duration.ofSeconds(13));
+        softly.assertThat(bootstrap.isExitOnFailure()).as("bootstrap.exit-on-failure").isFalse();
+        softly.assertThat(bootstrap.getRetryConfig().isEnabled()).as("bootstrap.retry.enabled").isFalse();
+        softly.assertThat(bootstrap.getRetryConfig().getMaxDuration()).as("bootstrap.retry.max-duration")
+                .isEqualTo(Duration.ZERO);
+        softly.assertThat(bootstrap.getRetryConfig().getMinBackoff()).as("bootstrap.retry.min-backoff")
+                .isEqualTo(Duration.ofMillis(250));
+        softly.assertThat(bootstrap.getRetryConfig().getMaxBackoff()).as("bootstrap.retry.max-backoff")
+                .isEqualTo(Duration.ofSeconds(3));
+    }
+
+    @Test
+    public void bootstrapRetrySettingsAreReadFromTheNestedBlocks() {
+        final PostgresConfig.BootstrapConfig bootstrap = bootstrapConfigOf("retry.max-duration = 5m");
+        assertThat(bootstrap.getRetryConfig().getMaxDuration()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(bootstrap.getRetryConfig().getMinBackoff()).as("unset keys keep their defaults")
+                .isEqualTo(Duration.ofSeconds(1));
+    }
+
+    @Test
+    public void invalidBootstrapDurationsAreConfigErrors() {
+        assertThatThrownBy(() -> bootstrapConfigOf("attempt-timeout = 0s"))
+                .isInstanceOf(DittoConfigError.class).hasMessageContaining("attempt-timeout");
+        assertThatThrownBy(() -> bootstrapConfigOf("retry.min-backoff = 0s"))
+                .isInstanceOf(DittoConfigError.class).hasMessageContaining("min-backoff");
+        assertThatThrownBy(() -> bootstrapConfigOf("retry.max-duration = -1s"))
+                .isInstanceOf(DittoConfigError.class).hasMessageContaining("max-duration");
+        assertThatThrownBy(() -> bootstrapConfigOf("retry { min-backoff = 5s, max-backoff = 2s }"))
+                .isInstanceOf(DittoConfigError.class).hasMessageContaining("max-backoff");
+    }
+
+    private static PostgresConfig.BootstrapConfig bootstrapConfigOf(final String bootstrapBlock) {
+        return DefaultPostgresConfig.of(ConfigFactory.parseString("postgresql.bootstrap {\n" + bootstrapBlock + "\n}"))
+                .getBootstrapConfig();
     }
 
     @Test

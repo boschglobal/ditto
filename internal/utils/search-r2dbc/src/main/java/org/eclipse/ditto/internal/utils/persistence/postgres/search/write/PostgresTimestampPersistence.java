@@ -49,9 +49,10 @@ import reactor.core.publisher.Mono;
  * </p>
  * <p>
  * <strong>Initialization guarantee:</strong> the {@code search_sync (id, ts, tag)} table is created by the provider's
- * synchronous, fail-fast {@code bootstrapSchema()} (SPI contract) before any read/write is served — the same guarantee
- * Mongo's {@code initializedInstance} gives by creating the capped collection. This persistence therefore performs NO
- * per-instance initialization; it only reads/writes the already-provisioned row.
+ * synchronous {@code bootstrapSchema()} (SPI contract: it throws rather than return without the schema) before any
+ * read/write is served — the same guarantee Mongo's {@code initializedInstance} gives by creating the capped
+ * collection. This persistence therefore performs NO per-instance initialization; it only reads/writes the
+ * already-provisioned row.
  * </p>
  *
  * @since 3.10.0

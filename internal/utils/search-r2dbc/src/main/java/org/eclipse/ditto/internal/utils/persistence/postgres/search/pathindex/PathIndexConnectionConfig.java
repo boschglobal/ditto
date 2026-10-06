@@ -121,4 +121,9 @@ final class PathIndexConnectionConfig implements PostgresConfig {
         return delegate.getSslConfig();
     }
 
+    @Override
+    public BootstrapConfig getBootstrapConfig() {
+        return delegate.getBootstrapConfig();
+    }
+
 }

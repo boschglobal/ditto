@@ -48,9 +48,11 @@ import com.typesafe.config.Config;
 public interface SearchPersistenceProvider extends DittoExtensionPoint {
 
     /**
-     * Bootstraps the backend's search schema/indices, if any, before any search read/write happens. SYNCHRONOUS
-     * and fail-fast: it MUST throw if the schema/indices cannot be established, so the service refuses to serve
-     * traffic against an unusable index. The Mongo implementation performs index initialization here.
+     * Bootstraps the backend's search schema/indices, if any, before any search read/write happens. SYNCHRONOUS: it
+     * blocks until the schema/indices are established and MUST throw if they cannot be, so the service refuses to
+     * serve traffic against an unusable index. While the database is not reachable yet, a backend may wait for a
+     * bounded, configured time before it throws (PostgreSQL: {@code ditto.postgresql.bootstrap}). The Mongo
+     * implementation performs index initialization here.
      *
      * @throws RuntimeException if the schema/indices cannot be bootstrapped (boot must fail).
      */

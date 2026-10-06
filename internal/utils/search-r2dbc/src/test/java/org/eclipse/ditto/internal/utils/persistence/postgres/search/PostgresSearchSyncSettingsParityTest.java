@@ -59,7 +59,12 @@ public final class PostgresSearchSyncSettingsParityTest {
         final Config overlay = ConfigFactory.parseResources("ditto-postgres-search.conf");
 
         // root().get(...) is a plain map lookup and works on the unresolved overlay (its ${?POSTGRES_*} are open)
-        assertThat(overlay.root().keySet()).containsExactly("ditto");
+        assertThat(overlay.root().keySet()).containsExactlyInAnyOrder("ditto", "pekko");
+        final ConfigObject pekko = (ConfigObject) overlay.root().get("pekko");
+        assertThat(pekko.keySet())
+                .as("outside ditto.*, the Postgres client config only sets the exit code of its own shutdown reason")
+                .containsExactly("coordinated-shutdown");
+        assertThat(((ConfigObject) pekko.get("coordinated-shutdown")).keySet()).containsExactly("reason-overrides");
         final ConfigObject ditto = (ConfigObject) overlay.root().get("ditto");
         assertThat(ditto.keySet())
                 .as("the opt-in profile may only swap the provider and carry Postgres client config")
