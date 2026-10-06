@@ -90,8 +90,9 @@ public final class PostgresSearchProfileHoconLintTest {
         assertThat(config.hasPath("ditto.postgresql.uri")).isTrue();
         assertThat(config.hasPath("ditto.postgresql.pool.max-size")).isTrue();
         assertThat(config.getInt("ditto.postgresql.pool.max-size"))
-                .as("the shared client default (postgres-client's ditto-postgres-client.conf) must resolve")
-                .isEqualTo(100);
+                .as("the shared client default (postgres-client's ditto-postgres-client.conf) must resolve; the "
+                        + "search service has its own pool of this size, counted in the connection budget")
+                .isEqualTo(25);
         assertThat(config.hasPath("ditto.postgresql.ssl.mode")).isTrue();
     }
 

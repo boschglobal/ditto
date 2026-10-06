@@ -107,7 +107,7 @@ Two `include` rules are load-bearing:
 | `POSTGRES_DDL_USER` | no | *(reuse runtime)* | Role used for DDL during schema bootstrap |
 | `POSTGRES_DDL_PASSWORD` | no | *(reuse runtime)* | DDL role password |
 | `POSTGRES_SSL_MODE` | no | `verify-full` | SSL verification mode; use `disable` for local plaintext |
-| `POSTGRES_POOL_MAX_SIZE` | no | `100` | Maximum connections in the R2DBC pool |
+| `POSTGRES_POOL_MAX_SIZE` | no | `25` | Connections per service instance (journal, snapshot store and read journal share one pool). Keep Σ ((replicas + maxSurge) × max-size) over all PostgreSQL-backed services plus reserved connections ≤ `max_connections` (a rolling update adds `maxSurge` pods per service); see `deployment/postgres/README.md`, "Connection budget" |
 | `POSTGRES_POOL_MAX_ACQUIRE_TIME` | no | `4s` | Maximum wait for a pooled connection. Keep `(1 + acquire-retry) × max-acquire-time` below the 5 s caller deadline, or a write can commit after its caller was told it failed |
 | `POSTGRES_POOL_ACQUIRE_RETRY` | no | `0` | Acquire retries; each re-runs the full `max-acquire-time`. Keep `0` |
 | `POSTGRES_POOL_PENDING_ACQUIRE_MAX_SIZE` | no | *(2 × max-size)* | Borrowers allowed to wait once the pool is full; beyond it they fail immediately ("pool overload"). `-1` = unbounded (discouraged) |

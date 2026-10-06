@@ -44,7 +44,7 @@ public final class PostgresPersistenceConfIncludeIdentityTest {
 
         assertThat(config.getString("ditto.postgresql.uri")).isEqualTo("r2dbc:postgresql://localhost:5432/ditto");
         assertThat(config.getString("ditto.postgresql.pooler-mode")).isEqualTo("direct");
-        assertThat(config.getInt("ditto.postgresql.pool.max-size")).isEqualTo(100);
+        assertThat(config.getInt("ditto.postgresql.pool.max-size")).isEqualTo(25);
         assertThat(config.getInt("ditto.postgresql.pool.fetch-size")).isEqualTo(0);
         assertThat(config.getInt("ditto.postgresql.pool.prepared-statement-cache-queries")).isEqualTo(0);
         assertThat(config.getString("ditto.postgresql.ssl.mode")).isEqualTo("verify-full");

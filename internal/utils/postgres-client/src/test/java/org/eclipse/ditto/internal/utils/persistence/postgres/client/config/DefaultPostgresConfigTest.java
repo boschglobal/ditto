@@ -66,12 +66,12 @@ public final class DefaultPostgresConfigTest {
 
         final PostgresConfig.PoolConfig pool = underTest.getPoolConfig();
         softly.assertThat(pool.getInitialSize()).as("pool.initial-size").isEqualTo(0);
-        softly.assertThat(pool.getMaxSize()).as("pool.max-size").isEqualTo(100);
+        softly.assertThat(pool.getMaxSize()).as("pool.max-size").isEqualTo(25);
         softly.assertThat(pool.getMaxAcquireTime()).as("pool.max-acquire-time").isEqualTo(Duration.ofSeconds(4));
         softly.assertThat(pool.getAcquireRetry()).as("pool.acquire-retry").isEqualTo(0);
         softly.assertThat(pool.getPendingAcquireMaxSize())
                 .as("pool.pending-acquire-max-size derived as 2 x max-size when unset")
-                .isEqualTo(200);
+                .isEqualTo(50);
         softly.assertThat(pool.getFetchSize()).as("pool.fetch-size").isEqualTo(0);
         softly.assertThat(pool.getPreparedStatementCacheQueries())
                 .as("pool.prepared-statement-cache-queries").isEqualTo(0);

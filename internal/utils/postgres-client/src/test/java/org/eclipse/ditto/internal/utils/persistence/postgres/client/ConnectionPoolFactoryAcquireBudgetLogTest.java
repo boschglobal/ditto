@@ -85,7 +85,7 @@ public final class ConnectionPoolFactoryAcquireBudgetLogTest {
         assertThat(infos().get(0).getFormattedMessage())
                 .as("summary names the effective acquire budget and the pending bound")
                 .contains("effective acquire budget=4000ms")
-                .contains("pending-acquire-max-size=200")
+                .contains("max-size=25, pending-acquire-max-size=50")
                 .contains("connect-timeout=2000ms");
     }
 

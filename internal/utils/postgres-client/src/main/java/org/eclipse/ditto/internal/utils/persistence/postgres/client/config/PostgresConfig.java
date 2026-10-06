@@ -23,7 +23,9 @@ import org.eclipse.ditto.internal.utils.config.KnownConfigValue;
  * Provides the configuration settings of the PostgreSQL (R2DBC) persistence backend.
  * <p>
  * Lives under the HOCON namespace {@code ditto.postgresql.{uri, pooler-mode, pool.*, ssl.*}}. Defaults:
- * {@code pool.max-size=100} (intended to be overridden per service and validated under load, not a hardcoded guess),
+ * {@code pool.max-size=25} (connections per service instance; the sum over all replicas of all PostgreSQL-backed
+ * services, the extra pods of a rolling update included, must fit {@code max_connections}, see
+ * {@code ditto-postgres-client.conf}; confirm under load),
  * {@code fetch-size=0}, {@code prepared-statement-cache-queries=0} and {@code ssl.mode=verify-full}. The pool-overload
  * settings deliberately do NOT mirror Mongo's 30 s wait: {@code pool.max-acquire-time=4s} with
  * {@code pool.acquire-retry=0}, {@code connect-timeout=2s} and a pending-acquire queue bounded at
@@ -218,7 +220,7 @@ public interface PostgresConfig {
 
             INITIAL_SIZE("initial-size", 0),
 
-            MAX_SIZE("max-size", 100),
+            MAX_SIZE("max-size", 25),
 
             MAX_ACQUIRE_TIME("max-acquire-time", Duration.ofSeconds(4L)),
 

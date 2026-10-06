@@ -15,8 +15,11 @@
 Operational artifacts for the phase-2 PostgreSQL persistence backend (custom
 Pekko plugin on the r2dbc driver). For the design see
 `docs/superpowers/specs/postgres-persistence-backend.md` — §7 (HOCON config),
-§11 (role privileges + schema). `thingsearch` stays on MongoDB; only `policies`,
-`things` and `connectivity` use this backend.
+§11 (role privileges + schema). `policies`, `things` and `connectivity` use this
+backend; `thingsearch` can use the separate PostgreSQL search backend
+(`documentation/src/main/resources/pages/ditto/installation-extending.md`), which
+shares the client and pool settings and counts toward the same
+[connection budget](#connection-budget).
 
 Contents:
 
@@ -33,6 +36,118 @@ bootstrap reads `server_version_num`; on an older server it logs a WARN and
 still starts. Technically, the persistence backend needs PostgreSQL ≥ 10 and
 the search backend PostgreSQL ≥ 13 (from 13 on `pg_trgm` is a trusted
 extension, so the DDL role can create it without superuser).
+
+## Connection budget
+
+Every instance of a PostgreSQL-backed service opens its own connection pool:
+`policies`, `things` and `connectivity` one each (journal, snapshot store and read
+journal share it), and `things-search` one when it runs on the PostgreSQL search
+backend. A pool holds at most `ditto.postgresql.pool.max-size` connections
+(`POSTGRES_POOL_MAX_SIZE`, default `25`). The pools know nothing of each other,
+so size them together against PostgreSQL's `max_connections`, counting the
+extra pods of a rolling update:
+
+    Σ over the PostgreSQL-backed services of ((replicas + maxSurge) × max-size)
+      + reserved connections  ≤  max_connections
+
+`maxSurge` is the number of extra pods a Deployment starts while it rolls. The
+Helm chart rolls `policies`, `things`, `things-search` and `connectivity` with
+`maxSurge: 1` and `maxUnavailable: 0` (each service's `updateStrategy`), and a
+`helm upgrade` that changes all four rolls them at the same time. While the old
+pod shuts down and hands its entities over, its pool is still open, and the new
+pod recovers those entities with a pool of its own. So each rolling service
+needs `maxSurge × max-size` connections on top of its steady state
+(`replicas × max-size`).
+
+Reserved connections are `superuser_reserved_connections` (PostgreSQL default 3),
+monitoring, `psql` sessions, and the connections Ditto opens outside its pool.
+Those exist per service instance, so reserve them per replica: a DDL connection
+for the schema bootstrap at startup and for the schema self-heal (when a
+statement hits a missing table), and in `things-search` the per-path index
+maintenance, which runs at every start (one connection, two while an index
+builds; to `ditto.postgresql.search.path-indexes.direct-uri` if set, else to
+`ditto.postgresql.uri`).
+
+**Worked example.** Two Kubernetes nodes, one replica each of `policies`,
+`things`, `connectivity` and `things-search`, all on PostgreSQL with
+`max_connections = 300`, about 20 of them kept for administration (280 left).
+The chart's `maxSurge: 1` adds one pool per service while it rolls:
+
+| Setup | Steady state | All four services rolling | Fits 280? |
+|---|---|---|---|
+| default `max-size = 25`, one replica each | 4 × 25 = 100 | 4 × (1 + 1) × 25 = 200 | yes |
+| things and policies ×3, things-search ×2, `max-size = 25` | (3 + 3 + 1 + 2) × 25 = 225 | (4 + 4 + 2 + 3) × 25 = 325 | no (only between upgrades) |
+| the same replicas, `max-size = 20` | 9 × 20 = 180 | 13 × 20 = 260 | yes |
+| the former default `max-size = 100`, one replica each | 4 × 100 = 400 | 4 × (1 + 1) × 100 = 800 | no |
+
+A stock PostgreSQL (`max_connections = 100`, 3 of them
+`superuser_reserved_connections`) holds the three persistence services at one
+replica each only in steady state (75): while they roll they take up to 150 if
+all three roll at once, and still 100 if they roll one at a time. So a stock
+server needs a larger `max_connections`, smaller per-service pools, or PgBouncer
+(below), and so does adding `things-search` or replicas. Past
+`max_connections`, PostgreSQL refuses new connections (SQLSTATE 53300, "sorry, too
+many clients already"); recoveries and writes then fail.
+
+**Bursts.** A pool opens connections on demand (`initial-size = 0`), at most
+`max-size` at a time, each handshake bounded by `connect-timeout` (2 s). There is
+no further rate limit (r2dbc-pool has no counterpart of MongoDB's
+`maxConnecting`), so a burst can open a service's whole share at once. Borrowers
+beyond `max-size` wait in a queue of `pool.pending-acquire-max-size` (default
+2 × `max-size` = 50) for at most `pool.max-acquire-time` (4 s); beyond the queue
+they fail at once: a journal write with "PostgreSQL pool overload", a snapshot
+load (every recovery starts with one), a read-journal query or a search borrow
+with reactor-pool's `PoolAcquirePendingLimitException`. Connections a burst
+opened close after 30 minutes idle (r2dbc-pool's default, which
+`max-idle-time = 0s` keeps).
+
+**Overriding per service.** Set `POSTGRES_POOL_MAX_SIZE` on that service only
+(its pending queue follows at 2 × the new value unless
+`POSTGRES_POOL_PENDING_ACQUIRE_MAX_SIZE` is set), or
+`ditto.postgresql.pool.max-size` in the service's activation config (see "2.
+Create a service activation config" in
+`documentation/src/main/resources/pages/ditto/installation-extending.md`). The
+Helm chart has no dedicated value; use the service's `extraEnv`:
+
+```yaml
+things:
+  extraEnv:
+    - name: POSTGRES_POOL_MAX_SIZE
+      value: "40"
+```
+
+Raise a value only when that pool is the measured bottleneck
+(`ditto_persistence_pool_pending` above 0 for long, "PostgreSQL pool overload"
+for journal writes, `PoolAcquirePendingLimitException` for recoveries, reads and
+search, or acquire-timeout errors while PostgreSQL has headroom), and re-check
+the sum before scaling a service out. `25` is a starting point: confirm production
+sizing by load testing.
+
+### Scaling out with PgBouncer
+
+When the sum no longer fits, put PgBouncer in **transaction** mode between Ditto
+and PostgreSQL: an idle Ditto connection then holds no server connection, so
+many replicas share a smaller server pool. Ditto's defaults are safe under
+transaction pooling (`pool.fetch-size = 0`: no server-side cursors;
+`pool.prepared-statement-cache-queries = 0`: unnamed statements;
+`PgBouncerTransactionPoolingIT` runs the persistence round trip through
+PgBouncer in `pool_mode=transaction`). Set `ditto.postgresql.pooler-mode =
+transaction` (`POSTGRES_POOLER_MODE`) for the startup cross-check, configure
+`statement_timeout` as in
+[Statement timeout: role default and PgBouncer](#statement-timeout-role-default-and-pgbouncer),
+and give per-path search index builds a direct URI
+(`ditto.postgresql.search.path-indexes.direct-uri`). Size behind PgBouncer as:
+
+    Σ over the services of ((replicas + maxSurge) × max-size)  ≤  PgBouncer max_client_conn
+    PgBouncer server pool + reserved connections  ≤  max_connections
+
+where the server pool is PgBouncer's `default_pool_size` (plus
+`reserve_pool_size`) per database and role. A transaction that finds no free
+server connection waits inside PgBouncer for up to `query_wait_timeout`.
+Ditto's 4 s acquire budget does not see that wait; when it outlasts the
+callers' 5 s deadline, a write can commit after its caller was told it failed.
+Either keep the sum within the server pool (PgBouncer then never queues), or
+lower `query_wait_timeout` below 5 s.
 
 ## 1. Provisioning order (MUST be followed in this sequence)
 

@@ -605,6 +605,11 @@ policies:
   extraEnv:
   # - name: LOG_LEVEL_APPLICATION
   #   value: "DEBUG"
+  # # PostgreSQL backend (opt-in): connection pool size per policies pod (default 25). The sum over all
+  # # PostgreSQL-backed services of ((replicas + maxSurge) x pool size) must fit max_connections, as a
+  # # rolling update adds maxSurge pods per service, see deployment/postgres/README.md "Connection budget".
+  # - name: POSTGRES_POOL_MAX_SIZE
+  #   value: "25"
   extraVolumes:
   #  - name: policies-extension
   #    configMap:
@@ -965,6 +970,11 @@ things:
   extraEnv:
   # - name: LOG_LEVEL_APPLICATION
   #   value: "DEBUG"
+  # # PostgreSQL backend (opt-in): connection pool size per things pod (default 25). The sum over all
+  # # PostgreSQL-backed services of ((replicas + maxSurge) x pool size) must fit max_connections, as a
+  # # rolling update adds maxSurge pods per service, see deployment/postgres/README.md "Connection budget".
+  # - name: POSTGRES_POOL_MAX_SIZE
+  #   value: "25"
   extraVolumes:
   #  - name: things-extension
   #    configMap:
@@ -1538,6 +1548,11 @@ thingsSearch:
   extraEnv:
   # - name: LOG_LEVEL_APPLICATION
   #   value: "DEBUG"
+  # # PostgreSQL backend (opt-in): connection pool size per things-search pod (default 25). The sum over all
+  # # PostgreSQL-backed services of ((replicas + maxSurge) x pool size) must fit max_connections, as a
+  # # rolling update adds maxSurge pods per service, see deployment/postgres/README.md "Connection budget".
+  # - name: POSTGRES_POOL_MAX_SIZE
+  #   value: "25"
   extraVolumes:
   #  - name: search-extension
   #    configMap:
@@ -1935,6 +1950,11 @@ connectivity:
   extraEnv:
   # - name: LOG_LEVEL_APPLICATION
   #   value: "DEBUG"
+  # # PostgreSQL backend (opt-in): connection pool size per connectivity pod (default 25). The sum over all
+  # # PostgreSQL-backed services of ((replicas + maxSurge) x pool size) must fit max_connections, as a
+  # # rolling update adds maxSurge pods per service, see deployment/postgres/README.md "Connection budget".
+  # - name: POSTGRES_POOL_MAX_SIZE
+  #   value: "25"
   extraVolumes:
   #  - name: connectivity-extension
   #    configMap:
