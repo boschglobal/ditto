@@ -15,6 +15,7 @@ package org.eclipse.ditto.connectivity.service;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import org.eclipse.ditto.internal.utils.persistence.mongo.MongoClientWrapper;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -43,13 +44,12 @@ import com.tngtech.archunit.core.importer.ImportOption;
  * per-service Mongo event-adapter base and the Mongo connection config the service needs to actually run on
  * MongoDB, which is the bundled default backend) - symmetric to the Postgres event adapters, not a switchable leak.
  * <p>
- * The only whitelist is the intentionally-retained encryption-migration code, which is out of scope for the
- * pluggable-persistence refactor and deliberately stays on the raw Mongo driver:
- * <ul>
- *     <li>classes under {@code ...connectivity.service.messaging.persistence.migration..}, and</li>
- *     <li>the {@code MongoClientWrapper} usage in {@link ConnectivityRootActor} (it builds the Mongo client that the
- *     migration singleton owns).</li>
- * </ul>
+ * The only whitelist is the encryption-migration package {@code ...connectivity.service.messaging.persistence.migration..}.
+ * The migration re-encrypts connection secrets by reading and rewriting the MongoDB journal and snapshot collections
+ * with the raw Mongo driver and BSON, so it is MongoDB-only by design. {@link ConnectivityRootActor} starts it only when
+ * the active persistence backend is MongoDB; on any other backend it starts a responder that refuses the migration
+ * commands (outside this package, so Rule 1 covers it) and builds no MongoDB client. The migration actor builds and
+ * closes its own {@code MongoClientWrapper}, which no other connectivity class may use (Rule 1b).
  * Driven via ArchUnit's core API from JUnit 4 {@code @Test} methods so the module keeps running on its existing
  * JUnit 4 / surefire setup; the imported classes are scoped to MAIN code via
  * {@link com.tngtech.archunit.core.importer.ImportOption.DoNotIncludeTests}.
@@ -61,10 +61,6 @@ public final class PersistenceBoundaryArchTest {
     /** The encryption-migration package - intentionally retains the raw Mongo driver (out of scope). */
     private static final String MIGRATION_PKG =
             "org.eclipse.ditto.connectivity.service.messaging.persistence.migration..";
-
-    /** The one class allowed to use the Mongo-zone {@code MongoClientWrapper} to bootstrap the migration singleton. */
-    private static final String CONNECTIVITY_ROOT_ACTOR =
-            "org.eclipse.ditto.connectivity.service.ConnectivityRootActor";
 
     /**
      * The SWITCHABLE Mongo artifacts the pluggable-persistence refactor routed through the provider. Service code
@@ -98,6 +94,24 @@ public final class PersistenceBoundaryArchTest {
                 }
             };
 
+    private static final String MONGO_CLIENT_WRAPPER =
+            "org.eclipse.ditto.internal.utils.persistence.mongo.MongoClientWrapper";
+    private static final String DITTO_MONGO_CLIENT =
+            "org.eclipse.ditto.internal.utils.persistence.mongo.DittoMongoClient";
+
+    /**
+     * The Mongo-zone client. It is not a switchable artifact (Rule 1 does not match it), but building one opens a
+     * MongoDB connection pool, which only the MongoDB-only encryption migration may do.
+     */
+    private static final DescribedPredicate<JavaClass> IS_MONGO_CLIENT =
+            new DescribedPredicate<>("be the Mongo-zone client (MongoClientWrapper or DittoMongoClient)") {
+                @Override
+                public boolean test(final JavaClass javaClass) {
+                    final String name = javaClass.getFullName();
+                    return name.equals(MONGO_CLIENT_WRAPPER) || name.equals(DITTO_MONGO_CLIENT);
+                }
+            };
+
     private static JavaClasses connectivityServiceMainClasses;
 
     @BeforeClass
@@ -109,15 +123,13 @@ public final class PersistenceBoundaryArchTest {
 
     /**
      * Rule 1: no connectivity-service MAIN class may depend on a SWITCHABLE Mongo artifact, except the whitelisted
-     * encryption-migration package (which directly uses the Mongo driver and BSON by design) and
-     * {@link ConnectivityRootActor} (which constructs the {@code MongoClientWrapper} handed to the migration
-     * singleton).
+     * encryption-migration package (MongoDB-only by design: it uses the Mongo driver and BSON directly, and
+     * {@link ConnectivityRootActor} refuses it on other backends).
      */
     @Test
     public void connectivityMustNotDependOnSwitchableMongoOutsideWhitelist() {
         noClasses()
                 .that().resideOutsideOfPackage(MIGRATION_PKG)
-                .and().doNotHaveFullyQualifiedName(CONNECTIVITY_ROOT_ACTOR)
                 .should().dependOnClassesThat(IS_SWITCHABLE_MONGO)
                 .as("connectivity-service MAIN code (outside the encryption-migration whitelist) "
                         + "must not depend on any switchable Mongo artifact "
@@ -139,6 +151,35 @@ public final class PersistenceBoundaryArchTest {
                 .because("service code must couple only to the backend-neutral persistence-API, "
                         + "never to a concrete backend")
                 .check(connectivityServiceMainClasses);
+    }
+
+    /**
+     * Rule 1b: only the encryption-migration package may use the Mongo-zone client. The migration actor builds its
+     * client when it starts and closes it when it stops; {@link ConnectivityRootActor} builds none, so no MongoDB
+     * connection pool is opened on a non-MongoDB backend.
+     */
+    @Test
+    public void onlyTheEncryptionMigrationUsesTheMongoClient() {
+        noClasses()
+                .that().resideOutsideOfPackage(MIGRATION_PKG)
+                .should().dependOnClassesThat(IS_MONGO_CLIENT)
+                .as("connectivity-service MAIN code outside the encryption-migration package must not use the "
+                        + "Mongo-zone client (MongoClientWrapper, DittoMongoClient)")
+                .because("the MongoDB-only encryption migration builds and closes its own client; no other "
+                        + "connectivity code may open a MongoDB connection pool")
+                .check(connectivityServiceMainClasses);
+    }
+
+    /**
+     * Meta-test: proves Rule 1b is NON-VACUOUS, i.e. its matcher matches the real client class.
+     */
+    @Test
+    public void mongoClientMatcherActuallyMatchesMongoClientWrapper() {
+        final JavaClass mongoClientWrapper = new ClassFileImporter().importClass(MongoClientWrapper.class);
+
+        assertThat(IS_MONGO_CLIENT.test(mongoClientWrapper))
+                .as("the Mongo-client matcher must match MongoClientWrapper, otherwise Rule 1b would be vacuous")
+                .isTrue();
     }
 
     /**

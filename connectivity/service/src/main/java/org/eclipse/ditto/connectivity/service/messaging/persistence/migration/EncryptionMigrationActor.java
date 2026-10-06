@@ -38,6 +38,7 @@ import org.eclipse.ditto.connectivity.service.config.FieldsEncryptionConfig;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoDiagnosticLoggingAdapter;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoLoggerFactory;
 import org.eclipse.ditto.internal.utils.persistence.mongo.MongoClientWrapper;
+import org.eclipse.ditto.internal.utils.persistence.mongo.config.MongoDbConfig;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.WriteModel;
 import com.mongodb.reactivestreams.client.MongoCollection;
@@ -52,6 +53,11 @@ import com.mongodb.reactivestreams.client.MongoCollection;
  *   <li><b>Key rotation</b>: Re-encrypt data from old key to new key</li>
  *   <li><b>Disable encryption</b>: Decrypt data back to plaintext</li>
  * </ul>
+ * <p>
+ * <b>MongoDB only.</b> The connectivity root actor starts this actor (as a cluster singleton) only when the active
+ * persistence backend is MongoDB; on any other backend it starts {@code EncryptionMigrationUnsupportedActor}, which
+ * refuses the commands. The actor builds its MongoDB client in {@link #preStart()} and closes it in
+ * {@link #postStop()}, so only the node that runs the singleton holds one.
  * <p>
  * The actor delegates to helper classes for focused responsibilities:
  * <ul>
@@ -103,12 +109,17 @@ public final class EncryptionMigrationActor extends AbstractActor {
     private final DittoDiagnosticLoggingAdapter log = DittoLoggerFactory.getDiagnosticLoggingAdapter(this);
 
     private final FieldsEncryptionConfig encryptionConfig;
+    private final MongoDbConfig mongoDbConfig;
     private final Materializer materializer;
-    private final MongoCollection<Document> snapshotCollection;
-    private final MongoCollection<Document> journalCollection;
-    private final MigrationProgressTracker progressTracker;
     private final int batchSize;
     private final int maxDocumentsPerMinute;
+
+    // Built in preStart and closed in postStop: the client exists only while this singleton runs, on one node.
+    @Nullable
+    private MongoClientWrapper mongoClient;
+    private MongoCollection<Document> snapshotCollection;
+    private MongoCollection<Document> journalCollection;
+    private MigrationProgressTracker progressTracker;
 
     private boolean migrationInProgress = false;
     private boolean currentDryRun = false;
@@ -117,33 +128,45 @@ public final class EncryptionMigrationActor extends AbstractActor {
     @Nullable
     private MigrationProgress currentProgress;
 
-    private EncryptionMigrationActor(final ConnectivityConfig connectivityConfig, final MongoClientWrapper mongoClient) {
+    private EncryptionMigrationActor(final ConnectivityConfig connectivityConfig) {
         this.encryptionConfig = connectivityConfig.getConnectionConfig().getFieldsEncryptionConfig();
+        this.mongoDbConfig = connectivityConfig.getMongoDbConfig();
         this.materializer = Materializer.createMaterializer(this::getContext);
         this.batchSize = encryptionConfig.getMigrationBatchSize();
         this.maxDocumentsPerMinute = encryptionConfig.getMigrationMaxDocumentsPerMinute();
-
-        final var db = mongoClient.getDefaultDatabase();
-        this.snapshotCollection = db.getCollection(SNAPSHOT_COLLECTION);
-        this.journalCollection = db.getCollection(JOURNAL_COLLECTION);
-        final MongoCollection<Document> progressCollection = db.getCollection(PROGRESS_COLLECTION);
-        this.progressTracker = new MigrationProgressTracker(progressCollection, materializer);
     }
 
     /**
-     * Creates Props for this actor.
+     * Creates Props for this actor. The actor builds its own MongoDB client from the connectivity service's
+     * {@code ditto.mongodb} config when it starts and closes it when it stops.
      *
      * @param connectivityConfig the connectivity configuration.
      * @return the Props.
      */
-    public static Props props(final ConnectivityConfig connectivityConfig, final MongoClientWrapper mongoClient) {
-        return Props.create(EncryptionMigrationActor.class, connectivityConfig, mongoClient);
+    public static Props props(final ConnectivityConfig connectivityConfig) {
+        return Props.create(EncryptionMigrationActor.class, connectivityConfig);
+    }
+
+    @Override
+    public void preStart() throws Exception {
+        super.preStart();
+        final MongoClientWrapper client = MongoClientWrapper.newInstance(mongoDbConfig);
+        mongoClient = client;
+        final var db = client.getDefaultDatabase();
+        snapshotCollection = db.getCollection(SNAPSHOT_COLLECTION);
+        journalCollection = db.getCollection(JOURNAL_COLLECTION);
+        progressTracker = new MigrationProgressTracker(db.getCollection(PROGRESS_COLLECTION), materializer);
     }
 
     @Override
     public void postStop() throws Exception {
         if (activeKillSwitch != null) {
             activeKillSwitch.shutdown();
+        }
+        final MongoClientWrapper client = mongoClient;
+        mongoClient = null;
+        if (client != null) {
+            client.close();
         }
         super.postStop();
     }

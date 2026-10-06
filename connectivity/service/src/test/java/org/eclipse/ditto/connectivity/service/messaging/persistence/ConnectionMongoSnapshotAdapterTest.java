@@ -61,4 +61,31 @@ public class ConnectionMongoSnapshotAdapterTest {
         assertThat(encryptedConnection.getUri()).contains("encrypted_");
         assertThat(userInfoAfterDecrypt).isEqualTo(userInfo);
     }
+
+    @Test
+    public void disabledEncryptionWithTheFormerKeyKeptAsCurrentKeyDecryptsAndWritesPlaintext() {
+        // disabling encryption without a migration (the PostgreSQL docs): the former key stays 'symmetrical-key', so
+        // snapshots written while encryption was enabled are still decrypted, and rewritten in plaintext
+        final Config config = ConfigFactory.load("connection-fields-encryption-test").getConfig("connection");
+        final ConnectionMongoSnapshotAdapter encryptingSerializer =
+                new ConnectionMongoSnapshotAdapter(DefaultFieldsEncryptionConfig.of(config));
+        final Connection connection = TestConstants.createConnection();
+        final String userInfo = URI.create(connection.getUri()).getUserInfo();
+        final BsonDocument encryptedSnapshot = (BsonDocument)
+                new NeutralSnapshotAdapter<>(encryptingSerializer, MongoSnapshotCodec.INSTANCE)
+                        .toSnapshotStore(connection);
+
+        final ConnectionMongoSnapshotAdapter disabledSerializer = new ConnectionMongoSnapshotAdapter(
+                DefaultFieldsEncryptionConfig.of(ConfigFactory.parseString("encryption.encryption-enabled = false")
+                        .withFallback(config)));
+        final Connection recovered =
+                disabledSerializer.createJsonifiableFrom(JsonObject.of(encryptedSnapshot.toJson()));
+        final BsonDocument rewrittenSnapshot = (BsonDocument)
+                new NeutralSnapshotAdapter<>(disabledSerializer, MongoSnapshotCodec.INSTANCE)
+                        .toSnapshotStore(recovered);
+
+        assertThat(encryptedSnapshot.toJson()).contains("encrypted_");
+        assertThat(URI.create(recovered.getUri()).getUserInfo()).isEqualTo(userInfo);
+        assertThat(rewrittenSnapshot.toJson()).doesNotContain("encrypted_");
+    }
 }

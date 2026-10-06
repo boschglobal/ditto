@@ -377,12 +377,27 @@ These commands enable safe encryption key rotation and encryption disable workfl
 For detailed information about encryption configuration and workflows, refer to
 [Encrypt sensitive data in Connections](installation-operating.html#encrypt-sensitive-data-in-connections).
 
+These commands are available only on the MongoDB persistence backend. On any other backend (PostgreSQL), when field
+encryption is enabled or an `old-symmetrical-key` is set, each of them changes nothing and is answered with this error
+(otherwise nothing answers them and they time out, as on MongoDB in that configuration); see
+[Key rotation on PostgreSQL](installation-operating.html#key-rotation-on-postgresql):
+
+```json
+{
+  "status": 501,
+  "error": "signal.unsupported",
+  "message": "Encryption migration is only supported on the MongoDB persistence backend, not on the active PostgreSQL backend. On PostgreSQL keep 'old-symmetrical-key' configured.",
+  "description": "Connection data encrypted with the old key is not re-encrypted in bulk on this backend. Reads fall back to 'old-symmetrical-key', and new or changed connection data is encrypted with 'symmetrical-key'. Removing the old key makes connections that still hold data encrypted with it fail to recover."
+}
+```
+
 ### Migrate encryption
 
-Trigger batch processing of all persisted connection data (snapshots and journal events). The command supports two workflows:
+Trigger batch processing of all persisted connection data (snapshots and journal events). The command supports three workflows:
 
 **Migration Logic:**
 - **Key Rotation:** `encryption-enabled = true` + both keys set → Decrypt with old key, re-encrypt with new key
+- **Initial Encryption:** `encryption-enabled = true` + only the current key set → Encrypt plaintext values with the current key
 - **Disable Encryption:** `encryption-enabled = false` + old key set → Decrypt with old key, write plaintext
 
 The configuration determines which workflow is executed.

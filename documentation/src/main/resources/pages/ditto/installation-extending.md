@@ -290,6 +290,10 @@ Repeat the same pattern for the Policies and Connectivity services, substituting
 
 {% include note.html content="Data migration from MongoDB is the operator's responsibility. No automated migration tooling is provided." %}
 
+#### Known limitations
+
+* **Connection encryption migration is MongoDB-only:** connection secrets are encrypted at rest on PostgreSQL exactly as on MongoDB, and the dual-key configuration (`old-symmetrical-key`) works, but the DevOps commands `migrateEncryption`, `migrateEncryptionStatus` and `migrateEncryptionAbort`, which re-encrypt or decrypt all stored connection data, are refused on PostgreSQL (when field encryption is enabled or an `old-symmetrical-key` is set; otherwise nothing answers them and they time out, as on MongoDB in that configuration). After a key rotation keep `old-symmetrical-key` configured; see [Key rotation on PostgreSQL](installation-operating.html#key-rotation-on-postgresql).
+
 ### PostgreSQL search backend
 
 Thing-search can **optionally** run its search index on PostgreSQL instead of MongoDB, independently of which backend the persistence services use. MongoDB remains the default search backend — this is strictly opt-in and only affects the `things-search` service.
