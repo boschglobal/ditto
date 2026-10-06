@@ -15,6 +15,8 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.client.schema;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.Set;
+
 import org.junit.Test;
 
 /**
@@ -23,7 +25,8 @@ import org.junit.Test;
  * DDL ({@link SchemaVersionDecision#APPLY}), runs no DDL and writes no row
  * ({@link SchemaVersionDecision#COMPATIBLE_NEWER}), or refuses. Covers both the boot path
  * ({@link SchemaVerifier#verifyStoredVersion}) and the self-heal path
- * ({@link SchemaVerifier#verifyStoredVersionForHeal}). Pure logic, no live PostgreSQL. The single home of the version
+ * ({@link SchemaVerifier#verifyStoredVersionForHeal}), and the same-version fast path
+ * ({@link SchemaVerifier#decideComponentDdl}). Pure logic, no live PostgreSQL. The single home of the version
  * decision's unit tests; {@code persistence-r2dbc}'s {@code SchemaVerifierTest} covers the live-catalog guard.
  */
 public final class SchemaVerifierVersionDecisionTest {
@@ -164,6 +167,72 @@ public final class SchemaVerifierVersionDecisionTest {
         assertThatThrownBy(() -> SchemaVerifier.verifyStoredVersionForHeal(COMPONENT, 2, 3, null))
                 .isInstanceOf(SchemaBootException.class)
                 .hasMessageContaining("min_compatible_version 3");
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // same-version fast path (decideComponentDdl)
+    // ---------------------------------------------------------------------------------------------------------------
+
+    @Test
+    public void sameVersionAndChecksumWithEveryRelationPresentIsUpToDate() {
+        final SchemaVersionDecision version =
+                SchemaVerifier.verifyStoredVersion(COMPONENT, CODE_CHECKSUM, 2, CODE_CHECKSUM, 2, 2);
+        final boolean current = SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, 2, CODE_CHECKSUM);
+
+        assertThat(SchemaVerifier.decideComponentDdl(version, current, Set.of()))
+                .isEqualTo(SchemaVersionDecision.UP_TO_DATE);
+    }
+
+    @Test
+    public void sameVersionWithAMissingIndexRunsTheDdl() {
+        assertThat(SchemaVerifier.decideComponentDdl(SchemaVersionDecision.APPLY, true, Set.of("sf_num")))
+                .isEqualTo(SchemaVersionDecision.APPLY);
+    }
+
+    @Test
+    public void sameVersionWithUnnameableDdlRunsTheDdl() {
+        assertThat(SchemaVerifier.decideComponentDdl(SchemaVersionDecision.APPLY, true, null))
+                .isEqualTo(SchemaVersionDecision.APPLY);
+    }
+
+    @Test
+    public void firstBootAndUpgradeRunTheDdlEvenIfEveryRelationExists() {
+        assertThat(SchemaVerifier.decideComponentDdl(SchemaVersionDecision.APPLY,
+                SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, null, null), Set.of()))
+                .isEqualTo(SchemaVersionDecision.APPLY);
+        assertThat(SchemaVerifier.decideComponentDdl(SchemaVersionDecision.APPLY,
+                SchemaVerifier.storedRowIsCurrent(3, CODE_CHECKSUM, 2, "old-checksum"), Set.of()))
+                .isEqualTo(SchemaVersionDecision.APPLY);
+    }
+
+    @Test
+    public void newerCompatibleStoredVersionKeepsTheRollingUpgradePath() {
+        final SchemaVersionDecision version =
+                SchemaVerifier.verifyStoredVersion(COMPONENT, CODE_CHECKSUM, 2, "v3-checksum", 3, 2);
+
+        assertThat(SchemaVerifier.decideComponentDdl(version, false, Set.of()))
+                .isEqualTo(SchemaVersionDecision.COMPATIBLE_NEWER);
+        assertThat(SchemaVerifier.decideComponentDdl(version, true, Set.of()))
+                .isEqualTo(SchemaVersionDecision.COMPATIBLE_NEWER);
+    }
+
+    @Test
+    public void healWithSameVersionButDriftedChecksumRunsTheDdl() {
+        // The heal never refuses on drift (verifyStoredVersionForHeal), and a drifted row is never "current".
+        final SchemaVersionDecision version = SchemaVerifier.verifyStoredVersionForHeal(COMPONENT, 2, 2, 2);
+
+        assertThat(SchemaVerifier.decideComponentDdl(version,
+                SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, 2, "drifted"), Set.of()))
+                .isEqualTo(SchemaVersionDecision.APPLY);
+    }
+
+    @Test
+    public void storedRowIsCurrentOnlyForTheSameVersionAndChecksum() {
+        assertThat(SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, 2, CODE_CHECKSUM)).isTrue();
+        assertThat(SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, 1, CODE_CHECKSUM)).isFalse();
+        assertThat(SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, 3, CODE_CHECKSUM)).isFalse();
+        assertThat(SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, 2, "other")).isFalse();
+        assertThat(SchemaVerifier.storedRowIsCurrent(2, CODE_CHECKSUM, null, null)).isFalse();
     }
 
 }

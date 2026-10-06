@@ -14,12 +14,17 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.client.schema;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
@@ -28,6 +33,7 @@ import org.slf4j.LoggerFactory;
 
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
+import io.r2dbc.spi.R2dbcException;
 import io.r2dbc.spi.Result;
 import io.r2dbc.spi.Row;
 
@@ -62,20 +68,31 @@ import reactor.core.publisher.Mono;
  *     ({@link SchemaVerifier#verifyStoredVersion}) before any component DDL runs: apply, run against a newer compatible
  *     schema without touching it, or refuse to boot (same-version checksum drift, or a newer incompatible schema).</li>
  *     <li>{@link SchemaVersionDecision#APPLY} only: all of the descriptor's {@code CREATE TABLE}/{@code CREATE
- *     INDEX}/{@code ALTER TABLE … autovacuum} statements (each idempotent).</li>
- *     <li><strong>live-catalog verification</strong> (both decisions) — {@code pg_get_constraintdef} on every PK +
+ *     INDEX}/{@code ALTER TABLE … autovacuum} statements (each idempotent) — <strong>unless</strong> the stored row has
+ *     this code's version and checksum and every table and index the DDL creates exists
+ *     ({@link #namedRelations(PostgresSchemaDescriptor)}, looked up with {@code to_regclass}, no table lock): then
+ *     {@link SchemaVersionDecision#UP_TO_DATE}, no DDL. When the DDL runs, it runs after
+ *     {@link #SET_DDL_LOCK_TIMEOUT}.</li>
+ *     <li><strong>live-catalog verification</strong> (all decisions) — {@code pg_get_constraintdef} on every PK +
  *     {@code information_schema.columns} per table; refuse-to-boot on any divergence (because
  *     {@code CREATE TABLE IF NOT EXISTS} silently keeps a pre-existing divergent table). Extra columns and extra or
  *     missing indexes do not fail it, so it holds against a newer compatible schema too.</li>
- *     <li>{@link SchemaVersionDecision#APPLY} only: upsert of the row (version, checksum,
- *     {@code min_compatible_version}). A {@link SchemaVersionDecision#COMPATIBLE_NEWER} boot never writes the row, so
- *     an older pod can't flip the schema or the version back.</li>
+ *     <li>{@link SchemaVersionDecision#APPLY} and {@link SchemaVersionDecision#UP_TO_DATE}: upsert of the row (version,
+ *     checksum, {@code min_compatible_version}). A {@link SchemaVersionDecision#COMPATIBLE_NEWER} boot never writes the
+ *     row, so an older pod can't flip the schema or the version back.</li>
  *     <li>commit — the advisory xact lock auto-releases.</li>
  * </ol>
  * <p>
  * There is deliberately no {@code SELECT indisvalid} rebuild step: invalid indexes only arise from {@code CREATE INDEX
  * CONCURRENTLY}, which is never used here and cannot run in a transaction; plain {@code CREATE INDEX} rolls back
  * cleanly. The bootstrap blocks the calling (startup) thread — it is a one-time step run before any actor starts.
+ * </p>
+ * <h2>Same-version boots</h2>
+ * <p>
+ * A start whose stored row is current and whose tables and indexes all exist takes no lock on the component's tables,
+ * so it never waits for (nor deadlocks) a concurrent index build such as a {@code CREATE INDEX CONCURRENTLY}. The
+ * consequence: a manually dropped table or index is re-created at the next start, but a manually reset reloption is
+ * not re-applied until the next version bump or a self-heal that runs the DDL.
  * </p>
  * <h2>Checksum semantics</h2>
  * The {@code schema_version} checksum is computed over the <em>effective</em> DDL — the shared {@code schema_version}
@@ -133,6 +150,32 @@ public final class PostgresSchemaManager {
     private static final String COMPATIBILITY_COLUMN_EXISTS_SQL = "SELECT EXISTS (SELECT 1 FROM pg_attribute "
             + "WHERE attrelid = to_regclass('schema_version') AND attname = 'min_compatible_version' "
             + "AND NOT attisdropped)";
+
+    /**
+     * How long each statement of a component's DDL may wait for a lock: below PostgreSQL's default
+     * {@code deadlock_timeout} (1 s), so a boot that meets a running {@code CREATE INDEX CONCURRENTLY} gives up before
+     * the deadlock detector can abort that build, and writers queued behind the boot's lock request wait at most this
+     * long. A boot that times out fails like any failed boot (the transaction is rolled back, nothing changed).
+     */
+    static final String DDL_LOCK_TIMEOUT = "500ms";
+
+    /**
+     * Issued right before the component DDL, inside the bootstrap (or heal) transaction and after the advisory lock.
+     * {@code SET LOCAL} ends with the transaction and, unlike a startup parameter, also holds behind a
+     * transaction-mode PgBouncer.
+     */
+    static final String SET_DDL_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '" + DDL_LOCK_TIMEOUT + "'";
+
+    /**
+     * The tables and indexes of {@code $1} that do not exist in {@code current_schema()} — the schema
+     * {@code CREATE TABLE/INDEX IF NOT EXISTS} and {@link #verifyCatalog} use. {@code to_regclass} reads the catalog
+     * only: no lock on any of the relations.
+     */
+    static final String MISSING_RELATIONS_SQL = "SELECT relation FROM unnest($1::text[]) AS named(relation) "
+            + "WHERE to_regclass(format('%I.%I', current_schema(), relation)) IS NULL";
+
+    /** SQLSTATE {@code lock_not_available}: raised when {@link #DDL_LOCK_TIMEOUT} expires. */
+    private static final String LOCK_NOT_AVAILABLE = "55P03";
 
     private static final Duration DEFAULT_BOOTSTRAP_TIMEOUT = Duration.ofSeconds(60L);
 
@@ -207,6 +250,18 @@ public final class PostgresSchemaManager {
     }
 
     /**
+     * The tables and indexes the descriptor's own DDL creates, by name, in statement order — what the same-version
+     * fast path looks up before it skips the component DDL ({@link SchemaVersionDecision#UP_TO_DATE}). Empty when a
+     * statement creates something whose name cannot be read; every boot then runs the DDL.
+     *
+     * @param descriptor the component schema.
+     * @return the relation names, or an empty {@code Optional}.
+     */
+    public static Optional<List<String>> namedRelations(final PostgresSchemaDescriptor descriptor) {
+        return SchemaDdlRelations.of(descriptor.ddlStatements());
+    }
+
+    /**
      * Runs the bootstrap synchronously, blocking until commit or failure.
      *
      * @throws SchemaBootException on a same-version checksum mismatch, a newer stored version this code is not
@@ -219,6 +274,10 @@ public final class PostgresSchemaManager {
                             + "compatible stored schema version {} (code version {}); no DDL run, schema_version row "
                             + "unchanged.",
                     descriptor.component(), outcome.storedVersion(), descriptor.version());
+        } else if (outcome != null && outcome.decision() == SchemaVersionDecision.UP_TO_DATE) {
+            LOGGER.info("PostgreSQL schema bootstrap complete for component '{}' (version {}, checksum {}): every "
+                            + "table and index of the schema exists, so no DDL was run.",
+                    descriptor.component(), descriptor.version(), checksum(descriptor));
         } else {
             LOGGER.info("PostgreSQL schema bootstrap complete for component '{}' (version {}, checksum {}).",
                     descriptor.component(), descriptor.version(), checksum(descriptor));
@@ -259,10 +318,16 @@ public final class PostgresSchemaManager {
      * newer <em>incompatible</em> one fails the heal with a {@link SchemaBootException}, so the original missing-table
      * error surfaces.
      * </p>
+     * <p>
+     * The heal follows the boot's same-version fast path: when the stored row has this code's version and checksum and
+     * every table and index of the DDL exists, it runs no DDL ({@link SchemaVersionDecision#UP_TO_DATE}); when it runs
+     * DDL, it does so after {@link #SET_DDL_LOCK_TIMEOUT}.
+     * </p>
      *
      * @return the create-only heal as a reactive pipeline (single transaction, connection released on every terminal
-     * path), emitting {@link SchemaVersionDecision#APPLY} when the DDL ran and
-     * {@link SchemaVersionDecision#COMPATIBLE_NEWER} when it deliberately did not.
+     * path), emitting {@link SchemaVersionDecision#APPLY} when the DDL ran, and
+     * {@link SchemaVersionDecision#UP_TO_DATE} or {@link SchemaVersionDecision#COMPATIBLE_NEWER} when it deliberately
+     * did not.
      */
     public Mono<SchemaVersionDecision> ensureTablesReactive() {
         return Mono.usingWhen(
@@ -281,14 +346,22 @@ public final class PostgresSchemaManager {
                 .then(ensureSchemaVersionTable(connection))
                 .then(readStoredVersion(connection))
                 .flatMap(stored -> {
-                    final SchemaVersionDecision decision = SchemaVerifier.verifyStoredVersionForHeal(
+                    final SchemaVersionDecision versionDecision = SchemaVerifier.verifyStoredVersionForHeal(
                             descriptor.component(), descriptor.version(), stored.version(),
                             stored.minCompatibleVersion());
-                    if (decision == SchemaVersionDecision.COMPATIBLE_NEWER) {
+                    if (versionDecision == SchemaVersionDecision.COMPATIBLE_NEWER) {
                         logCompatibleNewer("self-heal", stored);
-                        return Mono.just(decision);
+                        return Mono.just(versionDecision);
                     }
-                    return runComponentDdl(connection).thenReturn(decision);
+                    return decideComponentDdl(connection, "self-heal", versionDecision, stored, checksum(descriptor))
+                            .flatMap(decision -> {
+                                if (decision == SchemaVersionDecision.UP_TO_DATE) {
+                                    LOGGER.info("PostgreSQL schema self-heal for component '{}': every table and "
+                                            + "index of the schema exists; running no DDL.", descriptor.component());
+                                    return Mono.just(decision);
+                                }
+                                return runComponentDdl(connection, "self-heal").thenReturn(decision);
+                            });
                 })
                 .flatMap(decision -> Mono.from(connection.commitTransaction()).thenReturn(decision))
                 .onErrorResume(error -> Mono.from(connection.rollbackTransaction())
@@ -308,22 +381,26 @@ public final class PostgresSchemaManager {
                 // 3) read the row and decide BEFORE any component DDL runs (refuses on drift / incompatible newer).
                 .then(readStoredVersion(connection))
                 .flatMap(stored -> {
-                    final SchemaVersionDecision decision = SchemaVerifier.verifyStoredVersion(descriptor.component(),
-                            expectedChecksum, descriptor.version(), stored.checksum(), stored.version(),
-                            stored.minCompatibleVersion());
-                    final BootstrapOutcome outcome = new BootstrapOutcome(decision, stored.version());
-                    if (decision == SchemaVersionDecision.COMPATIBLE_NEWER) {
+                    final SchemaVersionDecision versionDecision = SchemaVerifier.verifyStoredVersion(
+                            descriptor.component(), expectedChecksum, descriptor.version(), stored.checksum(),
+                            stored.version(), stored.minCompatibleVersion());
+                    if (versionDecision == SchemaVersionDecision.COMPATIBLE_NEWER) {
                         logCompatibleNewer("boot", stored);
                         // No DDL, no row write: verify only the catalog facts this code needs.
-                        return verifyCatalog(connection).thenReturn(outcome);
+                        return verifyCatalog(connection)
+                                .thenReturn(new BootstrapOutcome(versionDecision, stored.version()));
                     }
-                    // 4) the component's DDL, each statement idempotent.
-                    return runComponentDdl(connection)
-                            // 5) live-catalog verification inside the same txn.
-                            .then(verifyCatalog(connection))
-                            // 6) insert / advance the schema_version row.
-                            .then(upsertRow(connection, expectedChecksum))
-                            .thenReturn(outcome);
+                    // 4) same version + checksum and every table/index present: no DDL, no table lock; otherwise the
+                    //    component's DDL under the DDL lock timeout.
+                    return decideComponentDdl(connection, "boot", versionDecision, stored, expectedChecksum)
+                            .flatMap(decision -> (decision == SchemaVersionDecision.UP_TO_DATE
+                                    ? Mono.<Void>empty()
+                                    : runComponentDdl(connection, "boot"))
+                                    // 5) live-catalog verification inside the same txn (both paths).
+                                    .then(verifyCatalog(connection))
+                                    // 6) insert / advance the row (unchanged values on the up-to-date path).
+                                    .then(upsertRow(connection, expectedChecksum))
+                                    .thenReturn(new BootstrapOutcome(decision, stored.version())));
                 })
                 // 7) commit -> advisory xact lock auto-releases.
                 .flatMap(outcome -> Mono.from(connection.commitTransaction()).thenReturn(outcome))
@@ -373,8 +450,8 @@ public final class PostgresSchemaManager {
     /**
      * {@link #SCHEMA_VERSION_DDL} (element 0 of the checksummed effective DDL) followed, only while the column is
      * missing, by the manager-owned, non-checksummed {@link #SCHEMA_VERSION_COMPATIBILITY_DDL}. On
-     * {@link SchemaVersionDecision#APPLY}, together with {@link #runComponentDdl(Connection)}, the checksummed DDL
-     * executed is still exactly {@link #effectiveDdl(PostgresSchemaDescriptor)}, in order.
+     * {@link SchemaVersionDecision#APPLY}, together with {@link #runComponentDdl(Connection, String)}, the checksummed
+     * DDL executed is still exactly {@link #effectiveDdl(PostgresSchemaDescriptor)}, in order.
      */
     private static Mono<Void> ensureSchemaVersionTable(final Connection connection) {
         return executeUpdate(connection, SCHEMA_VERSION_DDL)
@@ -392,12 +469,70 @@ public final class PostgresSchemaManager {
     }
 
     /**
-     * The descriptor's own statements, i.e. the effective DDL minus the already executed {@link #SCHEMA_VERSION_DDL}.
+     * The same-version fast path: probes the catalog only when the stored row is exactly this code's schema (see
+     * {@link SchemaVerifier#decideComponentDdl}).
      */
-    private Mono<Void> runComponentDdl(final Connection connection) {
-        return Flux.fromIterable(descriptor.ddlStatements())
-                .concatMap(ddl -> executeUpdate(connection, ddl))
-                .then();
+    private Mono<SchemaVersionDecision> decideComponentDdl(final Connection connection, final String phase,
+            final SchemaVersionDecision versionDecision, final StoredSchemaVersion stored,
+            final String expectedChecksum) {
+        final boolean storedRowIsCurrent = SchemaVerifier.storedRowIsCurrent(descriptor.version(), expectedChecksum,
+                stored.version(), stored.checksum());
+        if (versionDecision != SchemaVersionDecision.APPLY || !storedRowIsCurrent) {
+            return Mono.just(versionDecision);
+        }
+        final Optional<List<String>> relations = namedRelations(descriptor);
+        if (relations.isEmpty()) {
+            LOGGER.info("PostgreSQL schema {} for component '{}': its DDL creates a relation whose name cannot be "
+                    + "read, so the DDL runs although the stored schema is current.", phase, descriptor.component());
+            return Mono.just(SchemaVerifier.decideComponentDdl(versionDecision, true, null));
+        }
+        return missingRelations(connection, relations.get())
+                .map(missing -> {
+                    if (!missing.isEmpty()) {
+                        LOGGER.info("PostgreSQL schema {} for component '{}': missing {}; running the component DDL.",
+                                phase, descriptor.component(), missing);
+                    }
+                    return SchemaVerifier.decideComponentDdl(versionDecision, true, missing);
+                });
+    }
+
+    private static Mono<Set<String>> missingRelations(final Connection connection, final List<String> names) {
+        if (names.isEmpty()) {
+            return Mono.just(Set.of());
+        }
+        return Flux.from(connection.createStatement(MISSING_RELATIONS_SQL)
+                        .bind(0, names.toArray(String[]::new))
+                        .execute())
+                .flatMap(result -> result.map((row, meta) -> row.get(0, String.class)))
+                .collect(Collectors.toCollection(LinkedHashSet::new))
+                .map(Collections::unmodifiableSet);
+    }
+
+    /**
+     * The descriptor's own statements, i.e. the effective DDL minus the already executed {@link #SCHEMA_VERSION_DDL},
+     * after {@link #SET_DDL_LOCK_TIMEOUT}: each statement waits at most {@link #DDL_LOCK_TIMEOUT} for a lock.
+     */
+    private Mono<Void> runComponentDdl(final Connection connection, final String phase) {
+        return executeUpdate(connection, SET_DDL_LOCK_TIMEOUT)
+                .thenMany(Flux.fromIterable(descriptor.ddlStatements())
+                        .concatMap(ddl -> executeUpdate(connection, ddl)))
+                .then()
+                .doOnError(PostgresSchemaManager::isLockNotAvailable, error -> LOGGER.warn("PostgreSQL schema {} "
+                                + "for component '{}' gave up after waiting {} for a table lock (lock_timeout); "
+                                + "nothing was changed. Another session holds a conflicting lock on one of the "
+                                + "component's tables, e.g. a running CREATE INDEX CONCURRENTLY or DROP INDEX "
+                                + "CONCURRENTLY, a long transaction or an autovacuum.", phase, descriptor.component(),
+                        DDL_LOCK_TIMEOUT));
+    }
+
+    private static boolean isLockNotAvailable(final Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause() == t ? null : t.getCause()) {
+            if (t instanceof R2dbcException r2dbcException
+                    && LOCK_NOT_AVAILABLE.equals(r2dbcException.getSqlState())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Mono<StoredSchemaVersion> readStoredVersion(final Connection connection) {
@@ -473,7 +608,8 @@ public final class PostgresSchemaManager {
 
     /**
      * Inserts the component's row or advances it to this code's version, checksum and {@code min_compatible_version}.
-     * Only reached on {@link SchemaVersionDecision#APPLY}, i.e. never when the stored version is newer.
+     * Only reached on {@link SchemaVersionDecision#APPLY} and {@link SchemaVersionDecision#UP_TO_DATE} (unchanged
+     * values), i.e. never when the stored version is newer.
      */
     private Mono<Void> upsertRow(final Connection connection, final String checksum) {
         return executeUpdate(connection,

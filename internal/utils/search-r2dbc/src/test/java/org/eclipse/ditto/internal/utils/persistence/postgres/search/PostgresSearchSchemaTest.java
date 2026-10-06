@@ -147,6 +147,17 @@ public final class PostgresSearchSchemaTest {
                 .hasSize(64);
     }
 
+    @Test
+    public void everyTableAndIndexOfTheDdlIsNamedForTheSameVersionFastPath() {
+        // A same-version boot skips the DDL only when all of these exist; an unparsable CREATE statement would make
+        // the Optional empty and every boot run the DDL (and wait for a running per-path index build).
+        assertThat(PostgresSchemaManager.namedRelations(PostgresSearchSchema.descriptor())).hasValue(List.of(
+                "search_things", "st_namespace", "st_global_read", "st_policy", "st_referenced_pols",
+                "st_delete_at", "st_modified",
+                "search_flat", "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm",
+                "search_sync"));
+    }
+
     private static int indexOfStatementStartingWith(final List<String> ddl, final String prefix) {
         for (int i = 0; i < ddl.size(); i++) {
             if (ddl.get(i).startsWith(prefix)) {

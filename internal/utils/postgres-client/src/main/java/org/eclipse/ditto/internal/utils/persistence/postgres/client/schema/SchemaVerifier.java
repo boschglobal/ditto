@@ -14,6 +14,7 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.client.schema;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.annotation.Nullable;
 
@@ -26,6 +27,8 @@ import javax.annotation.Nullable;
  *     DDL, runs against a newer but compatible schema without touching it, or refuses (same-version checksum drift, or
  *     a newer schema this code is not compatible with). See {@link #verifyStoredVersion} and
  *     {@link #verifyStoredVersionForHeal}.</li>
+ *     <li>the <strong>same-version fast path</strong> — {@link #decideComponentDdl}: a current row whose DDL relations
+ *     all exist runs no DDL.</li>
  *     <li><strong>live-catalog guard</strong> — each table's actual primary-key definition, column types, and the
  *     {@code COLLATE "C"} collation of its persistence-id columns (read from the catalog) must match the canonical
  *     contract, because {@code CREATE TABLE IF NOT EXISTS} silently keeps a divergent pre-existing table that the
@@ -122,6 +125,53 @@ public final class SchemaVerifier {
                     storedMinCompatibleVersion);
         }
         return SchemaVersionDecision.APPLY;
+    }
+
+    /**
+     * Whether the stored {@code schema_version} row describes exactly this code's schema: the same version and the same
+     * checksum. Only then may a boot or self-heal skip the component DDL
+     * ({@link #decideComponentDdl(SchemaVersionDecision, boolean, Set)}).
+     *
+     * @param currentVersion the current code schema version for the component.
+     * @param expectedChecksum the current code checksum.
+     * @param storedVersion the stored version, or {@code null} when there is no row.
+     * @param storedChecksum the stored checksum, or {@code null} when there is no row.
+     * @return {@code true} if both match.
+     */
+    public static boolean storedRowIsCurrent(final int currentVersion, final String expectedChecksum,
+            @Nullable final Integer storedVersion, @Nullable final String storedChecksum) {
+        return storedVersion != null && storedVersion == currentVersion && expectedChecksum.equals(storedChecksum);
+    }
+
+    /**
+     * The same-version fast path, decided after {@link #verifyStoredVersion} (boot) or
+     * {@link #verifyStoredVersionForHeal} (self-heal) returned:
+     * <table>
+     *   <caption>Component DDL decision</caption>
+     *   <tr><th>Version decision</th><th>Stored row current</th><th>Missing relations</th><th>Result</th></tr>
+     *   <tr><td>{@link SchemaVersionDecision#APPLY}</td><td>yes</td><td>none</td>
+     *   <td>{@link SchemaVersionDecision#UP_TO_DATE} — no DDL</td></tr>
+     *   <tr><td>{@link SchemaVersionDecision#APPLY}</td><td>yes</td><td>some, or unknown ({@code null})</td>
+     *   <td>{@link SchemaVersionDecision#APPLY}</td></tr>
+     *   <tr><td>{@link SchemaVersionDecision#APPLY}</td><td>no (first boot, upgrade, drifted heal)</td>
+     *   <td>any</td><td>{@link SchemaVersionDecision#APPLY}</td></tr>
+     *   <tr><td>{@link SchemaVersionDecision#COMPATIBLE_NEWER}</td><td>any</td><td>any</td>
+     *   <td>{@link SchemaVersionDecision#COMPATIBLE_NEWER} (unchanged)</td></tr>
+     * </table>
+     *
+     * @param versionDecision what the stored version allows.
+     * @param storedRowIsCurrent {@link #storedRowIsCurrent(int, String, Integer, String)}.
+     * @param missingRelations the tables and indexes of the component's DDL that do not exist, or {@code null} when
+     * they are unknown (the DDL could not be named, or nothing was probed).
+     * @return the decision.
+     */
+    public static SchemaVersionDecision decideComponentDdl(final SchemaVersionDecision versionDecision,
+            final boolean storedRowIsCurrent, @Nullable final Set<String> missingRelations) {
+        if (versionDecision == SchemaVersionDecision.APPLY && storedRowIsCurrent && missingRelations != null
+                && missingRelations.isEmpty()) {
+            return SchemaVersionDecision.UP_TO_DATE;
+        }
+        return versionDecision;
     }
 
     private static SchemaVersionDecision decideNewer(final String refusal, final String component,

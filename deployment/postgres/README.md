@@ -259,8 +259,9 @@ short statements that are read completely before the ping uses them (see
   `CREATE INDEX CONCURRENTLY` builds (per-path search indexes) run as the DDL role
   and must not be cut off by a role-level timeout. The bootstrap is still bounded
   by `ditto.postgresql.statement-timeout` wherever that startup parameter reaches
-  the server; the per-path index builds set `statement_timeout = 0` for their own
-  session.
+  the server; a boot that runs DDL also waits at most 500 ms for each table lock
+  (`lock_timeout`, see [Schema upgrades](#schema-upgrades)); the per-path index
+  builds set `statement_timeout = 0` for their own session.
 - **Without a separate DDL role the default also applies to DDL.** When
   `ddl-credentials` are empty (`POSTGRES_DDL_USER` unset), Ditto runs the schema
   bootstrap as the runtime role, so the runtime role's timeout default applies to
@@ -458,9 +459,22 @@ it runs any DDL and decides:
 |---|---|
 | none (first boot) | creates the schema, verifies the catalog, inserts the row |
 | `version` older than the code | upgrade: runs its idempotent DDL, verifies the catalog, advances the row (including its own `min_compatible_version`) |
-| `version` equal to the code | runs its idempotent DDL and verifies the catalog; a checksum mismatch refuses to boot (drift) |
+| `version` equal to the code | a checksum mismatch refuses to boot (drift). Checksum matches: if every table and index its DDL creates exists, runs **no** DDL (no lock on the component's tables), verifies the catalog and rewrites the row unchanged; otherwise runs its idempotent DDL (re-creating what is missing) and verifies the catalog |
 | `version` newer, `min_compatible_version` ≤ code | **compatible newer** (rolling upgrade in progress): runs **no** DDL and does **not** write the row; only verifies the catalog facts it needs (primary keys, column types, `COLLATE "C"`; extra columns or extra/dropped indexes are fine); logs an INFO line naming both versions |
 | `version` newer, `min_compatible_version` > code | refuses to boot; the message names `min_compatible_version` |
+
+Every boot (and self-heal) that runs DDL first sets `SET LOCAL lock_timeout = '500ms'` in its transaction, after
+the advisory lock: each DDL statement waits at most 500 ms for a table lock, below PostgreSQL's default
+`deadlock_timeout` (1 s). A boot that meets a conflicting lock — a running `CREATE INDEX CONCURRENTLY` or
+`DROP INDEX CONCURRENTLY` (per-path search indexes), a long transaction, or an autovacuum of that table (a lock
+wait shorter than `deadlock_timeout` does not make PostgreSQL cancel the autovacuum) — fails with SQLSTATE `55P03`,
+changes nothing, logs a WARN naming the component, and is retried at the next start. On large, busy tables a
+schema upgrade may therefore need several start attempts; cancelling the blocking autovacuum worker
+(`pg_cancel_backend`) lets the next one through.
+
+Consequence of the same-version rule: a manually dropped table or index is re-created at the next start, but a
+manually changed or reset reloption (e.g. `autovacuum_vacuum_scale_factor`) is not re-applied until the next
+schema version bump or a self-heal that runs the DDL.
 
 A row written before the `min_compatible_version` column existed has it `NULL`, which counts as
 `min_compatible_version = version`. The first boot of an image with this check adds the column and
@@ -477,7 +491,8 @@ privileges on `schema_version` as before this change (`SELECT`, `INSERT`, `UPDAT
 The runtime self-heal (re-creating a missing table on SQLSTATE `42P01`) follows the same rule: if the
 stored version is newer, it runs no DDL. With a compatible newer schema the heal is a no-op and the
 failed statement is retried once. With an incompatible one the heal fails and the original error
-surfaces.
+surfaces. With the same version and checksum it follows the boot's rule as well: it runs no DDL while
+every table and index exists, and its DDL runs under the same 500 ms `lock_timeout`.
 
 ### Rolling upgrades
 

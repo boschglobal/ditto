@@ -61,8 +61,8 @@ import reactor.core.publisher.Mono;
  * </p>
  * <p>
  * Each heal that recreates a component's schema emits a WARN log + increments {@link PostgresMetrics#SELF_HEAL_COUNT}
- * (a heal that runs no DDL because the stored schema version is newer and compatible is neither logged as a
- * recreation nor counted): the heal <strong>masks data loss</strong>
+ * (a heal that runs no DDL because the stored schema version is newer and compatible, or because every table and
+ * index of the schema exists, is neither logged as a recreation nor counted): the heal <strong>masks data loss</strong>
  * (a wiped database silently self-heals to empty tables), the same trade-off MongoDB already has. Operators wanting
  * fail-loud set {@code ditto.postgresql.schema.self-heal = false} ({@link #isEnabled()} then {@code false}, and the
  * original error surfaces unchanged).
@@ -198,7 +198,7 @@ public final class PostgresSchemaHealer {
                     + "instead.", descriptor.component());
             incrementHealCounter();
         }
-        // COMPATIBLE_NEWER: no DDL ran (a newer, compatible schema owns it); PostgresSchemaManager logged why at INFO.
+        // COMPATIBLE_NEWER / UP_TO_DATE: no DDL ran; PostgresSchemaManager logged why at INFO.
     }
 
     private void incrementHealCounter() {

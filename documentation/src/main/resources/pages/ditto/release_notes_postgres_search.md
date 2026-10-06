@@ -71,10 +71,10 @@ configure **per-path search indexes** (`ditto.postgresql.search.path-indexes`, t
 custom search indexes): a partial trigram index restricted to one path, built in the background with
 `CREATE INDEX CONCURRENTLY` after the schema bootstrap, repaired if a build fails, and dropped when its path is removed
 from the list (an unset list manages nothing; an explicitly empty one drops them all). With it, the same queries took
-111.1–111.2 ms p95. Building the indexes needs a direct (not transaction-pooled) database connection, and no search
-instance should be started or restarted while an index is being built or dropped: a starting instance's schema
-bootstrap waits for the build and stalls index writes meanwhile. See the PostgreSQL search section of the installation
-guide.
+111.1–111.2 ms p95. Building the indexes needs a direct (not transaction-pooled) database connection. Search instances
+can be started and restarted while an index is built: a start whose schema is up to date runs no schema DDL, and one
+that has to run DDL gives up after 500 ms instead of stalling index writes. See the PostgreSQL search section of the
+installation guide.
 
 ## Mongo-only search knobs ignored on PostgreSQL
 

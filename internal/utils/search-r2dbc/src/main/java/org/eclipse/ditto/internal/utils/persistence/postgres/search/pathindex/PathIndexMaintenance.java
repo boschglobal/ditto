@@ -83,17 +83,15 @@ import reactor.core.publisher.Mono;
  * </ol>
  * <p>
  * The connection is a dedicated, non-pooled DDL-role connection: a build never holds a connection of the runtime pool.
- * The build itself does not block the running instances' reads and writes. A search instance that <em>starts</em>
- * while a build or drop runs does interfere: its schema bootstrap re-runs {@code CREATE INDEX IF NOT EXISTS} on
- * {@code search_flat}, which waits for the build's lock and meanwhile stalls index writes of all instances (up to the
- * bootstrap's statement timeout), or PostgreSQL's deadlock detector aborts the build. The operator docs therefore say
- * not to start or restart search instances during a build.
+ * The build itself does not block the running instances' reads and writes, and a search instance that starts
+ * meanwhile does not wait for it: a start whose search schema is up to date runs no schema DDL (no lock on
+ * {@code search_flat}), and a start that has to run DDL gives up after the schema bootstrap's 500 ms
+ * {@code lock_timeout} instead of stalling writes or deadlocking the build.
  * </p>
  * <p>
- * If the service stops mid-build, PostgreSQL keeps running the {@code CREATE INDEX CONCURRENTLY} (unless an instance
- * that starts meanwhile deadlocks it, see above) and releases the lock when that backend ends; if the build is
- * cancelled, aborted or the backend killed, the INVALID index is repaired at the next start of any instance, which is
- * a full build again.
+ * If the service stops mid-build, PostgreSQL keeps running the {@code CREATE INDEX CONCURRENTLY} and releases the
+ * lock when that backend ends; if the build is cancelled, aborted or the backend killed, the INVALID index is
+ * repaired at the next start of any instance, which is a full build again.
  * </p>
  */
 @ThreadSafe
@@ -364,12 +362,10 @@ public final class PathIndexMaintenance {
         return Mono.defer(() -> {
             final Instant start = Instant.now();
             LOGGER.info("Building search path index {} ({}/{}): {} on <{}> (wpath <{}>) with CREATE INDEX "
-                            + "CONCURRENTLY. The build does not block the running instances' reads and writes, but "
-                            + "do not start or restart search instances until 'Built search path index {}' is "
-                            + "logged: a starting instance's schema bootstrap waits for the build and stalls index "
-                            + "writes meanwhile. Until the index is valid, queries on this path use the table-wide "
+                            + "CONCURRENTLY. The build blocks neither the running instances' reads and writes nor "
+                            + "starting instances. Until the index is valid, queries on this path use the table-wide "
                             + "index.", index.name(), position, total,
-                    index.kind().getConfigValue(), index.path(), index.wpath(), index.name());
+                    index.kind().getConfigValue(), index.path(), index.wpath());
             final Disposable progress = Flux.interval(progressInterval, progressInterval)
                     .concatMap(tick -> progress(pid).onErrorResume(error -> Mono.empty()))
                     .subscribe(state -> LOGGER.info("Building search path index {}: {}, {} s elapsed.", index.name(),

@@ -15,6 +15,7 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.schema;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
+import java.util.stream.Stream;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.junit.Test;
@@ -124,6 +125,18 @@ public final class PostgresSchemaTest {
     public void doesNotUseSessionAdvisoryLockOrIndisvalidRebuild() {
         assertThat(DDL).noneMatch(s -> s.contains("CONCURRENTLY"));
         assertThat(DDL).noneMatch(s -> s.contains("pg_advisory_lock("));   // the bootstrap uses pg_advisory_XACT_lock
+    }
+
+    @Test
+    public void everyTableAndIndexOfTheDdlIsNamedForTheSameVersionFastPath() {
+        // E_journal_seq has no named index: the fast path must name tables too, or a dropped one would never be
+        // re-created by a same-version boot or a self-heal.
+        final List<String> expected = PostgresSchema.ENTITIES.stream()
+                .flatMap(entity -> Stream.of(entity + "_journal", entity + "_journal_tags_idx",
+                        entity + "_journal_seq", entity + "_snaps", entity + "_snaps_lifecycle_idx"))
+                .toList();
+
+        assertThat(PostgresSchemaManager.namedRelations(PostgresSchema.descriptor())).hasValue(expected);
     }
 
     private static String stmtContaining(final String needle) {

@@ -20,10 +20,20 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.client.schema;
 public enum SchemaVersionDecision {
 
     /**
-     * No stored row yet, an older stored version, or the same version: run this code's DDL. At boot the catalog is then
-     * verified and the row is inserted or advanced to this code's version, checksum and {@code min_compatible_version}.
+     * No stored row yet, an older stored version, or the same version with something missing: run this code's DDL. At
+     * boot the catalog is then verified and the row is inserted or advanced to this code's version, checksum and
+     * {@code min_compatible_version}.
      */
     APPLY,
+
+    /**
+     * The stored row has exactly this code's version and checksum, and every table and index this code's DDL creates
+     * exists ({@link PostgresSchemaManager#namedRelations(PostgresSchemaDescriptor)}): run <strong>no</strong> DDL, so
+     * the boot takes no lock on the component's tables. At boot the catalog is still verified and the row is upserted
+     * with unchanged values; a self-heal does nothing (the caller's single retry then decides). Statements that change
+     * existing objects (reloptions, {@code DROP INDEX IF EXISTS}) are therefore not re-applied by such a boot.
+     */
+    UP_TO_DATE,
 
     /**
      * The stored version is newer than this code's, and its {@code min_compatible_version} is at most this code's

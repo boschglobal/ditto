@@ -84,7 +84,13 @@ public interface PostgresSchemaDescriptor {
     /**
      * @return the ordered list of this component's own DDL statements (CREATE TABLE / CREATE INDEX / ALTER TABLE …),
      * each {@code IF NOT EXISTS}, <strong>excluding</strong> the shared {@code schema_version} table (owned by the
-     * manager). Order is stable so the checksum is deterministic.
+     * manager). Order is stable so the checksum is deterministic. A statement that creates a table or index must have
+     * the form {@code CREATE TABLE IF NOT EXISTS <name> (…} or {@code CREATE INDEX IF NOT EXISTS <name> ON …} with a
+     * plain lower-case name: a same-version boot skips the DDL only if every relation named so exists
+     * ({@link PostgresSchemaManager#namedRelations(PostgresSchemaDescriptor)}), and any other creating statement makes
+     * every boot run the DDL. Statements that change existing objects ({@code ALTER TABLE … SET (…)},
+     * {@code DROP INDEX IF EXISTS}) are applied only by boots that run the DDL (first boot, a version bump, a missing
+     * relation) — ship such a change with a version bump.
      */
     List<String> ddlStatements();
 
