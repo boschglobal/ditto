@@ -112,6 +112,12 @@ Two `include` rules are load-bearing:
 | `POSTGRES_POOL_ACQUIRE_RETRY` | no | `0` | Acquire retries; each re-runs the full `max-acquire-time`. Keep `0` |
 | `POSTGRES_POOL_PENDING_ACQUIRE_MAX_SIZE` | no | *(2 × max-size)* | Borrowers allowed to wait once the pool is full; beyond it they fail immediately ("pool overload"). `-1` = unbounded (discouraged) |
 | `POSTGRES_CONNECT_TIMEOUT` | no | `2s` | TCP/TLS connect timeout; keep below `max-acquire-time` |
+| `BREAKER_MAXTRIES` | no | `5` | Journal circuit breaker: failures that open it. Same variable as for the MongoDB journal; the Helm chart always sets it (`<service>.config.mongodb.journalCircuitBreaker.maxTries`) |
+| `BREAKER_TIMEOUT` | no | `5s` | Journal circuit breaker: a call slower than this counts as a failure |
+| `BREAKER_RESET` | no | `3s` | Journal circuit breaker: how long it stays open before one trial call |
+| `SNAPSHOT_BREAKER_MAXTRIES` | no | `5` | Snapshot-store circuit breaker: failures that open it. Every recovery starts with a snapshot load, so under pool overload this breaker usually opens first; the Helm chart always sets it (`<service>.config.mongodb.snapsCircuitBreaker.maxTries`) |
+| `SNAPSHOT_BREAKER_TIMEOUT` | no | `10s` | Snapshot-store circuit breaker: a call slower than this counts as a failure |
+| `SNAPSHOT_BREAKER_RESET` | no | `6s` | Snapshot-store circuit breaker: how long it stays open; meanwhile every recovery of the service fails at once |
 | `POSTGRES_READ_JOURNAL_ENTITY` | no | *(service default)* | Override the read-journal entity binding |
 
 ---

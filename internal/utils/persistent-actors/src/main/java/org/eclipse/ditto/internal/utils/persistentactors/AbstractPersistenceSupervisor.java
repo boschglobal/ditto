@@ -22,6 +22,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
 
@@ -83,6 +84,7 @@ import org.eclipse.ditto.internal.utils.pekko.actors.AbstractActorWithStashWithT
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoLoggerFactory;
 import org.eclipse.ditto.internal.utils.pekko.logging.ThreadSafeDittoLoggingAdapter;
 import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
+import org.eclipse.ditto.internal.utils.persistence.api.PersistenceOverload;
 import org.eclipse.ditto.internal.utils.persistence.api.serializer.EventSerializer;
 import org.eclipse.ditto.internal.utils.tracing.DittoTracing;
 import org.eclipse.ditto.internal.utils.tracing.span.SpanOperationName;
@@ -772,7 +774,8 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
                 if (withDittoHeaders instanceof Signal<?> signal) {
                     signalTransformer.apply(signal, persistenceActorChild)
                             .whenComplete(
-                                    (result, error) -> handleOptionalTransformationException(signal, error, sender))
+                                    (result, error) -> handleOptionalTransformationException(signal, error, sender,
+                                            false))
                             .thenAccept(transformed -> persistenceActorChild.tell(transformed, sender));
                 } else {
                     persistenceActorChild.tell(withDittoHeaders, sender);
@@ -784,18 +787,53 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
     }
 
     private void handleOptionalTransformationException(final Signal<?> signal,
-            @Nullable final Throwable error, final ActorRef sender) {
+            @Nullable final Throwable error, final ActorRef sender, final boolean persistenceActorAbsent) {
 
         if (error != null) {
             log.withCorrelationId(signal)
                     .info("Got error during signal transformation: <{}>", error);
-            final var dre = DittoRuntimeException.asDittoRuntimeException(error,
-                    reason -> DittoInternalErrorException.newBuilder()
-                            .dittoHeaders(signal.getDittoHeaders())
-                            .cause(reason)
-                            .build());
+            final var dre = getTransformationExceptionAsRuntimeException(error, signal.getDittoHeaders(),
+                    persistenceActorAbsent, () -> getUnavailableExceptionBuilder(entityId));
             sender.tell(dre, ActorRef.noSender());
         }
+    }
+
+    /**
+     * Maps a failed signal transformation to the exception its sender gets.
+     * <p>
+     * A signal transformer may ask the persistence actor, e.g. whether the entity exists. When the persistence is
+     * overloaded, that actor stops without a reply (its recovery or journal write failed, e.g. on an open circuit
+     * breaker or a full connection pool) or is not running (back-off after such a stop), so the transformation fails
+     * with an {@link AskTimeoutException} or because there was no persistence actor to ask. These failures, and
+     * persistence overload itself ({@link PersistenceOverload#isOverload(Throwable)}), are answered with the entity's
+     * "unavailable" exception (HTTP 503), as when the persistence actor is down. A {@link DittoRuntimeException} is
+     * passed on; any other failure becomes a {@link DittoInternalErrorException} (HTTP 500).
+     * </p>
+     *
+     * @param error the failure of the transformation.
+     * @param dittoHeaders the headers of the transformed signal.
+     * @param persistenceActorAbsent whether there was no persistence actor when the transformation started.
+     * @param unavailableExceptionBuilder supplies the builder of the entity's "unavailable" exception.
+     * @return the exception to send to the signal's sender.
+     */
+    static DittoRuntimeException getTransformationExceptionAsRuntimeException(final Throwable error,
+            final DittoHeaders dittoHeaders,
+            final boolean persistenceActorAbsent,
+            final Supplier<DittoRuntimeExceptionBuilder<?>> unavailableExceptionBuilder) {
+
+        final Throwable rootCause = unwrapCompletionException(error);
+        if (!(rootCause instanceof DittoRuntimeException) && (persistenceActorAbsent ||
+                rootCause instanceof AskTimeoutException || PersistenceOverload.isOverload(rootCause))) {
+            return unavailableExceptionBuilder.get()
+                    .dittoHeaders(dittoHeaders)
+                    .cause(rootCause)
+                    .build();
+        }
+        return DittoRuntimeException.asDittoRuntimeException(error,
+                reason -> DittoInternalErrorException.newBuilder()
+                        .dittoHeaders(dittoHeaders)
+                        .cause(reason)
+                        .build());
     }
 
     /**
@@ -820,9 +858,11 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
                 if (shouldBecomeTwinSignalProcessingAwaiting(signal)) {
                     becomeTwinSignalProcessingAwaiting();
                 }
+                final boolean persistenceActorAbsent = null == persistenceActorChild;
                 final var syncCs = signalTransformer.apply(signal, persistenceActorChild)
                         .whenCompleteAsync((result, error) ->
-                                handleOptionalTransformationException(signal, error, sender),
+                                handleOptionalTransformationException(signal, error, sender,
+                                        persistenceActorAbsent),
                                 enforcementExecutor
                         )
                         .thenComposeAsync(transformed ->
@@ -921,6 +961,13 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
                     .warning("Enforcement of signal for entity <{}> timed out: {}",
                             entityId, rootCause.getMessage());
             dre = EnforcementTimeoutException.newBuilder()
+                    .dittoHeaders(signal.getDittoHeaders())
+                    .cause(rootCause)
+                    .build();
+        } else if (PersistenceOverload.isOverload(rootCause)) {
+            log.withCorrelationId(signal)
+                    .warning("Persistence of entity <{}> is overloaded: {}", entityId, rootCause.getMessage());
+            dre = getUnavailableExceptionBuilder(entityId)
                     .dittoHeaders(signal.getDittoHeaders())
                     .cause(rootCause)
                     .build();

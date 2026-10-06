@@ -26,18 +26,22 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import javax.annotation.Nullable;
 
 import org.apache.pekko.actor.ActorRef;
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.actor.Props;
+import org.apache.pekko.actor.Status;
+import org.apache.pekko.pattern.CircuitBreakerOpenException;
 import org.apache.pekko.testkit.TestActorRef;
 import org.apache.pekko.testkit.TestProbe;
 import org.apache.pekko.testkit.javadsl.TestKit;
 import org.eclipse.ditto.base.model.auth.AuthorizationContext;
 import org.eclipse.ditto.base.model.auth.AuthorizationSubject;
 import org.eclipse.ditto.base.model.auth.DittoAuthorizationContextType;
+import org.eclipse.ditto.base.model.exceptions.DittoInternalErrorException;
 import org.eclipse.ditto.base.model.exceptions.DittoRuntimeException;
 import org.eclipse.ditto.base.model.exceptions.DittoRuntimeExceptionBuilder;
 import org.eclipse.ditto.base.model.headers.DittoHeaderDefinition;
@@ -49,6 +53,7 @@ import org.eclipse.ditto.base.model.signals.events.Event;
 import org.eclipse.ditto.base.service.actors.ShutdownBehaviour;
 import org.eclipse.ditto.base.service.config.supervision.DefaultLocalAskTimeoutConfig;
 import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
+import org.eclipse.ditto.internal.utils.persistence.api.PersistenceOverload;
 import org.eclipse.ditto.internal.utils.persistence.mongo.streaming.MongoReadJournal;
 import org.eclipse.ditto.internal.utils.persistentactors.AbstractPersistenceSupervisor;
 import org.eclipse.ditto.internal.utils.tracing.DittoTracingInitResource;
@@ -102,6 +107,8 @@ import org.junit.Test;
 import org.mockito.Mockito;
 
 import com.typesafe.config.ConfigFactory;
+
+import scala.concurrent.duration.FiniteDuration;
 
 /**
  * Tests {@link PolicyCommandEnforcement} in context of a {@link PolicyEnforcerActor}.
@@ -262,6 +269,43 @@ public final class PolicyCommandEnforcementTest {
 
             expectMsg(mockResponse);
             verify(policyEnforcerProvider, times(1)).getPolicyEnforcer(POLICY_ID);
+        }};
+    }
+
+    @Test
+    public void persistenceActorFailingWithAnOpenCircuitBreakerIsAnsweredUnavailable() {
+        assertPersistenceActorFailureIsAnsweredWith(new CircuitBreakerOpenException(
+                        new FiniteDuration(3L, TimeUnit.SECONDS), "Circuit Breaker is open; calls are failing fast"),
+                PolicyUnavailableException.class);
+    }
+
+    @Test
+    public void persistenceActorFailingWithABackendOverloadIsAnsweredUnavailable() {
+        assertPersistenceActorFailureIsAnsweredWith(new BackendOverload(), PolicyUnavailableException.class);
+    }
+
+    @Test
+    public void persistenceActorFailingWithAnotherErrorIsStillAnInternalError() {
+        assertPersistenceActorFailureIsAnsweredWith(new IllegalStateException("not an overload"),
+                DittoInternalErrorException.class);
+    }
+
+    private void assertPersistenceActorFailureIsAnsweredWith(final Throwable failure,
+            final Class<? extends DittoRuntimeException> expectedResponse) {
+
+        new TestKit(system) {{
+            final ModifyPolicyEntries modifyPolicyEntries =
+                    ModifyPolicyEntries.of(POLICY_ID, Collections.singleton(POLICY_ENTRY), DITTO_HEADERS);
+            mockDefaultPolicyEnforcerResponse();
+
+            supervisor.tell(modifyPolicyEntries, getRef());
+
+            policyPersistenceActorProbe.expectMsg(modifyPolicyEntries);
+            policyPersistenceActorProbe.lastSender()
+                    .tell(new Status.Failure(failure), policyPersistenceActorProbe.ref());
+
+            final DittoRuntimeException response = expectMsgClass(expectedResponse);
+            assertThat(response.getDittoHeaders().getCorrelationId()).contains(CORRELATION_ID);
         }};
     }
 
@@ -844,6 +888,16 @@ public final class PolicyCommandEnforcementTest {
         when(config.getAllNamespaceRootPolicyIds()).thenReturn(Collections.emptySet());
         when(config.getNamespacesForRootPolicy(Mockito.any())).thenReturn(Collections.emptySet());
         return config;
+    }
+
+    /** A backend exception that marks persistence overload, e.g. PostgresPoolOverloadException. */
+    private static final class BackendOverload extends RuntimeException implements PersistenceOverload {
+
+        private static final long serialVersionUID = 1L;
+
+        private BackendOverload() {
+            super("store out of capacity");
+        }
     }
 
 }
