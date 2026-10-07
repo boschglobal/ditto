@@ -20,6 +20,7 @@ import java.time.Duration;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -142,7 +143,7 @@ public final class PostgresSearchSchemaManagerIT {
         assertThat(reloptions("search_things")).isEqualTo(V2_RELOPTIONS);
         assertThat(reloptions("search_flat")).isEqualTo(V2_RELOPTIONS);
         assertThat(reloptions("search_sync")).as("search_sync keeps the server defaults").isEqualTo(NO_RELOPTIONS);
-        assertThat(storedRow()).isEqualTo("2/" + PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor())
+        assertThat(storedRow()).isEqualTo("3/" + PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor())
                 + "/1");
     }
 
@@ -157,7 +158,7 @@ public final class PostgresSearchSchemaManagerIT {
         final String flatFile = relfilenode("search_flat");
 
         // the first v2 pod of a rolling upgrade
-        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchemaV2.descriptor()).bootstrap();
 
         assertThat(reloptions("search_things")).isEqualTo(V2_RELOPTIONS);
         assertThat(reloptions("search_flat")).isEqualTo(V2_RELOPTIONS);
@@ -166,15 +167,32 @@ public final class PostgresSearchSchemaManagerIT {
                 .isEqualTo(thingsFile);
         assertThat(relfilenode("search_flat")).as("setting reloptions does not rewrite the table")
                 .isEqualTo(flatFile);
-        assertThat(storedRow()).isEqualTo("2/" + PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor())
-                + "/1");
+        assertThat(storedRow()).isEqualTo("2/" + PostgresSearchSchemaV2.CHECKSUM + "/1");
+    }
+
+    @Test
+    public void upgradeFromV2AdvancesTheRowTo3WithTheSameChecksumAndBuildsNoIndexInTheBootstrap() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchemaV2.descriptor()).bootstrap();
+        assertThat(storedRow()).isEqualTo("2/" + PostgresSearchSchemaV2.CHECKSUM + "/1");
+        final String flatFile = relfilenode("search_flat");
+
+        // the first v3 pod of a rolling upgrade
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+
+        assertThat(storedRow()).isEqualTo("3/" + PostgresSearchSchemaV2.CHECKSUM + "/1");
+        assertThat(indexExists(SystemSearchIndex.MULTI_VALUED.indexName()))
+                .as("sf_multi is built CONCURRENTLY by the maintenance, never by the bootstrap transaction")
+                .isFalse();
+        assertThat(relfilenode("search_flat")).isEqualTo(flatFile);
+        assertThat(reloptions("search_flat")).isEqualTo(V2_RELOPTIONS);
     }
 
     @Test
     public void v1BootsAgainstAStoredV2SchemaWithoutRunningDdlOrTouchingTheRow() {
         reset();
         PostgresSchemaManager.of(connectionFactory, PostgresSearchSchemaV1.descriptor()).bootstrap();
-        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchemaV2.descriptor()).bootstrap();
         final String v2Row = storedRow();
         // Probe for "no DDL ran": the v1 DDL re-creates this index (CREATE INDEX IF NOT EXISTS) whenever it runs.
         runDdl("DROP INDEX sf_exists");
@@ -185,7 +203,7 @@ public final class PostgresSearchSchemaManagerIT {
 
             assertThat(indexExists("sf_exists")).as("v1 DDL must not run against the v2 schema").isFalse();
             assertThat(storedRow()).as("the row is not written back to v1").isEqualTo(v2Row)
-                    .isEqualTo("2/" + PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor()) + "/1");
+                    .isEqualTo("2/" + PostgresSearchSchemaV2.CHECKSUM + "/1");
             assertThat(reloptions("search_things")).isEqualTo(V2_RELOPTIONS);
             assertThat(reloptions("search_flat")).isEqualTo(V2_RELOPTIONS);
             assertThat(managerLog.list.stream()
@@ -195,6 +213,29 @@ public final class PostgresSearchSchemaManagerIT {
                             .contains("stored schema version 2")
                             .contains("this code's version 1")
                             .contains("Running no DDL"));
+        } finally {
+            releaseManagerLog(managerLog);
+        }
+    }
+
+    @Test
+    public void v2BootsAgainstAStoredV3SchemaWithoutRunningDdlOrTouchingTheRow() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSearchSchema.descriptor()).bootstrap();
+        final String v3Row = storedRow();
+        // Probe for "no DDL ran": the v2 DDL re-creates this index (CREATE INDEX IF NOT EXISTS) whenever it runs.
+        runDdl("DROP INDEX sf_exists");
+        final ListAppender<ILoggingEvent> managerLog = captureManagerLog();
+        try {
+            // a not-yet-upgraded v2 pod restarts mid-roll
+            PostgresSchemaManager.of(connectionFactory, PostgresSearchSchemaV2.descriptor()).bootstrap();
+
+            assertThat(indexExists("sf_exists")).as("v2 DDL must not run against the v3 schema").isFalse();
+            assertThat(storedRow()).isEqualTo(v3Row).isEqualTo("3/" + PostgresSearchSchemaV2.CHECKSUM + "/1");
+            assertThat(managerLog.list.stream().filter(event -> event.getLevel() == Level.INFO)
+                    .map(ILoggingEvent::getFormattedMessage))
+                    .anySatisfy(message -> assertThat(message).contains("stored schema version 3")
+                            .contains("this code's version 2").contains("Running no DDL"));
         } finally {
             releaseManagerLog(managerLog);
         }

@@ -221,6 +221,19 @@ Reading the table (all from the committed plans and per-iteration tables):
     neither settles.
   - The benchmarked 48 ms rescue materialised the ~1.4% temperature **range** instead, and ran with the bench-only
     covering indexes.
+  - **Selective range leg (2026-10-06):** the CTE may now start from a same-path two-sided numeric range (rows in the
+    range + the multi-valued rows of the path via the system index `sf_multi`, search schema v3); with an equality and
+    a range the statement counts both and materialises the smaller.
+    - Back-to-back on a fresh corpus (ABBA + B3, all-rounds warm p95): shape 1 6,801 → 3,749 ms (A mean → B mean),
+      shape 5 5,227 → 5,934 ms; the leg is picked right every time (range for shapes 1/5 and `ce-b`, point for
+      `ce-a-sudo`; `ce-c` has only the range, and `ce-a` with the corpus's auth returns no row before any CTE runs),
+      but the **gate is missed**: the main statement then reads the whole city anyway (a bitmap scan of ~90k rows into
+      a merge/hash semi join instead of ~5 per-thing probes; the planner estimates the city at 1,223 rows).
+    - Not measured: a lone **wide** two-sided range, which is now materialised in full (no cap) where it had no CTE
+      before; see the evidence README.
+    - The host swapped heavily during these runs (shape 1's A runs are ~5× this section's baseline), so the absolute
+      numbers are inflated; the plans are the finding.
+    - Evidence: `results/production-config/selective-range-leg/`.
 - **Shape 2:** the plan drives from the ~29k `global_read` things (bitmap scan), filters by the per-field auth and
   probes the flat PK for each survivor.
   - It is executed **leader-only**, like every shipped `findAll` (see below).
@@ -330,6 +343,12 @@ Stages can be run individually (they build on each other in this order):
 | `down` | Remove the container (`--purge` also deletes the data volume) | seconds |
 | `production-config` | `pc-up pc-load pc-read pc-cold pc-bias`: the shipped-schema + shipped-translator baseline (§5), own container `ditto-search-bench-pc` (port 55433, volume `ditto-search-bench-pc-data`) | ~25 min at 1M (load 678 s; warm 551 s, cold 161 s, bias 11 s) |
 | `pc-load` / `pc-read` / `pc-cold` / `pc-bias` | the stages individually, in this order (`--rounds N`, `--cold-samples N`, `--results-dir DIR`); `pc-bias` only after `pc-cold` (it reads the pages the first cold samples need); `pc-status`, `pc-down [--purge]` | see above |
+| `pc-invariance` | the selective-leg requests (shapes 1/5, the counter-examples `ce-*`, two `attributes/region` array filters) with point legs only and with range legs: same request results and same full ordered sudo match lists (`invariance.md`), fails on a difference | hours at 1M (each iteration runs the request and the full sudo match list in both modes, ~1.7 min per shape-1 iteration) |
+
+Production-config knobs: `--range-legs auto|off` (selective range legs as the service uses them while the system
+index `sf_multi` is valid, or forced off: point legs only; recorded in `environment.md`) and `--variants LIST`
+(`pc-read`: only these variant ids, e.g. `1,5,2,ce-a,ce-a-sudo,ce-b,ce-c`). The `pc-load` catalog check includes
+`sf_multi`, so a corpus loaded with search schema v2 has to be reloaded.
 
 Knobs: `--count N` / `--seed N` (corpus), `--yes` (skip confirmation), `--quick` (50k corpus +
 short write windows — for demos only, numbers are not comparable), `MVN=<path>` to pick a Maven

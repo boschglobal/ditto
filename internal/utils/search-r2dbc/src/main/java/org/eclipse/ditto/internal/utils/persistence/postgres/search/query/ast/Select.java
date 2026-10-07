@@ -21,7 +21,7 @@ import javax.annotation.Nullable;
  * A {@code SELECT} statement (top-level query, {@code EXISTS} subquery, CTE body or lateral block), assembled via
  * {@link #builder()}. Renders as:
  * <pre>{@code [WITH [MATERIALIZED] cte, …] SELECT col[ AS a], … FROM table[ alias][ LEFT JOIN LATERAL …]
- *   [ WHERE …][ ORDER BY key[ DESC], …][ LIMIT …][ OFFSET …]}</pre>
+ *   [ WHERE …][ GROUP BY …][ UNION ALL <select> …][ ORDER BY key[ DESC], …][ LIMIT …][ OFFSET …]}</pre>
  * All value/path/pattern operands within it are {@code $n} binds; only the fixed grammar and validated identifiers are
  * rendered as text. The builder takes only public types + validated identifier strings, so the structural sub-nodes
  * ({@code SelectColumn}, {@code TableRef}, {@code Cte}, {@code LateralJoin}) stay package-internal.
@@ -35,6 +35,7 @@ public final class Select implements SqlNode {
     @Nullable
     private final SqlExpression where;
     private final List<SqlExpression> groupBy;
+    private final List<Select> unionAll;
     private final List<OrderByItem> orderBy;
     @Nullable
     private final SqlExpression limit;
@@ -54,6 +55,7 @@ public final class Select implements SqlNode {
         this.joins = List.copyOf(builder.joins);
         this.where = builder.where;
         this.groupBy = List.copyOf(builder.groupBy);
+        this.unionAll = List.copyOf(builder.unionAll);
         this.orderBy = List.copyOf(builder.orderBy);
         this.limit = builder.limit;
         this.offset = builder.offset;
@@ -82,6 +84,9 @@ public final class Select implements SqlNode {
         if (!groupBy.isEmpty()) {
             ctx.sql(" GROUP BY ").renderSeparated(groupBy, ", ");
         }
+        for (final Select branch : unionAll) {
+            ctx.sql(" UNION ALL ").render(branch);
+        }
         if (!orderBy.isEmpty()) {
             ctx.sql(" ORDER BY ").renderSeparated(orderBy, ", ");
         }
@@ -106,6 +111,7 @@ public final class Select implements SqlNode {
         @Nullable
         private SqlExpression where;
         private final List<SqlExpression> groupBy = new ArrayList<>();
+        private final List<Select> unionAll = new ArrayList<>();
         private final List<OrderByItem> orderBy = new ArrayList<>();
         @Nullable
         private SqlExpression limit;
@@ -161,6 +167,18 @@ public final class Select implements SqlNode {
         }
 
         /**
+         * Sets a subquery as the {@code FROM} source: {@code FROM (<subquery>) <alias>}.
+         *
+         * @param subquery the subquery.
+         * @param alias its (validated) alias.
+         * @return this builder.
+         */
+        public Builder from(final Select subquery, final String alias) {
+            this.from = new DerivedTable(subquery, alias);
+            return this;
+        }
+
+        /**
          * Adds a {@code LEFT JOIN LATERAL (subquery) alias ON true} block.
          *
          * @param subquery the lateral subquery.
@@ -192,6 +210,25 @@ public final class Select implements SqlNode {
          */
         public Builder groupBy(final SqlExpression expression) {
             groupBy.add(expression);
+            return this;
+        }
+
+        /**
+         * Appends {@code UNION ALL <branch>}. This builder's {@code ORDER BY}/{@code LIMIT}/{@code OFFSET} then apply to
+         * the whole union (PostgreSQL semantics), so a branch must be a plain {@code SELECT}: no {@code WITH},
+         * {@code ORDER BY}, {@code LIMIT}, {@code OFFSET} or union of its own.
+         *
+         * @param branch the branch.
+         * @return this builder.
+         * @throws IllegalArgumentException if the branch is not a plain {@code SELECT}.
+         */
+        public Builder unionAll(final Select branch) {
+            if (!branch.ctes.isEmpty() || !branch.orderBy.isEmpty() || branch.limit != null || branch.offset != null
+                    || !branch.unionAll.isEmpty()) {
+                throw new IllegalArgumentException("A UNION ALL branch must be a plain SELECT (no WITH, ORDER BY, "
+                        + "LIMIT, OFFSET or UNION of its own)");
+            }
+            unionAll.add(branch);
             return this;
         }
 
@@ -240,7 +277,8 @@ public final class Select implements SqlNode {
         }
 
         /**
-         * Prepends a non-materialized common-table-expression to the {@code WITH} clause.
+         * Appends a non-materialized common-table-expression to the {@code WITH} clause (CTEs render in call order; a
+         * CTE that reads another must be added after it).
          *
          * @param name the CTE name (validated identifier).
          * @param subquery the CTE body.
@@ -252,7 +290,8 @@ public final class Select implements SqlNode {
         }
 
         /**
-         * Prepends a {@code MATERIALIZED} common-table-expression to the {@code WITH} clause (§3.5 rescue form).
+         * Appends a {@code MATERIALIZED} common-table-expression to the {@code WITH} clause (§3.5 rescue form; CTEs
+         * render in call order; a CTE that reads another must be added after it).
          *
          * @param name the CTE name (validated identifier).
          * @param subquery the CTE body.

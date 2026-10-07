@@ -15,7 +15,9 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.search.read;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -27,10 +29,17 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.Defau
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSearchSchema;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQuery;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQueryBuilderFactory;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SearchQueryAssembler;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.write.PostgresSearchUpdaterFlow;
+import org.eclipse.ditto.json.JsonArray;
+import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonObject;
+import org.eclipse.ditto.json.JsonValue;
 import org.eclipse.ditto.policies.api.PolicyTag;
 import org.eclipse.ditto.policies.model.PolicyId;
 import org.eclipse.ditto.rql.query.Query;
@@ -76,7 +85,8 @@ import reactor.core.publisher.Mono;
  * REAL write path ({@link PostgresSearchUpdaterFlow}) and read back through {@link PostgresThingsSearchPersistence},
  * covering the operator/auth matrix, {@code count}/{@code sudoCount}, the namespace report,
  * {@code recoverLastWriteModel} (incl. the emptied-out tombstone and absent cases), {@code findAllUnlimited} streaming,
- * and that {@code plan_cache_mode = force_custom_plan} is active on a search pool.
+ * that {@code plan_cache_mode = force_custom_plan} is active on a search pool, and that range legs of the selective-leg
+ * CTE never change a result (array-valued paths included) while the runtime pick materialises the smaller leg.
  * <p>
  * Skipped offline / when no Docker daemon is reachable (the {@link #startContainer() Assume} guard turns an unreachable
  * Docker into a skip, not a failure).
@@ -412,6 +422,226 @@ public final class PostgresSearchReadIT {
         assertThat(mode).isEqualTo("force_custom_plan");
     }
 
+    // ============================================================================================ selective range leg
+
+    private static final String MULTI = SystemSearchIndex.MULTI_VALUED.createStatement();
+
+    private PostgresThingsSearchPersistence withRangeLegs() {
+        return PostgresThingsSearchPersistence.forConnectionFactory(connectionFactory, 100, () -> true);
+    }
+
+    private PostgresThingsSearchPersistence pointLegsOnly() {
+        return PostgresThingsSearchPersistence.forConnectionFactory(connectionFactory, 100, () -> false);
+    }
+
+    private void seedRangeCorpus() {
+        // arrays that straddle [91700, 93000] without an element inside it, and ones that do / do not match
+        write(docAuth("straddle", attributes(JsonObject.newBuilder()
+                .set("region", JsonArray.of("[91621, 91214, 93186]")).set("pair", JsonArray.of("[6, 2]"))
+                .set("kind", "common").build()), S1, rootGrant("s1")), 1L);
+        write(docAuth("inside", attributes(JsonObject.newBuilder().set("region", JsonArray.of("[91750]"))
+                .set("kind", "common").build()), S1, rootGrant("s1")), 1L);
+        write(docAuth("scalar-inside", attributes(JsonObject.newBuilder().set("region", 92500)
+                .set("pair", 4).set("kind", "rare").build()), S1, rootGrant("s1")), 1L);
+        write(doc("above", attributes(JsonObject.newBuilder().set("region", JsonArray.of("[95000, 96000]"))
+                .set("pair", JsonArray.of("[7, 8]")).set("kind", "common").build())), 1L);
+        write(doc("text", attributes(JsonObject.newBuilder().set("region", "92000").build())), 1L);
+        write(featureArrayDoc("feat-straddle", "f", JsonArray.of("[10, 30]")), 1L);   // features/f/properties/v
+        write(featureArrayDoc("feat-inside", "f", JsonArray.of("[20]")), 1L);
+    }
+
+    @Test
+    public void rangeLegsNeverChangeFindOrCountResultsOnArrayValuedPaths() {
+        seedRangeCorpus();
+        runDdl(MULTI);
+        final List<Criteria> filters = List.of(
+                cf.and(List.of(ge("region", 91700), le("region", 93000))),        // straddle: 1,327 -> 909 class
+                cf.and(List.of(gt("region", 91621), lt("region", 93186))),
+                cf.and(List.of(ge("pair", 5), le("pair", 3))),                     // empty interval: [6, 2] matches
+                cf.and(List.of(eqAttr("kind", "common"), ge("region", 91700), le("region", 93000))),
+                cf.and(List.of(eqAttr("kind", "rare"), ge("region", 0), le("region", 1_000_000))),
+                cf.and(List.of(geFeature("f", "v", 15), leFeature("f", "v", 25))));
+        for (final Criteria criteria : filters) {
+            assertSameResults(criteria);
+        }
+        // the straddling thing is matched (MongoDB semantics), which a single-row range leg would lose
+        assertThat(sudoFindWith(withRangeLegs(), filters.get(0))).contains("straddle");
+        assertThat(sudoFindWith(withRangeLegs(), filters.get(2))).contains("straddle");
+        assertThat(sudoFindWith(withRangeLegs(), filters.get(5))).contains("feat-straddle");
+        assertThat(authFindWith(withRangeLegs(), filters.get(0))).as("the auth form is not empty")
+                .contains("straddle");
+    }
+
+    @Test
+    public void rangeLegsAreCorrectEvenWithoutTheIndex() {
+        seedRangeCorpus();   // no sf_multi: slower, never different
+        assertSameResults(cf.and(List.of(ge("region", 91700), le("region", 93000))));
+    }
+
+    @Test
+    public void thePickMaterialisesTheLegWithFewerIndexEntries() {
+        for (int i = 0; i < 60; i++) {   // "common": 59 things; temperature 10..69
+            write(doc("t" + i, attributes(JsonObject.newBuilder().set("city", i == 0 ? "rare" : "common")
+                    .set("temp", 10 + i).build())), 1L);
+        }
+        runDdl(MULTI);
+        // common city (59) vs a 3-wide range (3) -> range leg
+        assertThat(executedSelLegBranches(cf.and(List.of(eqAttr("city", "common"), ge("temp", 20), le("temp", 22)))))
+                .containsExactly(false, true, true);
+        // rare city (1) vs a wide range (60, counted up to 2) -> point leg
+        assertThat(executedSelLegBranches(cf.and(List.of(eqAttr("city", "rare"), ge("temp", 0), le("temp", 100)))))
+                .containsExactly(true, false, false);
+    }
+
+    @Test
+    public void theMultiValuedBranchUsesTheSystemIndex() {
+        seedRangeCorpus();
+        runDdl(MULTI);
+        runDdl("VACUUM ANALYZE search_flat");
+        final String plan = explainText(cf.and(List.of(ge("region", 91700), le("region", 93000))));
+        assertThat(plan).contains("Index Only Scan using sf_multi");
+    }
+
+    private void assertSameResults(final Criteria criteria) {
+        final PostgresQuery query = query(criteria);
+        assertThat(ids(withRangeLegs().findAll(query, null, null, HEADERS)))
+                .as("sudo find %s", criteria).isEqualTo(ids(pointLegsOnly().findAll(query, null, null, HEADERS)));
+        assertThat(ids(withRangeLegs().findAll(query, S1, null, HEADERS)))
+                .as("auth find %s", criteria).isEqualTo(ids(pointLegsOnly().findAll(query, S1, null, HEADERS)));
+        assertThat(runSingle(withRangeLegs().sudoCount(query, HEADERS)))
+                .as("sudo count %s", criteria).isEqualTo(runSingle(pointLegsOnly().sudoCount(query, HEADERS)));
+        assertThat(runSingle(withRangeLegs().count(query, S1, HEADERS)))
+                .as("auth count %s", criteria).isEqualTo(runSingle(pointLegsOnly().count(query, S1, HEADERS)));
+    }
+
+    private List<String> sudoFindWith(final PostgresThingsSearchPersistence searchPersistence,
+            final Criteria criteria) {
+        return ids(searchPersistence.findAll(query(criteria), null, null, HEADERS));
+    }
+
+    private List<String> authFindWith(final PostgresThingsSearchPersistence searchPersistence,
+            final Criteria criteria) {
+        return ids(searchPersistence.findAll(query(criteria), S1, null, HEADERS));
+    }
+
+    private List<String> ids(final Source<ResultList<TimestampedThingId>, ?> page) {
+        return runSingle(page).stream().map(t -> t.thingId().getName()).collect(Collectors.toList());
+    }
+
+    private Criteria ge(final String attribute, final Object value) {
+        return cf.fieldCriteria(fef.filterByAttribute(attribute), cf.ge(value));
+    }
+
+    private Criteria le(final String attribute, final Object value) {
+        return cf.fieldCriteria(fef.filterByAttribute(attribute), cf.le(value));
+    }
+
+    private Criteria gt(final String attribute, final Object value) {
+        return cf.fieldCriteria(fef.filterByAttribute(attribute), cf.gt(value));
+    }
+
+    private Criteria lt(final String attribute, final Object value) {
+        return cf.fieldCriteria(fef.filterByAttribute(attribute), cf.lt(value));
+    }
+
+    private Criteria eqAttr(final String attribute, final Object value) {
+        return cf.fieldCriteria(fef.filterByAttribute(attribute), cf.eq(value));
+    }
+
+    private Criteria geFeature(final String featureId, final String property, final Object value) {
+        return cf.fieldCriteria(fef.filterByFeatureProperty(featureId, property), cf.ge(value));
+    }
+
+    private Criteria leFeature(final String featureId, final String property, final Object value) {
+        return cf.fieldCriteria(fef.filterByFeatureProperty(featureId, property), cf.le(value));
+    }
+
+    /**
+     * Runs {@code EXPLAIN (ANALYZE, FORMAT JSON)} of the sudo count with range legs and returns, for each
+     * {@code UNION ALL} branch of {@code sel_leg} in order (point, in-range, multi-valued), whether its scan ran: a
+     * branch gated off by its one-time filter is never executed.
+     */
+    private static List<Boolean> executedSelLegBranches(final Criteria criteria) {
+        final RenderedSql count = SearchQueryAssembler.count(criteria, null, 0L, 0L, SelectiveLegs.POINT_AND_RANGE);
+        final String json = String.join("", explain("EXPLAIN (ANALYZE, FORMAT JSON) ", count, false));
+        final JsonObject root = JsonFactory.readFrom(json).asArray().get(0).orElseThrow().asObject();
+        final JsonObject cte = findNode(root.getValue("Plan").orElseThrow().asObject(), "CTE sel_leg")
+                .orElseThrow(() -> new AssertionError("no CTE sel_leg in " + json));
+        final JsonObject append = "Append".equals(cte.getValue("Node Type").map(JsonValue::asString).orElse(""))
+                ? cte : findNodeOfType(cte, "Append").orElseThrow(() -> new AssertionError("no Append in " + cte));
+        final List<Boolean> executed = new ArrayList<>();
+        for (final JsonValue branch : children(append)) {
+            executed.add(scanRan(branch.asObject()));
+        }
+        return executed;
+    }
+
+    /** A branch is {@code Result (One-Time Filter) -> scan}: the scan's loops tell whether the filter let it run. */
+    private static boolean scanRan(final JsonObject branch) {
+        if (branch.contains("One-Time Filter")) {
+            for (final JsonValue child : children(branch)) {
+                if ("Outer".equals(child.asObject().getValue("Parent Relationship").map(JsonValue::asString)
+                        .orElse(""))) {
+                    return loops(child.asObject()) > 0;
+                }
+            }
+        }
+        return loops(branch) > 0;
+    }
+
+    private static long loops(final JsonObject node) {
+        return node.getValue("Actual Loops").map(JsonValue::asLong).orElse(0L);
+    }
+
+    private static List<JsonValue> children(final JsonObject node) {
+        return node.getValue("Plans").map(value -> value.asArray().stream().toList()).orElse(List.of());
+    }
+
+    private static Optional<JsonObject> findNode(final JsonObject node, final String subplanName) {
+        if (subplanName.equals(node.getValue("Subplan Name").map(JsonValue::asString).orElse(""))) {
+            return Optional.of(node);
+        }
+        return children(node).stream().map(child -> findNode(child.asObject(), subplanName))
+                .flatMap(Optional::stream).findFirst();
+    }
+
+    private static Optional<JsonObject> findNodeOfType(final JsonObject node, final String nodeType) {
+        for (final JsonValue child : children(node)) {
+            if (nodeType.equals(child.asObject().getValue("Node Type").map(JsonValue::asString).orElse(""))) {
+                return Optional.of(child.asObject());
+            }
+            final Optional<JsonObject> deeper = findNodeOfType(child.asObject(), nodeType);
+            if (deeper.isPresent()) {
+                return deeper;
+            }
+        }
+        return Optional.empty();
+    }
+
+    /** EXPLAIN of the sudo count with range legs, with {@code enable_seqscan = off} (index eligibility). */
+    private static String explainText(final Criteria criteria) {
+        final RenderedSql count = SearchQueryAssembler.count(criteria, null, 0L, 0L, SelectiveLegs.POINT_AND_RANGE);
+        return String.join("\n", explain("EXPLAIN ", count, true));
+    }
+
+    private static List<String> explain(final String prefix, final RenderedSql rendered, final boolean noSeqscan) {
+        return Flux.usingWhen(Mono.from(connectionFactory.create()),
+                        connection -> Mono.from(connection.beginTransaction())
+                                .thenMany(noSeqscan
+                                        ? Flux.from(connection.createStatement("SET LOCAL enable_seqscan = off")
+                                        .execute()).flatMap(Result::getRowsUpdated)
+                                        : Flux.empty())
+                                .thenMany(Flux.from(rendered.applyTo(connection.createStatement(prefix
+                                                + rendered.sql())).execute())
+                                        .flatMap(result -> result.map((row, meta) -> row.get(0, String.class))))
+                                .collectList()
+                                .flatMapMany(rows -> Mono.from(connection.rollbackTransaction())
+                                        .thenMany(Flux.fromIterable(rows))),
+                        Connection::close)
+                .collectList()
+                .block(Duration.ofSeconds(30));
+    }
+
     // ============================================================================================ helpers
 
     private void seedColorSizeCorpus() {
@@ -514,6 +744,16 @@ public final class PostgresSearchReadIT {
                 .referencedPolicies(Set.of(PolicyTag.of(PolicyId.of(NS, "policy"), 1L)))
                 .thing(thing)
                 .build();
+    }
+
+    /** A thing with the array {@code values} at {@code features/<featureId>/properties/v}, visible to s1. */
+    private SearchIndexDocument featureArrayDoc(final String name, final String featureId, final JsonArray values) {
+        final ThingId thingId = ThingId.of(NS, name);
+        final JsonObject features = JsonObject.newBuilder()
+                .set(featureId, JsonObject.newBuilder()
+                        .set("properties", JsonObject.newBuilder().set("v", values).build()).build())
+                .build();
+        return docAuth(thingId, JsonObject.newBuilder().set("features", features).build(), S1, rootGrant("s1"));
     }
 
     private static Metadata metadata(final ThingId thingId, final long revision) {

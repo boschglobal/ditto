@@ -18,6 +18,7 @@ import java.util.List;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.TableContract;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.junit.Test;
 
 /**
@@ -30,8 +31,8 @@ public final class PostgresSearchSchemaTest {
     @Test
     public void descriptorIdentity() {
         assertThat(PostgresSearchSchema.descriptor().component()).isEqualTo("ditto-postgres-search");
-        assertThat(PostgresSearchSchema.descriptor().version()).isEqualTo(2);
-        // v2 only adds reloptions, which v1 code runs against unchanged
+        assertThat(PostgresSearchSchema.descriptor().version()).isEqualTo(3);
+        // v2 only adds reloptions, v3 only an index built outside the DDL: v1 code runs against both unchanged
         assertThat(PostgresSearchSchema.descriptor().minCompatibleVersion()).isEqualTo(1);
         assertThat(PostgresSearchSchema.COMPONENT).isEqualTo("ditto-postgres-search");
     }
@@ -108,6 +109,15 @@ public final class PostgresSearchSchemaTest {
                 .noneMatch(s -> s.contains("CONCURRENTLY"))
                 .noneMatch(s -> s.toLowerCase().contains("sf_trgm_scoped"))
                 .noneMatch(s -> s.contains("sf_path_"));
+    }
+
+    @Test
+    public void theSystemIndexIsNotPartOfTheChecksummedDdl() {
+        // sf_multi (search schema v3) is built by PathIndexMaintenance with CREATE INDEX CONCURRENTLY after the
+        // bootstrap: a plain build in the bootstrap transaction would block writes for the whole build.
+        assertThat(PostgresSearchSchema.ddlStatements())
+                .noneMatch(statement -> statement.contains(SystemSearchIndex.MULTI_VALUED.indexName()))
+                .noneMatch(statement -> statement.contains("ord = 1"));
     }
 
     @Test

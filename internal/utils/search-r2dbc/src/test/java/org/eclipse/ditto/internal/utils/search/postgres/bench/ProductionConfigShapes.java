@@ -36,12 +36,17 @@ import java.util.Locale;
  *   page size 25 — page 1, page 100 via {@code limit(2475,25)}, page 100 via the service cursor;</li>
  *   <li>shape 5: {@code count} with shape 1's filter.</li>
  * </ul>
+ * <p>
+ * The counter-examples of the selective-leg choice ({@link #ceAFilter}, {@link #ceBFilter}, {@link #ceCFilter}) check
+ * that the leg the statement materialises is the smaller one in both directions.
+ * </p>
  */
 final class ProductionConfigShapes {
 
     static final String CITY_FIELD = "attributes/location/city";
     static final String TEMP_FIELD = "features/env/properties/temperature";
     static final String VENDOR_FIELD = "attributes/vendor";
+    static final String ZIP_FIELD = "attributes/location/zip";
     static final String WILDCARD_FEATURE_TEXT_FIELD = "features/*/properties/prop0";
 
     /** Page size used by every find shape (the service default page size is also 25). */
@@ -60,6 +65,9 @@ final class ProductionConfigShapes {
     private static final double[] TEMP_BUCKET_LO = {-15, -10, -5, 0, 5, 10, 15, 20, 25, 30};
     private static final double[] GT_THRESHOLDS = {38, 39, 40, 41, 42, 43, 44};
     private static final String[] ILIKE_SUBSTRINGS = {"234", "246", "456", "567", "789", "321", "135", "890"};
+    private static final String[] CE_ZIPS = {
+            "12345", "23456", "34567", "45678", "56789", "67890", "78901", "89012", "90123", "11111",
+    };
 
     /** Length of shape 1/5's filter rotation (city and temperature bucket advance together). */
     static final int SHAPE1_CYCLE = lcm(CITIES.length, TEMP_BUCKET_LO.length);
@@ -69,6 +77,9 @@ final class ProductionConfigShapes {
     static final int SHAPE3_CYCLE = ILIKE_SUBSTRINGS.length;
     /** The first timed iteration: timed iterations keep the original bench's binds 3..22. */
     static final int FIRST_TIMED_ITERATION = 3;
+
+    /** Length of the counter-examples' rotation (zips, cities and temperature buckets: 10 each). */
+    static final int CE_CYCLE = 10;
 
     private ProductionConfigShapes() {
         throw new AssertionError("no instances");
@@ -136,6 +147,27 @@ final class ProductionConfigShapes {
     /** Shape 4 page via {@code limit(offset,25)} (OFFSET paging). */
     static List<String> shape4OffsetOptions(final int offset) {
         return List.of("sort(+" + TEMP_FIELD + ")", "limit(" + offset + "," + PAGE_SIZE + ")");
+    }
+
+    /** A rare zip equality (2–8 things) with a wide temperature range (~62 % of things): the point leg must win. */
+    static String ceAFilter(final int iteration) {
+        return "and(eq(" + ZIP_FIELD + ",\"" + CE_ZIPS[iteration % CE_ZIPS.length] + "\"),ge(" + TEMP_FIELD
+                + ",0),le(" + TEMP_FIELD + ",100))";
+    }
+
+    /** Shape 1's city equality (~9 %) with a 0.09-wide temperature range (~0.14 %): the range leg must win. */
+    static String ceBFilter(final int iteration) {
+        final BigDecimal lo = BigDecimal.valueOf(TEMP_BUCKET_LO[iteration % TEMP_BUCKET_LO.length]);
+        return "and(eq(" + CITY_FIELD + ",\"" + CITIES[iteration % CITIES.length] + "\"),ge(" + TEMP_FIELD + ","
+                + lo.toPlainString() + "),le(" + TEMP_FIELD + "," + lo.add(new BigDecimal("0.09")).toPlainString()
+                + "))";
+    }
+
+    /** A lone two-sided temperature range (~1.4 %): previously no CTE at all. */
+    static String ceCFilter(final int iteration) {
+        final BigDecimal lo = BigDecimal.valueOf(TEMP_BUCKET_LO[iteration % TEMP_BUCKET_LO.length]);
+        return "and(ge(" + TEMP_FIELD + "," + lo.toPlainString() + "),le(" + TEMP_FIELD + ","
+                + lo.add(new BigDecimal("0.99")).toPlainString() + "))";
     }
 
     /** Shape 4 next page via the service cursor (what a client sends: the cursor and the page size). */

@@ -129,7 +129,7 @@ The production-config mode measures what SHIPS instead:
 
 | | production-config mode |
 |---|---|
-| Schema | `PostgresSearchSchema.ddlStatements()` only (`ProductionConfigSchema`): tables before the COPY, the production `CREATE INDEX` statements after it, then `VACUUM (ANALYZE)`. A catalog check (`load.md`, `environment.md`; `ProductionConfigSchemaIT`) compares every index definition, column, constraint, reloption, per-column statistics target and extended statistics object with a reference built from the production DDL in a rolled-back scratch schema, and fails the run on any difference. An operator-configured per-path trigram index (`sf_path_trgm_*`, `ditto.postgresql.search.path-indexes`) is not a difference: it is listed in `environment.md` ("production DDL + N per-path index(es)") and in `summary.md`. |
+| Schema | The production schema (`ProductionConfigSchema`): `PostgresSearchSchema.ddlStatements()` plus the system index `sf_multi` (`SystemSearchIndex`, search schema v3, which the service builds `CONCURRENTLY` after its bootstrap): tables before the COPY, the production `CREATE INDEX` statements and then `sf_multi` (a plain build, the load is offline) after it, then `VACUUM (ANALYZE)`. A catalog check (`load.md`, `environment.md`; `ProductionConfigSchemaIT`) compares every index definition, column, constraint, reloption, per-column statistics target and extended statistics object with a reference built from the production DDL and `sf_multi` in a rolled-back scratch schema, and fails the run on any difference. A corpus loaded with search schema v2 (no `sf_multi`) therefore fails the check and needs a reload. An operator-configured per-path trigram index (`sf_path_trgm_*`, `ditto.postgresql.search.path-indexes`) is not a difference: it is listed in `environment.md` ("production DDL + N per-path index(es)") and in `summary.md`. |
 | Corpus | the original generator, seed and count (`CorpusGenerator`, 42, 1,000,000) and the same COPY loader, so the numbers stay comparable. `BenchCorpusFlattenerParityTest` proves the bench flattener's rows equal the shipped `ThingFlattener`'s, except one known divergence (a `null` array element: bench `type_rank` 1, shipped 5) that no benchmarked shape touches. |
 | Queries | RQL requests (`ProductionConfigShapes`) parsed by the query parser the search service builds (`SearchRootActor.getQueryParser`: production simple-field mappings, page-size limits, the PostgreSQL provider's `QueryBuilderFactory`); cursor paging through the service's `ThingsSearchCursor` (`BenchSearchQueryPath`, whose copy of the `SearchActor` flow is pinned against the real `SearchActor` by `BenchSearchQueryPathTest`); SQL rendered by `SearchQueryAssembler` / `CreateSqlVisitor` / `AuthFilterSqlBuilder` — no hand-written SQL. |
 | Execution | `PostgresThingsSearchPersistence.findAll` / `count` over a pool built by the production `ConnectionPoolFactory` from the shipped `ditto-postgres-search` profile (`ProductionSearchDb`): `plan_cache_mode = force_custom_plan` as a startup GUC, 60 s `statement_timeout`, unnamed statements, fetch size 100. Only uri/user/password and `ssl.mode = disable` are overridden. |
@@ -144,7 +144,21 @@ DOCKER_HOST=unix://$HOME/.orbstack/run/docker.sock \
 ```
 
 or stage by stage, in this order: `pc-up`, `pc-load`, `pc-read` (`--rounds N`), `pc-cold` (`--cold-samples N`),
-`pc-bias`; plus `pc-status`, `pc-down [--purge]`. **Run `pc-bias` after `pc-cold`, never before:** its read-only counts
+`pc-bias`; plus `pc-status`, `pc-down [--purge]`.
+
+**Selective legs.** `--range-legs auto|off` (`pc-read`, `pc-cold`, `pc-invariance`; property
+`bench.pc.rangeLegs`): `auto` (default) renders and executes every statement as the service does, i.e. with selective
+range legs while the system index `sf_multi` is valid (the harness checks it once with the service's
+`SystemIndexProbe`); `off` forces point legs only, the statement as before range legs. `environment.md` records which
+one ran ("Selective range legs: on (sf_multi valid)", "off (sf_multi missing or invalid)" or "off (forced:
+bench.pc.rangeLegs=off)"). `--variants 1,5,2,ce-a,…` (`pc-read`; `bench.pc.variants`) runs only those variants. The
+counter-examples of the leg choice are permanent variants in `ce-leg-choice.md`: `ce-a` (a rare zip equality with a
+wide temperature range: the point leg must win), `ce-a-sudo` (the same without auth), `ce-b` (shape 1's city with a
+0.09-wide temperature range: the range leg must win) and `ce-c` (a lone two-sided temperature range). Stage
+`pc-invariance` (`ProductionConfigReadBench#legInvariance`) runs every request of shapes 1, 5 and the counter-examples
+over its whole rotation, plus two `attributes/region` array filters, with point legs only and with range legs, and
+compares the request's result and the full ordered sudo match list (count + md5): `invariance.md`, and the stage
+fails on any difference. **Run `pc-bias` after `pc-cold`, never before:** its read-only counts
 read exactly the pages the first cold samples need (the fixed subject pair's `search_things` blocks, Stuttgart's heap,
 a full `search_things` scan) and the cold protocol cannot drop the macOS host cache, so running it first would warm
 those samples. The corpus stays in the named volume across stages and container restarts, so later sessions

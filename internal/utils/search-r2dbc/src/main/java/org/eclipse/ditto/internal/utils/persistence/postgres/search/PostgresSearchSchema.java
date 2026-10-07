@@ -64,7 +64,8 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
  * <p>
  * The operator-configured per-path indexes ({@code ditto.postgresql.search.path-indexes}) are deliberately NOT part of
  * this DDL: they are built with {@code CREATE INDEX CONCURRENTLY} (which cannot run in the bootstrap transaction) by
- * {@code PathIndexMaintenance} after a successful bootstrap, so the path list never changes the checksum.
+ * {@code PathIndexMaintenance} after a successful bootstrap, so the path list never changes the checksum; nor is the
+ * system index {@code sf_multi} (search schema v3), which the same maintenance builds the same way.
  * </p>
  */
 @Immutable
@@ -78,13 +79,19 @@ public final class PostgresSearchSchema {
      * declares {@link #MIN_COMPATIBLE_VERSION} and adds a literal test fixture of the version it replaces (see
      * {@code SearchSchemaChecksumPreservationTest}).
      * v2: {@code autovacuum_vacuum_scale_factor = 0.01} on {@code search_things} and {@code search_flat}.
+     * v3: the system index {@code sf_multi} ({@link
+     * org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex#MULTI_VALUED}). It is
+     * built with {@code CREATE INDEX CONCURRENTLY} by {@code PathIndexMaintenance} after the bootstrap, not by this DDL
+     * (a plain {@code CREATE INDEX} in the bootstrap transaction would block writes for the whole build on an existing
+     * table), so the v3 DDL and checksum equal v2's.
      */
-    public static final int VERSION = 2;
+    public static final int VERSION = 3;
 
     /**
      * The oldest code schema version that can run against the {@link #VERSION} schema (stored as
      * {@code schema_version.min_compatible_version}); see {@code PostgresSchemaDescriptor#minCompatibleVersion()} for
-     * the bump rules. Still 1: v2 only adds reloptions, which v1 code runs against unchanged.
+     * the bump rules. Still 1: v2 only adds reloptions, which v1 code runs against unchanged; v3 only adds an index
+     * older code ignores.
      */
     public static final int MIN_COMPATIBLE_VERSION = 1;
 

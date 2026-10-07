@@ -25,12 +25,13 @@ import org.eclipse.ditto.rql.query.criteria.Criteria;
 /**
  * Assembles the Task&nbsp;D4 read statements — the {@code findAll} / {@code findAllUnlimited} row queries and the
  * {@code count} — from a translated {@link Criteria}, a {@link PostgresSortClause} (D3) and the
- * {@link SelectiveLegCte selective-leg rescue CTE} (§3.5, 0.2b-evidenced). Pure and DB-free: it returns rendered,
- * fully-parameterized {@link RenderedSql} so the exact SQL and bind order are unit-testable without a database.
+ * {@link SelectiveLegCte selective-leg CTE} (§3.5; which conjunct it materialises: see {@link SelectiveLegCte} and
+ * {@link SelectiveLegs}). Pure and DB-free: it returns rendered, fully-parameterized {@link RenderedSql} so the exact
+ * SQL and bind order are unit-testable without a database.
  * <p>
  * <b>Statement shape ({@code findAll}).</b>
  * <pre>{@code
- * [WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE sfc.wpath = $ AND <value>)]
+ * [WITH [sel_pick AS MATERIALIZED (…),] sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE …)]
  * SELECT st.thing_id, st.t_modified, <cursor-projection cols>
  * FROM search_things st
  * [LEFT JOIN LATERAL (…) k0 ON true …]                              -- one per flat sort key (D3)
@@ -51,7 +52,6 @@ public final class SearchQueryAssembler {
     private static final String DOC_TABLE = "search_things";
     private static final String T_MODIFIED = "t_modified";
 
-    private static final String SEL_CTE = "sel_leg";
     private static final String SEL_ALIAS = "sl";
     private static final String COUNT_CTE = "matched";
     private static final SqlExpression COUNT_STAR = Sql.raw("count(*)");
@@ -59,6 +59,22 @@ public final class SearchQueryAssembler {
 
     private SearchQueryAssembler() {
         throw new AssertionError("no instances");
+    }
+
+    /**
+     * {@link #findAll(Criteria, java.util.List, PostgresSortClause, long, long, SelectiveLegs)} with point legs only
+     * ({@link SelectiveLegs#POINT}).
+     *
+     * @param criteria the query criteria.
+     * @param authorizationSubjectIds the visibility subjects, or {@code null} for the sudo (no-auth) form.
+     * @param sortClause the D3 sort/paging translation (the SAME instance the persistence uses for cursor extraction).
+     * @param limit the row limit ({@code pageLimit + 1}).
+     * @param offset the skip.
+     * @return the rendered, parameterized statement.
+     */
+    public static RenderedSql findAll(final Criteria criteria, @Nullable final java.util.List<String> authorizationSubjectIds,
+            final PostgresSortClause sortClause, final long limit, final long offset) {
+        return findAll(criteria, authorizationSubjectIds, sortClause, limit, offset, SelectiveLegs.POINT);
     }
 
     /**
@@ -71,19 +87,38 @@ public final class SearchQueryAssembler {
      * @param sortClause the D3 sort/paging translation (the SAME instance the persistence uses for cursor extraction).
      * @param limit the row limit ({@code pageLimit + 1}).
      * @param offset the skip.
+     * @param selectiveLegs which legs the selective-leg CTE may materialise.
      * @return the rendered, parameterized statement.
      */
     public static RenderedSql findAll(final Criteria criteria, @Nullable final java.util.List<String> authorizationSubjectIds,
-            final PostgresSortClause sortClause, final long limit, final long offset) {
+            final PostgresSortClause sortClause, final long limit, final long offset,
+            final SelectiveLegs selectiveLegs) {
         final Select.Builder builder = Sql.select()
                 .column(Sql.col(DOC_ALIAS, THING_ID))
                 .column(Sql.col(DOC_ALIAS, T_MODIFIED))
                 .from(DOC_TABLE, DOC_ALIAS);
-        applyWhereWithOptionalCte(builder, criteria, authorizationSubjectIds);
+        applyWhereWithOptionalCte(builder, criteria, authorizationSubjectIds, selectiveLegs);
         sortClause.applyOrdering(builder);
         sortClause.applyCursorProjections(builder);
         builder.limit(Sql.bigint(limit)).offset(Sql.bigint(offset));
         return Sql.render(builder.build());
+    }
+
+    /**
+     * {@link #findAllUnlimited(Criteria, java.util.List, PostgresSortClause, Long, long, SelectiveLegs)} with point legs
+     * only ({@link SelectiveLegs#POINT}).
+     *
+     * @param criteria the query criteria.
+     * @param authorizationSubjectIds the visibility subjects (never {@code null} on this path — parity with Mongo).
+     * @param sortClause the D3 sort/paging translation.
+     * @param limit the row limit, or {@code null} for unbounded.
+     * @param offset the skip.
+     * @return the rendered, parameterized statement.
+     */
+    public static RenderedSql findAllUnlimited(final Criteria criteria,
+            @Nullable final java.util.List<String> authorizationSubjectIds, final PostgresSortClause sortClause,
+            @Nullable final Long limit, final long offset) {
+        return findAllUnlimited(criteria, authorizationSubjectIds, sortClause, limit, offset, SelectiveLegs.POINT);
     }
 
     /**
@@ -99,15 +134,16 @@ public final class SearchQueryAssembler {
      * @param sortClause the D3 sort/paging translation.
      * @param limit the row limit, or {@code null} for unbounded.
      * @param offset the skip.
+     * @param selectiveLegs which legs the selective-leg CTE may materialise.
      * @return the rendered, parameterized statement.
      */
     public static RenderedSql findAllUnlimited(final Criteria criteria,
             @Nullable final java.util.List<String> authorizationSubjectIds, final PostgresSortClause sortClause,
-            @Nullable final Long limit, final long offset) {
+            @Nullable final Long limit, final long offset, final SelectiveLegs selectiveLegs) {
         final Select.Builder builder = Sql.select()
                 .column(Sql.col(DOC_ALIAS, THING_ID))
                 .from(DOC_TABLE, DOC_ALIAS);
-        applyWhereWithOptionalCte(builder, criteria, authorizationSubjectIds);
+        applyWhereWithOptionalCte(builder, criteria, authorizationSubjectIds, selectiveLegs);
         sortClause.applyOrdering(builder);
         if (limit != null) {
             builder.limit(Sql.bigint(limit));
@@ -119,10 +155,8 @@ public final class SearchQueryAssembler {
     }
 
     /**
-     * The {@code count}/{@code sudoCount} query — {@code count(*)} over the same {@code WHERE}. {@code skip}/{@code
-     * limit} are mirrored from Mongo's {@code CountOptions} exactly: when either is set the counted rows are first
-     * bounded by an {@code OFFSET}/{@code LIMIT} inside a {@code matched} CTE, else it is a plain {@code count(*)}
-     * (which additionally gets the selective-leg rescue CTE, like {@code findAll}).
+     * {@link #count(Criteria, java.util.List, long, long, SelectiveLegs)} with point legs only
+     * ({@link SelectiveLegs#POINT}).
      *
      * @param criteria the query criteria.
      * @param authorizationSubjectIds the visibility subjects, or {@code null} for sudo.
@@ -132,15 +166,32 @@ public final class SearchQueryAssembler {
      */
     public static RenderedSql count(final Criteria criteria,
             @Nullable final java.util.List<String> authorizationSubjectIds, final long skip, final long limit) {
-        final SqlExpression predicate = translate(criteria, authorizationSubjectIds);
+        return count(criteria, authorizationSubjectIds, skip, limit, SelectiveLegs.POINT);
+    }
+
+    /**
+     * The {@code count}/{@code sudoCount} query — {@code count(*)} over the same {@code WHERE}. {@code skip}/{@code
+     * limit} are mirrored from Mongo's {@code CountOptions} exactly: when either is set the counted rows are first
+     * bounded by an {@code OFFSET}/{@code LIMIT} inside a {@code matched} CTE (no selective-leg CTE), else it is a plain
+     * {@code count(*)} (which additionally gets the selective-leg CTE, like {@code findAll}).
+     *
+     * @param criteria the query criteria.
+     * @param authorizationSubjectIds the visibility subjects, or {@code null} for sudo.
+     * @param skip the skip applied before counting (Mongo {@code CountOptions.skip}).
+     * @param limit the cap on the count (Mongo {@code CountOptions.limit}; {@code <= 0} ⇒ uncapped).
+     * @param selectiveLegs which legs the selective-leg CTE may materialise.
+     * @return the rendered, parameterized statement.
+     */
+    public static RenderedSql count(final Criteria criteria,
+            @Nullable final java.util.List<String> authorizationSubjectIds, final long skip, final long limit,
+            final SelectiveLegs selectiveLegs) {
         if (skip <= 0 && limit <= 0) {
-            // Common count: plain count(*) + the selective-leg rescue CTE (same optimization as findAll).
+            // Common count: plain count(*) + the selective-leg CTE (same as findAll).
             final Select.Builder builder = Sql.select().column(COUNT_STAR).from(DOC_TABLE, DOC_ALIAS);
-            final Optional<Select> cte = SelectiveLegCte.extract(criteria);
-            cte.ifPresent(body -> builder.withMaterialized(SEL_CTE, body));
-            builder.where(cte.map(body -> Sql.and(semiJoin(), predicate)).orElse(predicate));
+            applyWhereWithOptionalCte(builder, criteria, authorizationSubjectIds, selectiveLegs);
             return Sql.render(builder.build());
         }
+        final SqlExpression predicate = translate(criteria, authorizationSubjectIds);
         // skip/limit-bounded count: wrap the matching rows in a CTE bounded by OFFSET/LIMIT, then count them.
         final Select.Builder matched = Sql.select().column(ONE).from(DOC_TABLE, DOC_ALIAS).where(predicate);
         if (limit > 0) {
@@ -155,23 +206,39 @@ public final class SearchQueryAssembler {
     }
 
     /**
+     * {@link #renderForDiagnostics(Criteria, java.util.List, PostgresSortClause, SelectiveLegs)} with point legs only
+     * ({@link SelectiveLegs#POINT}).
+     *
      * @param criteria the query criteria.
      * @param authorizationSubjectIds the visibility subjects, or {@code null} for sudo.
      * @param sortClause the D3 sort/paging translation.
+     * @return the rendered {@code findAll} statement for a representative single page.
+     */
+    public static RenderedSql renderForDiagnostics(final Criteria criteria,
+            @Nullable final java.util.List<String> authorizationSubjectIds, final PostgresSortClause sortClause) {
+        return renderForDiagnostics(criteria, authorizationSubjectIds, sortClause, SelectiveLegs.POINT);
+    }
+
+    /**
+     * @param criteria the query criteria.
+     * @param authorizationSubjectIds the visibility subjects, or {@code null} for sudo.
+     * @param sortClause the D3 sort/paging translation.
+     * @param selectiveLegs which legs the selective-leg CTE may materialise.
      * @return the rendered {@code findAll} statement for a representative single page (limit 1, no skip) — the slow-query
      * diagnostics form ({@code $n} placeholders shown, sudo form when subjects are {@code null}).
      */
     public static RenderedSql renderForDiagnostics(final Criteria criteria,
-            @Nullable final java.util.List<String> authorizationSubjectIds, final PostgresSortClause sortClause) {
-        return findAll(criteria, authorizationSubjectIds, sortClause, 1L, 0L);
+            @Nullable final java.util.List<String> authorizationSubjectIds, final PostgresSortClause sortClause,
+            final SelectiveLegs selectiveLegs) {
+        return findAll(criteria, authorizationSubjectIds, sortClause, 1L, 0L, selectiveLegs);
     }
 
     private static void applyWhereWithOptionalCte(final Select.Builder builder, final Criteria criteria,
-            @Nullable final java.util.List<String> authorizationSubjectIds) {
+            @Nullable final java.util.List<String> authorizationSubjectIds, final SelectiveLegs selectiveLegs) {
         final SqlExpression predicate = translate(criteria, authorizationSubjectIds);
-        final Optional<Select> cte = SelectiveLegCte.extract(criteria);
-        if (cte.isPresent()) {
-            builder.withMaterialized(SEL_CTE, cte.get());
+        final Optional<SelectiveLegCte.Prelude> prelude = SelectiveLegCte.extract(criteria, selectiveLegs);
+        if (prelude.isPresent()) {
+            prelude.get().applyTo(builder);
             builder.where(Sql.and(semiJoin(), predicate));
         } else {
             builder.where(predicate);
@@ -179,7 +246,7 @@ public final class SearchQueryAssembler {
     }
 
     private static SqlExpression semiJoin() {
-        return Sql.exists(Sql.select().column(ONE).from(SEL_CTE, SEL_ALIAS)
+        return Sql.exists(Sql.select().column(ONE).from(SelectiveLegCte.LEG_CTE, SEL_ALIAS)
                 .where(Sql.eq(Sql.col(SEL_ALIAS, THING_ID), Sql.col(DOC_ALIAS, THING_ID)))
                 .build());
     }

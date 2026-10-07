@@ -23,6 +23,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
@@ -44,23 +45,29 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
- * Builds, repairs and drops the operator-configured per-path {@code search_flat} indexes ({@link PathIndex}). Runs once
- * per service start, after a successful schema bootstrap, in the background; it is not part of the checksummed schema
- * DDL, so changing the path list never changes the schema checksum.
+ * Builds, repairs and drops the operator-configured per-path {@code search_flat} indexes ({@link PathIndex}), and builds
+ * and repairs the {@link SystemSearchIndex system indexes} of the search schema. Runs once per service start, after a
+ * successful schema bootstrap, in the background; neither kind is part of the checksummed schema DDL, so changing the
+ * path list never changes the schema checksum.
  * <p>
- * <strong>Not configured</strong> ({@code paths} unset or blank): the run manages nothing — it builds and drops
- * nothing, takes no lock, and only logs (INFO) which managed indexes exist. Only an explicitly configured list,
- * including an empty one, is reconciled; an empty list drops every managed index.
+ * <strong>System indexes</strong> are built whether or not the path list is configured, and never dropped except to
+ * repair an INVALID one (which is then rebuilt). They are built before the per-path indexes.
  * </p>
  * <p>
- * <strong>One run with a configured list:</strong>
+ * <strong>Not configured</strong> ({@code paths} unset or blank): the run manages no per-path index — it builds and
+ * drops none and only logs (INFO) which managed per-path indexes exist. Only an explicitly configured list, including
+ * an empty one, is reconciled; an empty list drops every managed per-path index.
+ * </p>
+ * <p>
+ * <strong>One run:</strong>
  * </p>
  * <ol>
- *     <li>Read the managed indexes ({@value PathIndex#NAME_PREFIX}*) on {@code search_flat} and their
- *     {@code pg_index.indisvalid}, and compute the {@link #plan(List, List) plan}. If there is nothing to do, stop: an
- *     unchanged configuration takes no lock and changes no session setting.</li>
+ *     <li>Read the managed indexes ({@value PathIndex#NAME_PREFIX}* and the system indexes) on {@code search_flat} and
+ *     their {@code pg_index.indisvalid}, and compute the {@link #plan(List, List, List) plan}. If there is nothing to
+ *     do, stop: an unchanged configuration takes no lock and changes no session setting.</li>
  *     <li>Otherwise, if the connection cannot hold a server session (a transaction-mode pooler without a direct URI),
- *     log an error and stop.</li>
+ *     log and stop: an error if per-path indexes need changes, a warning if only a system index is missing (that
+ *     costs performance, never correctness).</li>
  *     <li>{@code pg_try_advisory_lock} (session-scoped: it has to cover several autocommit statements, which a
  *     transaction-scoped lock cannot). If another instance holds it, that instance is doing the work: stop. Then
  *     verify that the lock is held by the backend that runs the following statements; if not, the connection is not
@@ -74,8 +81,8 @@ import reactor.core.publisher.Mono;
  *     the indexes.</li>
  *     <li>Re-read the catalog under the lock and apply the plan, one statement at a time: drop every INVALID managed
  *     index (a failed or killed {@code CREATE INDEX CONCURRENTLY} leaves one behind, and {@code IF NOT EXISTS} would
- *     skip it forever), drop every valid managed index whose path is no longer configured, then build each missing
- *     configured index with {@code CREATE INDEX CONCURRENTLY}, logging the build progress
+ *     skip it forever), drop every valid per-path index whose path is no longer configured, then build each missing
+ *     system index and each missing configured index with {@code CREATE INDEX CONCURRENTLY}, logging the build progress
  *     ({@code pg_stat_progress_create_index}) periodically. Every drop is {@code DROP INDEX CONCURRENTLY}. A failed
  *     build is logged, its INVALID leftover dropped where possible, and the run continues with the next index.</li>
  *     <li>{@code RESET statement_timeout} and {@code RESET lock_timeout}, release the lock and close the
@@ -107,12 +114,12 @@ public final class PathIndexMaintenance {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PathIndexMaintenance.class);
 
-    private static final String LIST_MANAGED_SQL = "SELECT c.relname::text AS name, i.indisvalid AS valid "
+    private static final String LIST_SQL = "SELECT c.relname::text AS name, i.indisvalid AS valid "
             + "FROM pg_index i "
             + "JOIN pg_class c ON c.oid = i.indexrelid "
             + "JOIN pg_class t ON t.oid = i.indrelid "
             + "JOIN pg_namespace n ON n.oid = t.relnamespace "
-            + "WHERE n.nspname = current_schema() AND t.relname = 'search_flat' AND starts_with(c.relname, $1) "
+            + "WHERE n.nspname = current_schema() AND t.relname = 'search_flat' "
             + "ORDER BY c.relname";
 
     private static final String TRY_LOCK_SQL = "SELECT pg_try_advisory_lock($1) AS locked, pg_backend_pid() AS pid";
@@ -150,15 +157,18 @@ public final class PathIndexMaintenance {
             + "FROM pg_stat_progress_create_index WHERE pid = $1";
 
     private final ConnectionFactory connectionFactory;
+    private final List<SystemSearchIndex> systemIndexes;
     private final List<PathIndex> configured;
     private final boolean listConfigured;
     private final boolean sessionCapable;
     private final Duration progressInterval;
     @Nullable private final ConnectionFactory ownedConnectionFactory;
 
-    private PathIndexMaintenance(final ConnectionFactory connectionFactory, @Nullable final List<PathIndex> configured,
+    private PathIndexMaintenance(final ConnectionFactory connectionFactory,
+            final List<SystemSearchIndex> systemIndexes, @Nullable final List<PathIndex> configured,
             final boolean sessionCapable, final Duration progressInterval, final boolean ownsConnectionFactory) {
         this.connectionFactory = Objects.requireNonNull(connectionFactory, "connectionFactory");
+        this.systemIndexes = List.copyOf(systemIndexes);
         listConfigured = configured != null;
         this.configured = configured == null ? List.of() : List.copyOf(configured);
         this.sessionCapable = sessionCapable;
@@ -168,7 +178,8 @@ public final class PathIndexMaintenance {
 
     /**
      * Creates the maintenance for a service: a dedicated, non-pooled DDL-role connection to the configured direct URI
-     * (or the runtime URI), without the {@code statement_timeout} startup option.
+     * (or the runtime URI), without the {@code statement_timeout} startup option. It maintains every
+     * {@link SystemSearchIndex}.
      *
      * @param runtimeConfig the runtime client config ({@code ditto.postgresql}).
      * @param pathIndexConfig the path-index config.
@@ -179,12 +190,15 @@ public final class PathIndexMaintenance {
         final PostgresConfig connectionConfig =
                 PathIndexConnectionConfig.of(runtimeConfig, pathIndexConfig.getDirectUri());
         return new PathIndexMaintenance(ConnectionPoolFactory.createDdlConnectionFactory(connectionConfig),
+                List.of(SystemSearchIndex.values()),
                 pathIndexConfig.isPathListConfigured() ? pathIndexConfig.getPathIndexes() : null,
                 PathIndexConnectionConfig.canHoldASession(runtimeConfig, pathIndexConfig.getDirectUri()),
                 DEFAULT_PROGRESS_INTERVAL, true);
     }
 
     /**
+     * As {@link #forConnectionFactory(ConnectionFactory, List, List, boolean, Duration)} without system indexes.
+     *
      * @param connectionFactory a (DDL-role) connection factory whose connections are one server session each.
      * @param configured the configured indexes ({@code null}: the list is not configured, nothing is managed).
      * @param sessionCapable whether the connections can hold a server session (see
@@ -194,7 +208,24 @@ public final class PathIndexMaintenance {
      */
     static PathIndexMaintenance forConnectionFactory(final ConnectionFactory connectionFactory,
             @Nullable final List<PathIndex> configured, final boolean sessionCapable, final Duration progressInterval) {
-        return new PathIndexMaintenance(connectionFactory, configured, sessionCapable, progressInterval, false);
+        return forConnectionFactory(connectionFactory, List.of(), configured, sessionCapable, progressInterval);
+    }
+
+    /**
+     * @param connectionFactory a (DDL-role) connection factory whose connections are one server session each.
+     * @param systemIndexes the system indexes to maintain.
+     * @param configured the configured indexes ({@code null}: the list is not configured, no per-path index is
+     * managed).
+     * @param sessionCapable whether the connections can hold a server session (see
+     * {@link PathIndexConnectionConfig#canHoldASession}).
+     * @param progressInterval how often a running build's progress is logged.
+     * @return the maintenance; the connection factory stays the caller's.
+     */
+    static PathIndexMaintenance forConnectionFactory(final ConnectionFactory connectionFactory,
+            final List<SystemSearchIndex> systemIndexes, @Nullable final List<PathIndex> configured,
+            final boolean sessionCapable, final Duration progressInterval) {
+        return new PathIndexMaintenance(connectionFactory, systemIndexes, configured, sessionCapable,
+                progressInterval, false);
     }
 
     /**
@@ -213,24 +244,42 @@ public final class PathIndexMaintenance {
     private Mono<Outcome> runOn(final Connection connection) {
         return listManaged(connection).flatMap(existing -> {
             if (!listConfigured) {
-                logNotConfigured(existing);
-                return Mono.just(Outcome.of(Status.NOT_CONFIGURED));
+                logNotConfigured(existing.stream().filter(index -> PathIndex.isManagedName(index.name())).toList());
             }
-            final Plan plan = plan(configured, existing);
+            final Plan plan = plan(systemIndexes, listConfigured ? configured : null, existing);
             if (plan.isEmpty()) {
-                logUpToDate();
-                return Mono.just(Outcome.of(Status.UP_TO_DATE));
+                return Mono.just(nothingToDo());
             }
             if (!sessionCapable) {
-                LOGGER.error("Search path indexes need changes ({}), but the connection cannot hold a server session: "
-                        + "ditto.postgresql.pooler-mode is 'transaction' and no "
-                        + "ditto.postgresql.search.path-indexes.direct-uri (POSTGRES_SEARCH_PATH_INDEXES_DIRECT_URI) "
-                        + "is configured. Configure a direct (non-PgBouncer) connection to the same database for the "
-                        + "index maintenance. Nothing was changed.", plan);
+                logNoSession(plan);
                 return Mono.just(Outcome.of(Status.NO_SESSION_CAPABLE_CONNECTION));
             }
             return lockAndApply(connection);
         });
+    }
+
+    private Outcome nothingToDo() {
+        if (!listConfigured) {
+            return Outcome.of(Status.NOT_CONFIGURED);
+        }
+        logUpToDate();
+        return Outcome.of(Status.UP_TO_DATE);
+    }
+
+    private static void logNoSession(final Plan plan) {
+        if (plan.hasPathIndexWork()) {
+            LOGGER.error("Search path indexes need changes ({}), but the connection cannot hold a server session: "
+                    + "ditto.postgresql.pooler-mode is 'transaction' and no "
+                    + "ditto.postgresql.search.path-indexes.direct-uri (POSTGRES_SEARCH_PATH_INDEXES_DIRECT_URI) "
+                    + "is configured. Configure a direct (non-PgBouncer) connection to the same database for the "
+                    + "index maintenance. Nothing was changed.", plan);
+        } else {
+            // a missing system index costs performance, never correctness
+            LOGGER.warn("The system search index {} cannot be built: the connection cannot hold a server session "
+                            + "(pooler-mode 'transaction' without ditto.postgresql.search.path-indexes.direct-uri). "
+                            + "Two-sided range filters keep the plan without it; nothing was changed.",
+                    plan.buildSystem().stream().map(SystemSearchIndex::indexName).collect(Collectors.joining(", ")));
+        }
     }
 
     private static void logNotConfigured(final List<ExistingIndex> existing) {
@@ -301,10 +350,9 @@ public final class PathIndexMaintenance {
                         }
                         // re-read under the lock: another instance may have applied the changes in the meantime
                         return listManaged(connection).flatMap(existing -> {
-                            final Plan plan = plan(configured, existing);
+                            final Plan plan = plan(systemIndexes, listConfigured ? configured : null, existing);
                             if (plan.isEmpty()) {
-                                logUpToDate();
-                                return Mono.just(Outcome.of(Status.UP_TO_DATE));
+                                return Mono.just(nothingToDo());
                             }
                             return apply(connection, lockPid, plan);
                         });
@@ -318,15 +366,16 @@ public final class PathIndexMaintenance {
         final List<String> built = new CopyOnWriteArrayList<>();
         final List<String> failed = new CopyOnWriteArrayList<>();
         LOGGER.info("Applying search path index changes: {}", plan);
-        final int builds = plan.build().size();
+        final List<BuildTarget> targets = Stream.concat(plan.buildSystem().stream().map(BuildTarget::of),
+                plan.build().stream().map(BuildTarget::of)).toList();
         return Flux.fromIterable(plan.dropInvalid())
                 .concatMap(name -> drop(connection, name,
                         "it is INVALID (a CREATE INDEX CONCURRENTLY failed or was cancelled)", repaired, failed))
                 .thenMany(Flux.fromIterable(plan.dropUnconfigured())
                         .concatMap(name -> drop(connection, name, "its path is no longer configured", dropped,
                                 failed)))
-                .thenMany(Flux.range(0, builds)
-                        .concatMap(i -> build(connection, pid, plan.build().get(i), i + 1, builds, built, failed)))
+                .thenMany(Flux.range(0, targets.size())
+                        .concatMap(i -> build(connection, pid, targets.get(i), i + 1, targets.size(), built, failed)))
                 .then(Mono.fromSupplier(() -> {
                     final Outcome outcome = new Outcome(Status.APPLIED, List.copyOf(built), List.copyOf(repaired),
                             List.copyOf(dropped), List.copyOf(failed));
@@ -342,59 +391,69 @@ public final class PathIndexMaintenance {
 
     /*
      * Drops are by name in the current schema, and names come only from the catalog query on search_flat in that schema
-     * or from PathIndex: "only per-path indexes of search_flat are ever dropped" rests on the sf_path_ prefix (no other
-     * index of this backend uses it) plus the hash in the name (two different definitions do not share a name).
+     * or from PathIndex: "only per-path indexes of search_flat are ever dropped as unconfigured" rests on the sf_path_
+     * prefix (no other index of this backend uses it) plus the hash in the name (two different definitions do not share
+     * a name). A system index is matched by its exact name and only dropped when INVALID (repair).
      */
     private Mono<Void> drop(final Connection connection, final String name, final String reason,
             final List<String> done, final List<String> failed) {
-        LOGGER.info("Dropping search path index {} because {}.", name, reason);
-        return execute(connection, PathIndex.dropStatement(name))
+        LOGGER.info("Dropping {} {} because {}.", label(name), name, reason);
+        return execute(connection, dropStatement(name))
                 .doOnSuccess(v -> done.add(name))
                 .onErrorResume(error -> {
-                    LOGGER.error("Dropping search path index {} failed: {}", name, error.getMessage(), error);
+                    LOGGER.error("Dropping {} {} failed: {}", label(name), name, error.getMessage(), error);
                     failed.add(name);
                     return Mono.empty();
                 });
     }
 
-    private Mono<Void> build(final Connection connection, final int pid, final PathIndex index, final int position,
+    private Mono<Void> build(final Connection connection, final int pid, final BuildTarget target, final int position,
             final int total, final List<String> built, final List<String> failed) {
         return Mono.defer(() -> {
             final Instant start = Instant.now();
-            LOGGER.info("Building search path index {} ({}/{}): {} on <{}> (wpath <{}>) with CREATE INDEX "
-                            + "CONCURRENTLY. The build blocks neither the running instances' reads and writes nor "
-                            + "starting instances. Until the index is valid, queries on this path use the table-wide "
-                            + "index.", index.name(), position, total,
-                    index.kind().getConfigValue(), index.path(), index.wpath());
+            LOGGER.info("Building {} {} ({}/{}): {} with CREATE INDEX CONCURRENTLY. The build blocks neither the "
+                            + "running instances' reads and writes nor starting instances. Until the index is valid, "
+                            + "{}.", target.label(), target.name(), position, total, target.description(),
+                    target.untilValid());
             final Disposable progress = Flux.interval(progressInterval, progressInterval)
                     .concatMap(tick -> progress(pid).onErrorResume(error -> Mono.empty()))
-                    .subscribe(state -> LOGGER.info("Building search path index {}: {}, {} s elapsed.", index.name(),
-                            state, Duration.between(start, Instant.now()).toSeconds()));
-            return execute(connection, index.createStatement())
+                    .subscribe(state -> LOGGER.info("Building {} {}: {}, {} s elapsed.", target.label(),
+                            target.name(), state, Duration.between(start, Instant.now()).toSeconds()));
+            return execute(connection, target.createStatement())
                     .doFinally(signal -> progress.dispose())
-                    .then(validity(connection, index.name()))
+                    .then(validity(connection, target.name()))
                     .flatMap(validity -> {
                         if (!validity.valid()) {
-                            return Mono.error(new IllegalStateException("the index " + index.name()
+                            return Mono.error(new IllegalStateException("the index " + target.name()
                                     + " is missing or not valid after CREATE INDEX CONCURRENTLY"));
                         }
-                        LOGGER.info("Built search path index {} in {} s ({}).", index.name(),
+                        LOGGER.info("Built {} {} in {} s ({}).", target.label(), target.name(),
                                 Duration.between(start, Instant.now()).toSeconds(), validity.size());
-                        built.add(index.name());
+                        built.add(target.name());
                         return Mono.<Void>empty();
                     })
                     .onErrorResume(error -> {
-                        LOGGER.error("Building search path index {} for <{}> failed after {} s: {}", index.name(),
-                                index.path(), Duration.between(start, Instant.now()).toSeconds(), error.getMessage(),
-                                error);
-                        failed.add(index.name());
-                        return dropLeftover(connection, index.name());
+                        LOGGER.error("Building {} {} ({}) failed after {} s: {}", target.label(), target.name(),
+                                target.description(), Duration.between(start, Instant.now()).toSeconds(),
+                                error.getMessage(), error);
+                        failed.add(target.name());
+                        return dropLeftover(connection, target.name());
                     });
         });
     }
 
+    private static String dropStatement(final String name) {
+        return SystemSearchIndex.byIndexName(name)
+                .map(SystemSearchIndex::dropConcurrentlyStatement)
+                .orElseGet(() -> PathIndex.dropStatement(name));
+    }
+
+    private static String label(final String name) {
+        return SystemSearchIndex.byIndexName(name).isPresent() ? "system search index" : "search path index";
+    }
+
     private static Mono<Void> dropLeftover(final Connection connection, final String name) {
-        return execute(connection, PathIndex.dropStatement(name))
+        return execute(connection, dropStatement(name))
                 .doOnSuccess(v -> LOGGER.info("Dropped the leftover of the failed build of {}.", name))
                 .onErrorResume(error -> {
                     LOGGER.warn("Could not drop the leftover of the failed build of {} ({}); it stays INVALID and is "
@@ -485,13 +544,17 @@ public final class PathIndexMaintenance {
                         error -> Mono.just(Optional.empty()));
     }
 
-    private static Mono<List<ExistingIndex>> listManaged(final Connection connection) {
-        return Flux.from(connection.createStatement(LIST_MANAGED_SQL).bind("$1", PathIndex.NAME_PREFIX).execute())
+    private Mono<List<ExistingIndex>> listManaged(final Connection connection) {
+        return Flux.from(connection.createStatement(LIST_SQL).execute())
                 .flatMap(result -> result.map((row, meta) -> new ExistingIndex(
                         Objects.requireNonNull(row.get("name", String.class)),
                         Boolean.TRUE.equals(row.get("valid", Boolean.class)))))
-                .filter(existing -> PathIndex.isManagedName(existing.name()))
+                .filter(existing -> PathIndex.isManagedName(existing.name()) || isSystemIndex(existing.name()))
                 .collectList();
+    }
+
+    private boolean isSystemIndex(final String name) {
+        return systemIndexes.stream().anyMatch(index -> index.indexName().equals(name));
     }
 
     private static Mono<Validity> validity(final Connection connection, final String name) {
@@ -519,23 +582,56 @@ public final class PathIndexMaintenance {
     }
 
     /**
-     * What a run has to do, given the configured indexes and the managed indexes present.
+     * What a run has to do, given the system indexes, the configured indexes and the managed indexes present.
      *
-     * @param dropInvalid managed indexes that are INVALID: dropped (configured ones are then rebuilt).
-     * @param dropUnconfigured valid managed indexes whose path is no longer configured: dropped.
+     * @param dropInvalid managed indexes that are INVALID: dropped (system and configured ones are then rebuilt).
+     * @param dropUnconfigured valid per-path indexes whose path is no longer configured: dropped.
+     * @param buildSystem system indexes that are missing or INVALID: built first.
      * @param build configured indexes that are missing or INVALID: built, in configuration order.
      */
-    record Plan(List<String> dropInvalid, List<String> dropUnconfigured, List<PathIndex> build) {
+    record Plan(List<String> dropInvalid, List<String> dropUnconfigured, List<SystemSearchIndex> buildSystem,
+            List<PathIndex> build) {
 
         boolean isEmpty() {
-            return dropInvalid.isEmpty() && dropUnconfigured.isEmpty() && build.isEmpty();
+            return dropInvalid.isEmpty() && dropUnconfigured.isEmpty() && buildSystem.isEmpty() && build.isEmpty();
+        }
+
+        boolean hasPathIndexWork() {
+            return !dropUnconfigured.isEmpty() || !build.isEmpty()
+                    || dropInvalid.stream().anyMatch(PathIndex::isManagedName);
         }
 
         @Override
         public String toString() {
-            return "drop INVALID " + dropInvalid + ", drop unconfigured " + dropUnconfigured + ", build "
+            return "drop INVALID " + dropInvalid + ", drop unconfigured " + dropUnconfigured + ", build system "
+                    + buildSystem.stream().map(SystemSearchIndex::indexName).toList() + ", build "
                     + build.stream().map(index -> index.name() + " (" + index.kind().getConfigValue() + " on <"
                     + index.path() + ">)").toList();
+        }
+    }
+
+    /**
+     * One index to build: a system index or a per-path index, with what its log lines say about it.
+     *
+     * @param label the kind of index, e.g. {@code search path index}.
+     * @param name the index name.
+     * @param createStatement the {@code CREATE INDEX CONCURRENTLY} statement.
+     * @param description what is built.
+     * @param untilValid what queries do until the index is valid.
+     */
+    private record BuildTarget(String label, String name, String createStatement, String description,
+            String untilValid) {
+
+        static BuildTarget of(final PathIndex index) {
+            return new BuildTarget("search path index", index.name(), index.createStatement(),
+                    index.kind().getConfigValue() + " on <" + index.path() + "> (wpath <" + index.wpath() + ">)",
+                    "queries on this path use the table-wide index");
+        }
+
+        static BuildTarget of(final SystemSearchIndex index) {
+            return new BuildTarget("system search index", index.indexName(), index.createConcurrentlyStatement(),
+                    index.createConcurrentlyStatement(),
+                    "two-sided range filters keep the plan without it");
         }
     }
 
@@ -548,27 +644,52 @@ public final class PathIndexMaintenance {
     record ExistingIndex(String name, boolean valid) {}
 
     /**
+     * The plan without system indexes (the per-path plan).
+     *
      * @param configured the configured indexes.
      * @param existing the managed indexes present.
      * @return the plan.
      */
     static Plan plan(final List<PathIndex> configured, final List<ExistingIndex> existing) {
+        return plan(List.of(), configured, existing);
+    }
+
+    /**
+     * @param systemIndexes the system indexes this run maintains.
+     * @param configured the configured per-path indexes, or {@code null} if the list is not configured (then no per-path
+     * index is built or dropped).
+     * @param existing the managed indexes present (per-path and system).
+     * @return the plan.
+     */
+    static Plan plan(final List<SystemSearchIndex> systemIndexes, @Nullable final List<PathIndex> configured,
+            final List<ExistingIndex> existing) {
         final Map<String, Boolean> validByName = new LinkedHashMap<>();
         existing.forEach(index -> validByName.put(index.name(), index.valid()));
-        final Set<String> configuredNames = configured.stream().map(PathIndex::name).collect(Collectors.toSet());
+        final Set<String> systemNames =
+                systemIndexes.stream().map(SystemSearchIndex::indexName).collect(Collectors.toSet());
+        final Set<String> configuredNames = configured == null ? Set.of()
+                : configured.stream().map(PathIndex::name).collect(Collectors.toSet());
         final List<String> dropInvalid = new ArrayList<>();
         final List<String> dropUnconfigured = new ArrayList<>();
         validByName.forEach((name, valid) -> {
+            final boolean system = systemNames.contains(name);
+            if (!system && (configured == null || !PathIndex.isManagedName(name))) {
+                // unset list: per-path indexes are not managed; and never touch what this run does not own
+                return;
+            }
             if (!valid) {
                 dropInvalid.add(name);
-            } else if (!configuredNames.contains(name)) {
+            } else if (!system && !configuredNames.contains(name)) {
                 dropUnconfigured.add(name);
             }
         });
-        final List<PathIndex> build = configured.stream()
+        final List<SystemSearchIndex> buildSystem = systemIndexes.stream()
+                .filter(index -> !Boolean.TRUE.equals(validByName.get(index.indexName())))
+                .toList();
+        final List<PathIndex> build = configured == null ? List.of() : configured.stream()
                 .filter(index -> !Boolean.TRUE.equals(validByName.get(index.name())))
                 .toList();
-        return new Plan(List.copyOf(dropInvalid), List.copyOf(dropUnconfigured), build);
+        return new Plan(List.copyOf(dropInvalid), List.copyOf(dropUnconfigured), buildSystem, build);
     }
 
     private record LockAttempt(boolean locked, int pid) {}
@@ -579,9 +700,15 @@ public final class PathIndexMaintenance {
      * The result of a run.
      */
     public enum Status {
-        /** The path list is not configured: nothing was built or dropped, no lock was taken. */
+        /**
+         * The path list is not configured and every system index is present and valid: nothing was built or dropped,
+         * no lock was taken.
+         */
         NOT_CONFIGURED,
-        /** Nothing to do: every configured index is present and valid, and no other managed index is present. */
+        /**
+         * Nothing to do: every system index and every configured index is present and valid, and no other managed
+         * per-path index is present.
+         */
         UP_TO_DATE,
         /** Changes were applied (see the lists of the {@link Outcome}; some may have failed). */
         APPLIED,

@@ -25,19 +25,20 @@ import org.junit.Test;
  * deliberate {@link PostgresSearchSchema#VERSION} bump.
  * <p>
  * History: v1 = {@link PostgresSearchSchemaV1#CHECKSUM}; v2 appended the autovacuum reloptions of
- * {@code search_things} and {@code search_flat}. Every bump adds a literal fixture of the version it replaces (see
- * {@link PostgresSearchSchemaV1}) and pins its checksum here, next to the new current one.
+ * {@code search_things} and {@code search_flat}; v3 = v2's DDL; its change, {@code sf_multi}, is built outside the DDL.
+ * Every bump adds a literal fixture of the version it replaces (see {@link PostgresSearchSchemaV1}) and pins its
+ * checksum here, next to the new current one.
  * </p>
  */
 public final class SearchSchemaChecksumPreservationTest {
 
-    /** The checksum of the current search schema version ({@link PostgresSearchSchema#VERSION} 2). */
+    /** The checksum of the current search schema version ({@link PostgresSearchSchema#VERSION} 3, DDL as v2). */
     private static final String CURRENT_SEARCH_CHECKSUM =
             "c51c0ddb092c925e6b2b1413aed8ae8e5c7826edcb3772af669832761fc21169";
 
     @Test
     public void searchChecksumMatchesThePinnedValueForTheCurrentSchemaVersion() {
-        assertThat(PostgresSearchSchema.VERSION).isEqualTo(2);
+        assertThat(PostgresSearchSchema.VERSION).isEqualTo(3);
         assertThat(PostgresSchemaManager.checksum(PostgresSearchSchema.descriptor()))
                 .as("search DDL must not drift without a deliberate PostgresSearchSchema.VERSION bump")
                 .isEqualTo(CURRENT_SEARCH_CHECKSUM);
@@ -51,16 +52,30 @@ public final class SearchSchemaChecksumPreservationTest {
     }
 
     @Test
+    public void frozenV2DescriptorReproducesTheChecksumV2DatabasesStore() {
+        assertThat(PostgresSchemaManager.checksum(PostgresSearchSchemaV2.descriptor()))
+                .as("the v2 fixture must be exactly the DDL v2 shipped")
+                .isEqualTo(PostgresSearchSchemaV2.CHECKSUM);
+    }
+
+    @Test
     public void v2IsTheV1DdlFollowedByTheAutovacuumReloptionsWithTheV1TableContracts() {
         final List<String> v1 = PostgresSearchSchemaV1.DDL_STATEMENTS;
-        final List<String> v2 = PostgresSearchSchema.ddlStatements();
+        final List<String> v2 = PostgresSearchSchemaV2.DDL_STATEMENTS;
 
         assertThat(v2.subList(0, v1.size())).as("v2 keeps every v1 statement unchanged, in order").isEqualTo(v1);
         assertThat(v2.subList(v1.size(), v2.size())).containsExactly(
                 "ALTER TABLE search_things SET (autovacuum_vacuum_scale_factor = 0.01)",
                 "ALTER TABLE search_flat SET (autovacuum_vacuum_scale_factor = 0.01)");
-        assertThat(PostgresSearchSchema.tableContracts()).as("v2 changes no table contract")
+        assertThat(PostgresSearchSchemaV2.TABLE_CONTRACTS).as("v2 changes no table contract")
                 .isEqualTo(PostgresSearchSchemaV1.TABLE_CONTRACTS);
+    }
+
+    @Test
+    public void v3KeepsTheV2DdlAndTableContractsBecauseItsIndexIsBuiltOutsideTheDdl() {
+        assertThat(PostgresSearchSchema.ddlStatements()).isEqualTo(PostgresSearchSchemaV2.DDL_STATEMENTS);
+        assertThat(PostgresSearchSchema.tableContracts()).isEqualTo(PostgresSearchSchemaV2.TABLE_CONTRACTS);
+        assertThat(PostgresSearchSchema.MIN_COMPATIBLE_VERSION).isEqualTo(1);
     }
 
 }

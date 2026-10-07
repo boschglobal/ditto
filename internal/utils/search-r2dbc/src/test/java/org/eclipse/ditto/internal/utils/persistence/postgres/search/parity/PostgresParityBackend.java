@@ -12,12 +12,16 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.postgres.search.parity;
 
+import java.time.Duration;
+
 import org.eclipse.ditto.base.service.config.limits.DefaultLimitsConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSearchSchema;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemIndexProbe;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQueryBuilderFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.read.PostgresThingsSearchPersistence;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.write.PostgresSearchUpdaterFlow;
@@ -28,11 +32,17 @@ import org.eclipse.ditto.thingsearch.persistence.api.write.SearchUpdaterFlow;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 
+import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.Result;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
 /**
  * The Postgres side of the parity matrix: {@code PostgresSearchUpdaterFlow} (flattener + JSONB doc row) writing into
  * a real PG16 Testcontainer, reads via {@code PostgresThingsSearchPersistence} + {@code PostgresQueryBuilderFactory},
  * wired production-shaped exactly like the module's other ITs (one shared pool with
- * {@code plan_cache_mode=force_custom_plan}, schema bootstrapped by the descriptor-driven manager).
+ * {@code plan_cache_mode=force_custom_plan}, schema bootstrapped by the descriptor-driven manager, the system index
+ * {@code sf_multi} built and the selective range legs enabled through the service's {@link SystemIndexProbe}).
  */
 final class PostgresParityBackend implements ParityBackend {
 
@@ -61,8 +71,21 @@ final class PostgresParityBackend implements ParityBackend {
         final DittoPostgresClient client =
                 DittoPostgresClient.newInstance(DefaultPostgresConfig.of(pgConfig.getConfig("ditto")));
         PostgresSchemaManager.of(client.getConnectionPool(), PostgresSearchSchema.descriptor()).bootstrap();
+        // the tables are empty, so a plain build is fine (the service builds it CONCURRENTLY after the bootstrap)
+        Mono.usingWhen(Mono.from(client.getConnectionPool().create()),
+                        connection -> Flux.from(connection.createStatement(
+                                SystemSearchIndex.MULTI_VALUED.createStatement()).execute())
+                                .flatMap(Result::getRowsUpdated)
+                                .then(),
+                        Connection::close)
+                .block(Duration.ofSeconds(30));
+        final SystemIndexProbe probe = SystemIndexProbe.of(SystemSearchIndex.MULTI_VALUED);
+        if (!Boolean.TRUE.equals(probe.refresh(client.getConnectionPool()).block(Duration.ofSeconds(30)))) {
+            throw new IllegalStateException("sf_multi is not valid after its build");
+        }
         final var flow = PostgresSearchUpdaterFlow.of(client);
-        final var persistence = PostgresThingsSearchPersistence.of(client);
+        // the battery runs with range legs on, as the service does once sf_multi is valid
+        final var persistence = PostgresThingsSearchPersistence.of(client, probe);
         final var qbf = new PostgresQueryBuilderFactory(DefaultLimitsConfig.of(config.getConfig("ditto")));
         return new PostgresParityBackend(client, persistence, flow, qbf);
     }

@@ -139,6 +139,34 @@ final class BenchConfig {
         return (int) longProperty("bench.pc.coldSamples", 3L);
     }
 
+    /**
+     * @return whether the read bench may use the selective range legs, from {@code bench.pc.rangeLegs}: {@code auto}
+     * (the default: as the service does, i.e. while the system index {@code sf_multi} is valid) or {@code off} (point
+     * legs only, the statement as before range legs).
+     * @throws IllegalArgumentException for any other value.
+     */
+    static String productionConfigRangeLegs() {
+        final String value = property("bench.pc.rangeLegs", "auto");
+        if (!"auto".equals(value) && !"off".equals(value)) {
+            throw new IllegalArgumentException("bench.pc.rangeLegs must be 'auto' or 'off', got <" + value + ">");
+        }
+        return value;
+    }
+
+    /**
+     * @return the read-bench variant ids to run, from {@code bench.pc.variants} (a comma list, e.g. {@code 1,5,ce-a});
+     * empty = all.
+     */
+    static java.util.Set<String> productionConfigVariants() {
+        final java.util.Set<String> ids = new java.util.LinkedHashSet<>();
+        for (final String id : property("bench.pc.variants", "").split(",")) {
+            if (!id.isBlank()) {
+                ids.add(id.trim());
+            }
+        }
+        return java.util.Collections.unmodifiableSet(ids);
+    }
+
     private static long longProperty(final String key, final long defaultValue) {
         final String v = property(key, null);
         return v != null ? Long.parseLong(v) : defaultValue;

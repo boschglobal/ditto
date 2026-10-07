@@ -19,16 +19,18 @@ import java.util.List;
 import java.util.Set;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSearchSchema;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonObject;
 import org.junit.Test;
 
 /**
- * Pins that the production-config bench mode applies the SHIPPED search DDL and nothing else: the pre-load and
- * post-load phases together are exactly the statements of {@link PostgresSearchSchema#ddlStatements()}, each once, in
- * production order within each phase, so no bench-only statement (statistics targets, covering indexes, scoped
- * trigram) can ride along. The expectations are written out here (not re-derived with the code's own
- * {@code CREATE INDEX} predicate), so a change of either side fails the test (review round 1, M6).
+ * Pins that the production-config bench mode applies the SHIPPED search schema and nothing else: the pre-load and
+ * post-load phases together are exactly the statements of {@link PostgresSearchSchema#ddlStatements()} plus the system
+ * index {@code sf_multi} ({@link SystemSearchIndex}), each once, in production order within each phase, so no
+ * bench-only statement (statistics targets, covering indexes, scoped trigram) can ride along. The expectations are
+ * written out here (not re-derived with the code's own {@code CREATE INDEX} predicate), so a change of either side
+ * fails the test (review round 1, M6).
  */
 public final class ProductionConfigSchemaTest {
 
@@ -46,22 +48,24 @@ public final class ProductionConfigSchemaTest {
     }
 
     @Test
-    public void postLoadIsTheElevenProductionIndexesInProductionOrder() {
+    public void postLoadIsTheElevenProductionIndexesThenTheSystemIndexInProductionOrder() {
         final List<String> names = new ArrayList<>();
         for (final String statement : ProductionConfigSchema.postLoadStatements()) {
             names.add(statement.replaceFirst("^CREATE INDEX IF NOT EXISTS (\\S+) ON .*$", "$1"));
         }
 
         assertThat(names).containsExactly("st_namespace", "st_global_read", "st_policy", "st_referenced_pols",
-                "st_delete_at", "st_modified", "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm");
+                "st_delete_at", "st_modified", "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm", "sf_multi");
     }
 
     @Test
     public void bothPhasesTogetherAreExactlyTheProductionStatements() {
         final List<String> applied = new ArrayList<>(ProductionConfigSchema.preLoadStatements());
         applied.addAll(ProductionConfigSchema.postLoadStatements());
+        final List<String> production = new ArrayList<>(PostgresSearchSchema.ddlStatements());
+        production.add(SystemSearchIndex.MULTI_VALUED.createStatement());
 
-        assertThat(applied).containsExactlyInAnyOrderElementsOf(PostgresSearchSchema.ddlStatements());
+        assertThat(applied).containsExactlyInAnyOrderElementsOf(production);
     }
 
     @Test
@@ -69,7 +73,7 @@ public final class ProductionConfigSchemaTest {
         assertThat(ProductionConfigSchema.expectedIndexNames()).isEqualTo(Set.of(
                 "search_things_pkey", "search_flat_pkey", "search_sync_pkey",
                 "st_namespace", "st_global_read", "st_policy", "st_referenced_pols", "st_delete_at", "st_modified",
-                "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm"));
+                "sf_num", "sf_text", "sf_bool", "sf_exists", "sf_trgm", "sf_multi"));
     }
 
 

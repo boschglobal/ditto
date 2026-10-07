@@ -413,6 +413,11 @@ Findings (each read off the committed plans / per-iteration tables):
    - The E5 rescue that produced 48 ms materialised the ~1.4% temperature range (with covering indexes).
    - Ten cities × ~690 MB do not stay cached, so iterations keep getting faster round by round (shape 1: 0.92–1.72 s
      in round 1, 0.84–0.91 s in round 3). The per-round p95 of shapes 1 and 5 falls each round; neither settles.
+   - Update (2026-10-07): the CTE may now start from the two-sided range (search schema v3, system index `sf_multi`)
+     and picks the smaller leg in the statement; it materialises the range (~13.9k ids in ~94 ms) as intended. Shapes
+     1 and 5 still miss the gate (B p95 3.4–7.6 s on a swapping host; warm EXPLAINs ~0.93–1.43 s): the main statement
+     then scans the whole city (~90k rows) for the city's `EXISTS` conjunct instead of probing the range candidates.
+     Evidence: `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/selective-range-leg/`.
 2. **Shape 2** drives from `global_read` (~29k things), filters by the per-field auth and probes the flat PK per
    survivor. It runs leader-only in the shipped path.
    - 109–146 ms once a subject pair's pages are cached.

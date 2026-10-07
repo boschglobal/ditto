@@ -19,6 +19,7 @@ import java.util.Optional;
 
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.testkit.javadsl.TestKit;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.json.JsonArray;
 import org.eclipse.ditto.json.JsonValue;
@@ -93,7 +94,8 @@ public final class ProductionConfigShapesTest {
                 java.util.Map.entry("3-high", 8), java.util.Map.entry("4-page1", 3),
                 java.util.Map.entry("4-offset", 3), java.util.Map.entry("4-keyset", 3),
                 java.util.Map.entry("4-offset-5000", 3), java.util.Map.entry("4-keyset-5000", 3),
-                java.util.Map.entry("5", 10));
+                java.util.Map.entry("5", 10), java.util.Map.entry("ce-a", 10), java.util.Map.entry("ce-a-sudo", 10),
+                java.util.Map.entry("ce-b", 10), java.util.Map.entry("ce-c", 10));
         for (final ProductionConfigReadBench.Variant variant : variants) {
             final java.util.Set<String> distinctRequests = new java.util.HashSet<>();
             for (int i = 0; i < 20; i++) {
@@ -153,6 +155,83 @@ public final class ProductionConfigShapesTest {
         assertThat(ProductionConfigReadBench.selectiveLegSummary(ProductionSearchPath.renderFind(
                 path.find(ProductionConfigShapes.shape2Filter(0), ProductionConfigShapes.defaultFindOptions()),
                 ProductionConfigShapes.subjectsFor(0)), plan)).isEmpty();
+        // the 2-argument render is the point-legs-only statement; shape 2 (one-sided range) has no leg in either mode
+        final Query shape1 =
+                path.find(ProductionConfigShapes.shape1Filter(0), ProductionConfigShapes.defaultFindOptions());
+        assertThat(sql.sql()).isEqualTo(ProductionSearchPath.renderFind(shape1, ProductionConfigShapes.subjectsFor(0),
+                SelectiveLegs.POINT).sql());
+        assertThat(ProductionSearchPath.renderFind(
+                path.find(ProductionConfigShapes.shape2Filter(0), ProductionConfigShapes.defaultFindOptions()),
+                ProductionConfigShapes.subjectsFor(0), SelectiveLegs.POINT_AND_RANGE).sql()).doesNotContain("sel_leg");
+    }
+
+    @Test
+    public void selectiveLegSummaryReadsThePickedBranchFromThePlan() {
+        final RenderedSql sql = ProductionSearchPath.renderFind(
+                path.find(ProductionConfigShapes.shape1Filter(0), ProductionConfigShapes.defaultFindOptions()),
+                ProductionConfigShapes.subjectsFor(0), SelectiveLegs.POINT_AND_RANGE);
+        final String plan = "Limit  (cost=1.0..2.0 rows=1 width=88) (actual time=150.0..150.1 rows=0 loops=1)\n"
+                + "  CTE sel_pick\n"
+                + "    ->  Subquery Scan on pc  (cost=1.00..2.00 rows=1 width=1) "
+                + "(actual time=40.100..40.200 rows=1 loops=1)\n"
+                + "  CTE sel_leg\n"
+                + "    ->  Append  (cost=1.00..900.00 rows=300 width=40) "
+                + "(actual time=40.300..45.500 rows=14012 loops=1)\n"
+                + "          ->  Result  (cost=0.01..300.00 rows=100 width=40) "
+                + "(actual time=0.002..0.002 rows=0 loops=1)\n"
+                + "                One-Time Filter: $3\n"
+                + "                InitPlan 3 (returns $3)\n"
+                + "                  ->  CTE Scan on sel_pick sp  (cost=0.00..0.02 rows=1 width=1) "
+                + "(actual time=40.150..40.250 rows=1 loops=1)\n"
+                + "                ->  Bitmap Heap Scan on search_flat sfc  (cost=10.68..824.41 rows=207 width=40) "
+                + "(never executed)\n"
+                + "                      ->  Bitmap Index Scan on sf_text  (cost=0.00..10.63 rows=207 width=0) "
+                + "(never executed)\n"
+                + "          ->  Result  (cost=0.01..300.00 rows=100 width=40) "
+                + "(actual time=0.100..4.000 rows=14000 loops=1)\n"
+                + "                One-Time Filter: (NOT $5)\n"
+                + "                InitPlan 5 (returns $5)\n"
+                + "                  ->  CTE Scan on sel_pick sp_1  (cost=0.00..0.02 rows=1 width=1) "
+                + "(actual time=0.001..0.001 rows=1 loops=1)\n"
+                + "                ->  Index Scan using sf_num on search_flat sfc_1  (cost=0.56..290.00 rows=99 "
+                + "width=40) (actual time=0.050..3.900 rows=14000 loops=1)\n"
+                + "          ->  Result  (cost=0.01..300.00 rows=100 width=40) "
+                + "(actual time=0.010..0.500 rows=12 loops=1)\n"
+                + "                One-Time Filter: (NOT $7)\n"
+                + "                InitPlan 7 (returns $7)\n"
+                + "                  ->  CTE Scan on sel_pick sp_2  (cost=0.00..0.02 rows=1 width=1) "
+                + "(actual time=0.001..0.001 rows=1 loops=1)\n"
+                + "                ->  Index Only Scan using sf_multi on search_flat sfc_2  (cost=0.42..8.44 rows=1 "
+                + "width=40) (actual time=0.010..0.400 rows=12 loops=1)\n"
+                + "Execution Time: 150.114 ms\n";
+
+        assertThat(sql.sql()).startsWith("WITH sel_pick AS MATERIALIZED");
+        assertThat(ProductionConfigReadBench.selectiveLegSummary(sql, plan)).hasValueSatisfying(line -> assertThat(line)
+                .contains("picked the range leg (in-range rows + multi-valued rows)")
+                .contains("branches executed [point, range, multi-valued]: [false, true, true]")
+                .contains("point: (sfc.wpath = '/attributes/location/city' AND sfc.val_text = 'Stuttgart')")
+                .contains("range: (sfc.wpath = '/features/env/properties/temperature' AND sfc.val_num >= ")
+                .contains("UNION ALL (sfc.wpath = '/features/env/properties/temperature' AND sfc.ord = 1)")
+                .contains("`->  Append`) produced 14012 thing ids in 45.500 ms")
+                .contains("the pick (`sel_pick`) took 40.200 ms")
+                .contains("of 150.114 ms total execution"));
+    }
+
+    @Test
+    public void counterExampleFiltersParseAndRotate() {
+        for (int i = 0; i < ProductionConfigShapes.CE_CYCLE; i++) {
+            for (final String filter : List.of(ProductionConfigShapes.ceAFilter(i), ProductionConfigShapes.ceBFilter(i),
+                    ProductionConfigShapes.ceCFilter(i))) {
+                assertThat(path.find(filter, ProductionConfigShapes.defaultFindOptions()).getCriteria())
+                        .as(filter).isNotNull();
+            }
+        }
+        assertThat(ProductionConfigShapes.ceAFilter(0)).isEqualTo("and(eq(attributes/location/zip,\"12345\"),"
+                + "ge(features/env/properties/temperature,0),le(features/env/properties/temperature,100))");
+        assertThat(ProductionConfigShapes.ceBFilter(0)).isEqualTo("and(eq(attributes/location/city,\"Stuttgart\"),"
+                + "ge(features/env/properties/temperature,-15.0),le(features/env/properties/temperature,-14.91))");
+        assertThat(ProductionConfigShapes.ceCFilter(1)).isEqualTo("and(ge(features/env/properties/temperature,-10.0),"
+                + "le(features/env/properties/temperature,-9.01))");
     }
 
     @Test

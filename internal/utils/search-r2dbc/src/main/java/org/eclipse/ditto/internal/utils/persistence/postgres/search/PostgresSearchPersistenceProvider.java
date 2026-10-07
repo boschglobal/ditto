@@ -38,6 +38,8 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Schem
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.DefaultPostgresSearchPathIndexConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexMaintenance;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PostgresSearchPathIndexConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemIndexProbe;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.DefaultPostgresDeleteAtReaperConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.PostgresDeleteAtReaper;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.PostgresDeleteAtReaperActor;
@@ -45,6 +47,7 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.search.reaper.Postg
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQueryBuilderFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresSortClause;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SearchQueryAssembler;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.read.PostgresThingsAggregationPersistence;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.read.PostgresThingsSearchPersistence;
@@ -67,6 +70,7 @@ import com.typesafe.config.ConfigObject;
 import com.typesafe.config.ConfigValue;
 import com.typesafe.config.ConfigValueType;
 
+import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.R2dbcException;
 import reactor.core.Disposable;
 
@@ -142,6 +146,12 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
     @Nullable private volatile CompletableFuture<PathIndexMaintenance.Outcome> pathIndexMaintenanceOutcome;
 
     /**
+     * The gate of the range legs of the selective-leg CTE: whether this instance sees the system index {@code sf_multi}
+     * valid. Started after a successful bootstrap; until then it reports "not valid" (point legs only).
+     */
+    private final SystemIndexProbe multiValuedIndex = SystemIndexProbe.of(SystemSearchIndex.MULTI_VALUED);
+
+    /**
      * Constructor invoked reflectively by {@code PekkoClassLoader} during extension loading.
      *
      * @param actorSystem the actor system the extension is loaded into.
@@ -189,23 +199,31 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
         // successful bootstrap and before the search read/updater paths issue runtime statements.
         PostgresClientExtension.get(actorSystem).getClient()
                 .registerSchemaDescriptor(PostgresSearchSchema.descriptor());
-        startPathIndexMaintenance(config, pathIndexConfig);
+        final ConnectionFactory pool = PostgresClientExtension.get(actorSystem).getClient().getConnectionPool();
+        startPathIndexMaintenance(config, pathIndexConfig, pool);
+        final Disposable probe = multiValuedIndex.poll(pool, SystemIndexProbe.DEFAULT_INTERVAL);
+        actorSystem.registerOnTermination(probe::dispose);
     }
 
     /**
-     * Starts the per-path index maintenance in the background — only reached after a successful bootstrap, so a
-     * refused bootstrap never builds an index. It runs on its own non-pooled DDL connection (never a connection of the
-     * runtime pool) and does not delay the start: an index build takes minutes on a large {@code search_flat}, and
-     * until an index is valid the planner keeps using the table-wide one. Failures are logged; the service keeps
-     * running (Mongo parity: custom search indexes are initialized asynchronously, failures logged).
+     * Starts the per-path and system index maintenance in the background — only reached after a successful bootstrap,
+     * so a refused bootstrap never builds an index. It runs on its own non-pooled DDL connection (never a connection of
+     * the runtime pool) and does not delay the start: an index build takes minutes on a large {@code search_flat}, and
+     * until an index is valid the planner keeps using the table-wide one (and, for the system index {@code sf_multi},
+     * range filters keep the plan without it). Failures are logged; the service keeps running (Mongo parity: custom
+     * search indexes are initialized asynchronously, failures logged).
      */
     private void startPathIndexMaintenance(final PostgresConfig config,
-            final PostgresSearchPathIndexConfig pathIndexConfig) {
+            final PostgresSearchPathIndexConfig pathIndexConfig, final ConnectionFactory pool) {
         final CompletableFuture<PathIndexMaintenance.Outcome> outcome = new CompletableFuture<>();
         pathIndexMaintenanceOutcome = outcome;
         try {
             final Disposable run = PathIndexMaintenance.of(config, pathIndexConfig).run()
-                    .subscribe(outcome::complete, error -> {
+                    .subscribe(result -> {
+                        outcome.complete(result);
+                        // this instance may just have built sf_multi: switch range legs on without waiting a poll
+                        multiValuedIndex.refresh(pool).subscribe();
+                    }, error -> {
                         LOGGER.error("Search path index maintenance failed: {}", error.getMessage(), error);
                         outcome.completeExceptionally(error);
                     });
@@ -225,12 +243,21 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
         return pathIndexMaintenanceOutcome;
     }
 
+    /**
+     * @return the probe of the system index sf_multi. Package private for tests.
+     */
+    SystemIndexProbe multiValuedIndexProbe() {
+        return multiValuedIndex;
+    }
+
     @Override
     public ThingsSearchPersistence createSearchPersistence() {
         // The full read path (count/find/namespace/recover + background-sync metadata source) over the single shared
         // connection pool. The pool carries plan_cache_mode=force_custom_plan (ditto-postgres-search.conf) so the
-        // wpath-parameterized read statements never latch onto a generic plan (plan §3.5 / bench-results §8.2).
-        return PostgresThingsSearchPersistence.of(PostgresClientExtension.get(actorSystem).getClient());
+        // wpath-parameterized read statements never latch onto a generic plan (plan §3.5 / bench-results §8.2). Range
+        // legs follow this instance's view of the system index sf_multi, read per statement.
+        return PostgresThingsSearchPersistence.of(PostgresClientExtension.get(actorSystem).getClient(),
+                multiValuedIndex);
     }
 
     @Override
@@ -340,8 +367,8 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
         // ordered bind values as a trailing comment. A null subjects list renders the sudo (no-auth) form, matching how
         // the caller passes authorization (MongoThingsSearchPersistence.explain uses the same sudo/non-sudo split).
         final PostgresSortClause sortClause = PostgresSortClause.of(query.getSortOptions());
-        final RenderedSql rendered =
-                SearchQueryAssembler.renderForDiagnostics(query.getCriteria(), authorizationSubjectIds, sortClause);
+        final RenderedSql rendered = SearchQueryAssembler.renderForDiagnostics(query.getCriteria(),
+                authorizationSubjectIds, sortClause, SelectiveLegs.of(multiValuedIndex.getAsBoolean()));
         return rendered.sql() + System.lineSeparator() + "-- binds: " + rendered.bindValues();
     }
 

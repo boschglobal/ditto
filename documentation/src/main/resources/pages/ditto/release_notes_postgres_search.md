@@ -85,6 +85,17 @@ can be started and restarted while an index is built: a start whose schema is up
 that has to run DDL gives up after 500 ms instead of stalling index writes. See the PostgreSQL search section of the
 installation guide.
 
+## Equality + range filters
+
+A filter that combines an equality with a two-sided numeric range on one field (`ge`/`gt` and `le`/`lt` on the same
+field) no longer always starts from the equality: the search counts the index entries of both in the same statement
+and starts from the smaller one; a two-sided range alone is started from directly. Results never change. Because two
+range conditions may be met by different array elements (as on MongoDB), the range start also uses the new system index
+`sf_multi` (search schema version 3), which the search service builds in the background with
+`CREATE INDEX CONCURRENTLY` after the schema bootstrap, like the per-path indexes (it needs the same direct database
+connection). Until an instance sees the index valid, range filters keep the previous plan. Version-2 images run against
+the version-3 schema unchanged. See "Range filters and the system index sf_multi" in the installation guide.
+
 ## Mongo-only search knobs ignored on PostgreSQL
 
 Search configuration specific to MongoDB — for example per-metric MongoDB index hints and configurable custom MongoDB

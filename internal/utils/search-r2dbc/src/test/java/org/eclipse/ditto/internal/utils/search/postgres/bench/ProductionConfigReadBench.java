@@ -16,19 +16,24 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.IntFunction;
 import java.util.stream.Collectors;
 
@@ -37,6 +42,11 @@ import javax.annotation.Nullable;
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.testkit.javadsl.TestKit;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemIndexProbe;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresSortClause;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SearchQueryAssembler;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.json.JsonArray;
 import org.eclipse.ditto.json.JsonFactory;
@@ -74,8 +84,15 @@ import org.junit.Test;
  * execution mode as above).
  * </p>
  * <p>
+ * <b>Selective legs</b> ({@code bench.pc.rangeLegs}): {@code auto} renders and executes every statement as the service
+ * does, i.e. with range legs while this instance sees the system index {@code sf_multi} valid; {@code off} forces point
+ * legs only (the statement as before range legs). {@code bench.pc.variants} restricts the warm run to a list of
+ * variant ids. <b>Invariance</b> ({@link #legInvariance()}): both modes must return the same results.
+ * </p>
+ * <p>
  * Evidence: {@code <bench.pc.resultsDir>/} ({@code environment.md}, one file per shape, {@code cold.md},
- * {@code summary.md}, and {@code warm.json}/{@code cold.json} from which {@code summary.md} is regenerated).
+ * {@code summary.md}, and {@code warm.json}/{@code cold.json} from which {@code summary.md} is regenerated;
+ * {@code invariance.md} from {@link #legInvariance()}).
  * Deliberately excluded from every automatic build phase; run via {@code benchmark/run-benchmark.sh pc-read pc-cold
  * pc-bias} (in that order: {@link #corpusBias()} reads the pages the first cold samples need) or
  * {@code mvn -pl internal/utils/search-r2dbc test -Dtest=ProductionConfigReadBench#warm -DfailIfNoTests=false}.
@@ -96,6 +113,8 @@ public class ProductionConfigReadBench {
     static final double SETTLED_ABS_MS = 10.0;
     private static final int COLD_FOLLOW_UPS = 2;
     private static final List<String> FIXED_SUBJECTS = ProductionConfigShapes.subjectsFor(0);
+    private static final String SUDO = "sudo (no auth)";
+    private static final String REGION_FIELD = "attributes/region";
 
     private static final List<String> GUCS = List.of("server_version", "plan_cache_mode", "statement_timeout",
             "shared_buffers", "effective_cache_size", "work_mem", "maintenance_work_mem", "random_page_cost",
@@ -108,6 +127,10 @@ public class ProductionConfigReadBench {
     private Path resultsDir;
     /** The per-path indexes the catalog check found during the warm run (written to warm.json and summary.md). */
     private List<String> perPathIndexes = List.of();
+    /** The selective legs of this run, resolved once by the first {@link #newDb()} (see {@link #resolveLegs()}). */
+    @Nullable private SelectiveLegs legs;
+    /** How {@link #legs} was resolved, for {@code environment.md}. */
+    private String legsLine = "not resolved";
 
     @Before
     public void setUp() {
@@ -146,6 +169,7 @@ public class ProductionConfigReadBench {
                 case "1", "5" -> ProductionConfigShapes.SHAPE1_CYCLE;
                 case "2" -> ProductionConfigShapes.SHAPE2_CYCLE;
                 case "3-low", "3-high" -> ProductionConfigShapes.SHAPE3_CYCLE;
+                case "ce-a", "ce-a-sudo", "ce-b", "ce-c" -> ProductionConfigShapes.CE_CYCLE;
                 default -> 1;
             };
         }
@@ -160,10 +184,10 @@ public class ProductionConfigReadBench {
                     : path.find(filter.apply(iteration), options.apply(iteration));
         }
 
-        RenderedSql render(final ProductionSearchPath path, final int iteration) {
+        RenderedSql render(final ProductionSearchPath path, final int iteration, final SelectiveLegs legs) {
             final Query query = query(path, iteration);
-            return count ? ProductionSearchPath.renderCount(query, subjects.apply(iteration))
-                    : ProductionSearchPath.renderFind(query, subjects.apply(iteration));
+            return count ? ProductionSearchPath.renderCount(query, subjects.apply(iteration), legs)
+                    : ProductionSearchPath.renderFind(query, subjects.apply(iteration), legs);
         }
     }
 
@@ -215,6 +239,23 @@ public class ProductionConfigReadBench {
         variants.add(new Variant("5", "count with shape 1's filter", "shape-5-count.md", true,
                 ProductionConfigShapes::shape1Filter, i -> List.of(), cycling,
                 "count, filter `" + ProductionConfigShapes.shape1Filter(0) + "` (cycles like shape 1)"));
+        variants.add(new Variant("ce-a", "rare zip equality + wide temperature range (the point leg must win)",
+                "ce-leg-choice.md", false, ProductionConfigShapes::ceAFilter, defaultFind, cycling,
+                "filter `" + ProductionConfigShapes.ceAFilter(0) + "` (zip cycles), options `"
+                        + ProductionConfigShapes.defaultFindOptions() + "`"));
+        variants.add(new Variant("ce-a-sudo",
+                "rare zip equality + wide temperature range, sudo (the point leg must win)", "ce-leg-choice.md",
+                false, ProductionConfigShapes::ceAFilter, defaultFind, i -> null,
+                "filter `" + ProductionConfigShapes.ceAFilter(0) + "` (zip cycles), options `"
+                        + ProductionConfigShapes.defaultFindOptions() + "`, no auth"));
+        variants.add(new Variant("ce-b", "city equality + 0.09-wide temperature range (the range leg must win)",
+                "ce-leg-choice.md", false, ProductionConfigShapes::ceBFilter, defaultFind, cycling,
+                "filter `" + ProductionConfigShapes.ceBFilter(0) + "` (city and bucket cycle), options `"
+                        + ProductionConfigShapes.defaultFindOptions() + "`"));
+        variants.add(new Variant("ce-c", "lone two-sided temperature range (previously no CTE)", "ce-leg-choice.md",
+                false, ProductionConfigShapes::ceCFilter, defaultFind, cycling,
+                "filter `" + ProductionConfigShapes.ceCFilter(0) + "` (bucket cycles), options `"
+                        + ProductionConfigShapes.defaultFindOptions() + "`"));
         return variants;
     }
 
@@ -245,8 +286,9 @@ public class ProductionConfigReadBench {
             requireForceCustomPlan(settings);
 
             final Cursors cursors = computeCursors(db);
-            final List<Variant> variants = variants(cursors);
-            final String keysetCheck = keysetVsOffset(db, variants);
+            final List<Variant> allVariants = variants(cursors);
+            final String keysetCheck = keysetVsOffset(db, allVariants);
+            final List<Variant> variants = selected(allVariants, BenchConfig.productionConfigVariants());
 
             // Shape by shape, its rounds back to back (review round 1, I2): each round is 3 warmup + 20 timed
             // executions immediately before one another, so a shape's numbers do not depend on which OTHER shape ran
@@ -268,10 +310,10 @@ public class ProductionConfigReadBench {
                     perRound.add(samples);
                     System.out.printf("  -> %s%n", Stats.of(ms(samples)));
                 }
-                final RenderedSql sql = variant.render(path, 0);
+                final RenderedSql sql = variant.render(path, 0, legs());
                 final String explain = db.explain(sql, !variant.count());
                 final int slowest = slowestIteration(perRound);
-                final String slowestExplain = db.explain(variant.render(path, slowest), !variant.count());
+                final String slowestExplain = db.explain(variant.render(path, slowest, legs()), !variant.count());
                 final String crossCheck = crossCheck(db, variant, sql);
                 final String totalMatches = totalMatches(db, variant);
                 sections.merge(variant.file(), variantSection(variant, perRound, sql, explain, crossCheck,
@@ -293,6 +335,20 @@ public class ProductionConfigReadBench {
                     .build().toString());
             writeSummary();
         }
+    }
+
+    /** @return the variants whose id is in {@code ids}, in their order; all of them when {@code ids} is empty. */
+    static List<Variant> selected(final List<Variant> variants, final Set<String> ids) {
+        if (ids.isEmpty()) {
+            return variants;
+        }
+        final List<String> unknown = ids.stream()
+                .filter(id -> variants.stream().noneMatch(v -> v.id().equals(id)))
+                .toList();
+        if (!unknown.isEmpty()) {
+            throw new IllegalArgumentException("unknown bench.pc.variants " + unknown);
+        }
+        return variants.stream().filter(v -> ids.contains(v.id())).toList();
     }
 
     private static void requireForceCustomPlan(final Map<String, String> settings) {
@@ -520,7 +576,7 @@ public class ProductionConfigReadBench {
             final String coldPlan;
             try (ProductionSearchDb db = newDb()) {
                 requireForceCustomPlan(db.show(List.of("plan_cache_mode")));
-                coldPlan = db.explain(variant.render(path, 0), !variant.count());
+                coldPlan = db.explain(variant.render(path, 0, legs()), !variant.count());
             }
             md.append("| ").append(variant.id()).append(" | ").append(fmtList(firsts)).append(" | ")
                     .append(fmt(median(firsts))).append(" | ").append(repeats.stream().map(this::fmtList)
@@ -545,6 +601,108 @@ public class ProductionConfigReadBench {
                 .set("variants", jsonArray(json))
                 .build().toString());
         writeSummary();
+    }
+
+    // =================================================================================================================
+    // selective-leg invariance
+    // =================================================================================================================
+
+    /**
+     * The selective-leg choice changes plans, never results: every request of the variants with a two-sided range
+     * ({@code 1}, {@code 5}, {@code ce-a}, {@code ce-a-sudo}, {@code ce-b}, {@code ce-c}) over its whole rotation, and
+     * two filters on the array-heavy {@code attributes/region} (one straddling range, one empty interval), rendered
+     * with point legs only and with range legs. Compared: (a) the request itself (the find page incl. the has-next row,
+     * in order, or the count) and (b) the full sudo match list ordered by thing id (count + md5). For the region
+     * filters both leader-only plans are appended. Writes {@code invariance.md}; fails at the end on any difference.
+     */
+    @Test
+    public void legInvariance() throws Exception {
+        final Instant started = Instant.now();
+        final List<String> differences = new ArrayList<>();
+        final StringBuilder md = new StringBuilder();
+        md.append("# Selective-leg invariance (production config)\n\n");
+        md.append("Generated by `ProductionConfigReadBench#legInvariance` on ").append(started).append(". Every ")
+                .append("request rendered by `SearchQueryAssembler` with point legs only (`POINT`, the statement as ")
+                .append("before range legs) and with range legs (`POINT_AND_RANGE`), executed directly on the shipped ")
+                .append("pool. (a) = the request itself (find page incl. the has-next row in order, or the count); ")
+                .append("(b) = the full sudo match list ordered by thing id (`findAllUnlimited`), as count and md5 ")
+                .append("over `id + \"\\n\"`.\n\n");
+        final StringBuilder plans = new StringBuilder();
+        try (ProductionSearchDb db = newDb()) {
+            requireForceCustomPlan(db.show(List.of("plan_cache_mode")));
+            md.append("- Selective range legs as `pc-read` would run them: ").append(legsLine).append("\n\n");
+            md.append("| request | iteration | subjects | (a) point legs | (a) range legs | (b) point legs | ")
+                    .append("(b) range legs | same |\n|---|---:|---|---|---|---|---|:---:|\n");
+            final List<Variant> variants = variants(new Cursors("", ""));
+            for (final String id : List.of("1", "5", "ce-a", "ce-a-sudo", "ce-b", "ce-c")) {
+                final Variant variant = find(variants, id);
+                for (int i = 0; i < variant.cycle(); i++) {
+                    System.out.printf("invariance %s iteration %d%n", id, i);
+                    compareLegs(db, id, i, variant.query(path, i), variant.subjects().apply(i), variant.count(), md,
+                            differences);
+                }
+            }
+            for (final String filter : List.of(
+                    "and(ge(" + REGION_FIELD + ",91700),le(" + REGION_FIELD + ",93000))",
+                    "and(ge(" + REGION_FIELD + ",93000),le(" + REGION_FIELD + ",91700))")) {
+                System.out.printf("invariance %s%n", filter);
+                final Query query = path.find(filter, ProductionConfigShapes.defaultFindOptions());
+                compareLegs(db, "`" + filter + "`", 0, query, null, false, md, differences);
+                for (final SelectiveLegs mode : SelectiveLegs.values()) {
+                    plans.append("### `").append(filter).append("`, ").append(mode).append(" (sudo find, ")
+                            .append(executionMode(find(variants, "1"))).append(")\n\n```\n")
+                            .append(db.explain(ProductionSearchPath.renderFind(query, null, mode), true))
+                            .append("```\n\n");
+                }
+            }
+        }
+        md.append("\n**Differences: ").append(differences.size()).append("**").append(differences.isEmpty() ? ""
+                : ": " + differences).append("\n\n## Plans of the `").append(REGION_FIELD)
+                .append("` filters (the multi-valued branch on an array-heavy path)\n\n").append(plans);
+        write("invariance.md", md.toString());
+        if (!differences.isEmpty()) {
+            throw new AssertionError("range legs changed results: " + differences);
+        }
+    }
+
+    private void compareLegs(final ProductionSearchDb db, final String request, final int iteration, final Query query,
+            @Nullable final List<String> subjects, final boolean count, final StringBuilder md,
+            final List<String> differences) throws NoSuchAlgorithmException {
+        final List<String> pointRequest = requestResult(db, query, subjects, count, SelectiveLegs.POINT);
+        final List<String> rangeRequest = requestResult(db, query, subjects, count, SelectiveLegs.POINT_AND_RANGE);
+        final List<String> pointList = db.ids(fullSudoList(query, SelectiveLegs.POINT));
+        final List<String> rangeList = db.ids(fullSudoList(query, SelectiveLegs.POINT_AND_RANGE));
+        final boolean same = pointRequest.equals(rangeRequest) && pointList.equals(rangeList);
+        if (!same) {
+            differences.add(request + " iteration " + iteration);
+        }
+        md.append("| ").append(request).append(" | ").append(iteration).append(" | ").append(subjectsOrSudo(subjects))
+                .append(" | ").append(describe(pointRequest, count)).append(" | ")
+                .append(describe(rangeRequest, count)).append(" | ").append(describe(pointList, false)).append(" | ")
+                .append(describe(rangeList, false)).append(" | ").append(same ? "yes" : "**NO**").append(" |\n");
+    }
+
+    /** The find page incl. the has-next row, in order; or the count as a one-element list. */
+    private static List<String> requestResult(final ProductionSearchDb db, final Query query,
+            @Nullable final List<String> subjects, final boolean count, final SelectiveLegs mode) {
+        return count
+                ? List.of(String.valueOf(db.executeCount(ProductionSearchPath.renderCount(query, subjects, mode))))
+                : db.executeThingIds(ProductionSearchPath.renderFind(query, subjects, mode));
+    }
+
+    private RenderedSql fullSudoList(final Query query, final SelectiveLegs mode) {
+        return SearchQueryAssembler.findAllUnlimited(query.getCriteria(), null, PostgresSortClause.of(
+                path.find(null, List.of("sort(+thingId)")).getSortOptions()), null, 0L, mode);
+    }
+
+    private static String describe(final List<String> result, final boolean count)
+            throws NoSuchAlgorithmException {
+        if (count) {
+            return "count " + result.get(0);
+        }
+        final MessageDigest md5 = MessageDigest.getInstance("MD5");
+        result.forEach(id -> md5.update((id + "\n").getBytes(StandardCharsets.UTF_8)));
+        return result.size() + " ids, md5 `" + HexFormat.of().formatHex(md5.digest()) + "`";
     }
 
     // =================================================================================================================
@@ -645,10 +803,7 @@ public class ProductionConfigReadBench {
         final StringBuilder sb = new StringBuilder();
         sb.append("## Shape ").append(variant.id()).append(" — ").append(variant.title()).append("\n\n");
         sb.append("Request (as a client sends it, parsed by the service's `QueryParser`): ").append(variant.request())
-                .append(". Auth subjects: ").append(variant.subjects().apply(0).equals(FIXED_SUBJECTS)
-                        && variant.subjects().apply(1).equals(FIXED_SUBJECTS)
-                        ? "fixed pair " + FIXED_SUBJECTS : "2 per iteration, cycling (iteration 0: "
-                        + variant.subjects().apply(0) + ")").append(".\n\n");
+                .append(". Auth subjects: ").append(subjectsLabel(variant)).append(".\n\n");
         sb.append("### Warm latency (per round: ").append(variant.warmupIterations()).append(" warmup iterations 0..")
                 .append(variant.warmupIterations() - 1).append(" covering the whole filter rotation of ")
                 .append(variant.cycle()).append(", then ").append(TIMED).append(" timed iterations ").append(FIRST_TIMED)
@@ -701,14 +856,27 @@ public class ProductionConfigReadBench {
             sb.append(rounds.get(rounds.size() - 1).get(i).rows()).append(" | `")
                     .append(variant.count() || variant.filter().apply(iteration) != null
                             ? variant.filter().apply(iteration) : String.valueOf(variant.options().apply(iteration)))
-                    .append("` | ").append(variant.subjects().apply(iteration)).append(" |\n");
+                    .append("` | ").append(subjectsOrSudo(variant.subjects().apply(iteration))).append(" |\n");
         }
         sb.append("\n### EXPLAIN (ANALYZE, BUFFERS, SETTINGS) — warm, the slowest iteration of the last round (")
                 .append(slowestIteration).append("), ").append(executionMode(variant)).append("\n\n");
-        selectiveLegSummary(variant.render(path, slowestIteration), slowestExplain)
+        selectiveLegSummary(variant.render(path, slowestIteration, legs()), slowestExplain)
                 .ifPresent(line -> sb.append(line.replace("(warm EXPLAIN below)", "(EXPLAIN below)")).append("\n\n"));
         sb.append("```\n").append(slowestExplain).append("```\n\n");
         return sb.toString();
+    }
+
+    private static String subjectsLabel(final Variant variant) {
+        final List<String> first = variant.subjects().apply(0);
+        if (first == null) {
+            return SUDO;
+        }
+        return first.equals(FIXED_SUBJECTS) && FIXED_SUBJECTS.equals(variant.subjects().apply(1))
+                ? "fixed pair " + FIXED_SUBJECTS : "2 per iteration, cycling (iteration 0: " + first + ")";
+    }
+
+    private static String subjectsOrSudo(@Nullable final List<String> subjects) {
+        return subjects == null ? SUDO : subjects.toString();
     }
 
     /** How the plan was executed, stated next to every EXPLAIN (review round 1, I1). */
@@ -728,26 +896,42 @@ public class ProductionConfigReadBench {
     /**
      * For statements with the selective-leg CTE: which leg it materialised (the CTE body's {@code wpath}/value binds),
      * how many thing ids, and how long the CTE body node took relative to the whole execution — read off the plan.
+     * With a point and a range leg ({@code sel_pick} first) also which of them the statement picked: the {@code sel_leg}
+     * branches gated off by their one-time filter are {@code (never executed)} — and how long the pick took.
      */
     static java.util.Optional<String> selectiveLegSummary(final RenderedSql sql, final String explain) {
-        if (!sql.sql().startsWith("WITH sel_leg AS MATERIALIZED")) {
+        final List<String> branches = cteBranches(sql);
+        if (branches.isEmpty()) {
             return java.util.Optional.empty();
         }
         final String[] lines = explain.split("\n");
-        String cteNode = null;
-        for (int i = 0; i < lines.length - 1 && cteNode == null; i++) {
-            if (lines[i].trim().equals("CTE sel_leg")) {
-                cteNode = lines[i + 1];
-            }
-        }
+        final int legLine = cteLine(lines, "CTE sel_leg");
+        final String cteNode = legLine >= 0 && legLine + 1 < lines.length ? lines[legLine + 1] : null;
         final java.util.regex.Matcher node = cteNode == null ? null : ACTUAL.matcher(cteNode);
         final java.util.regex.Matcher total = EXECUTION_TIME.matcher(explain);
-        final StringBuilder sb = new StringBuilder("Selective-leg CTE (`sel_leg`): materialised the leg `")
-                .append(cteCondition(sql)).append('`');
+        final StringBuilder sb = new StringBuilder("Selective-leg CTE (`sel_leg`): ");
+        if (branches.size() == 1) {
+            sb.append("materialised the leg `").append(cteCondition(sql)).append('`');
+        } else if (branches.size() == 2) {
+            sb.append("materialised the range leg (in-range rows + multi-valued rows) `").append(cteCondition(sql))
+                    .append('`');
+        } else {
+            final List<Boolean> executed = legLine < 0 ? List.of() : executedBranches(lines, legLine);
+            sb.append("picked ").append(chosenLeg(executed))
+                    .append(" (branches executed [point, range, multi-valued]: ").append(executed).append(") of `")
+                    .append(cteCondition(sql)).append('`');
+        }
         if (node != null && node.find()) {
             sb.append("; its body node (`").append(cteNode.trim().replaceAll("\\s+\\(cost=.*", "")).append("`) produced ")
                     .append(node.group(3)).append(" thing ids in ").append(node.group(2)).append(" ms (loops=")
                     .append(node.group(4)).append(')');
+        }
+        final int pickLine = cteLine(lines, "CTE sel_pick");
+        if (pickLine >= 0 && pickLine + 1 < lines.length) {
+            final java.util.regex.Matcher pick = ACTUAL.matcher(lines[pickLine + 1]);
+            if (pick.find()) {
+                sb.append("; the pick (`sel_pick`) took ").append(pick.group(2)).append(" ms");
+            }
         }
         if (total.find()) {
             sb.append(" of ").append(total.group(1)).append(" ms total execution (warm EXPLAIN below)");
@@ -755,20 +939,149 @@ public class ProductionConfigReadBench {
         return java.util.Optional.of(sb.append('.').toString());
     }
 
-    private static final java.util.regex.Pattern CTE_BODY = java.util.regex.Pattern.compile(
-            "^WITH sel_leg AS MATERIALIZED \\(SELECT .*? WHERE (.*?)\\) SELECT ", java.util.regex.Pattern.DOTALL);
+    private static int cteLine(final String[] lines, final String cte) {
+        for (int i = 0; i < lines.length; i++) {
+            if (lines[i].trim().equals(cte)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * @return for each {@code Result} with a {@code One-Time Filter} in the {@code sel_leg} subtree (the pick's gated
+     * {@code UNION ALL} branches, in order: point, range, multi-valued), whether a node below it other than the
+     * {@code sel_pick} scan ran.
+     */
+    private static List<Boolean> executedBranches(final String[] lines, final int cteLine) {
+        final int cteIndent = indent(lines[cteLine]);
+        int end = cteLine + 1;
+        while (end < lines.length && indent(lines[end]) > cteIndent) {
+            end++;
+        }
+        final List<Boolean> executed = new ArrayList<>();
+        for (int i = cteLine + 1; i < end; i++) {
+            if (lines[i].trim().startsWith("->  Result") && hasOneTimeFilter(lines, i, end)) {
+                final int resultIndent = indent(lines[i]);
+                boolean ran = false;
+                for (int j = i + 1; j < end && indent(lines[j]) > resultIndent; j++) {
+                    final String line = lines[j].trim();
+                    if (line.startsWith("->  ") && !line.contains("sel_pick") && !line.contains("(never executed)")) {
+                        ran = true;
+                    }
+                }
+                executed.add(ran);
+            }
+        }
+        return executed;
+    }
+
+    /** Whether the node at {@code nodeLine} lists a {@code One-Time Filter} among its own (non-child) lines. */
+    private static boolean hasOneTimeFilter(final String[] lines, final int nodeLine, final int end) {
+        final int nodeIndent = indent(lines[nodeLine]);
+        for (int j = nodeLine + 1; j < end && indent(lines[j]) > nodeIndent; j++) {
+            final String line = lines[j].trim();
+            if (line.startsWith("->  ") || line.startsWith("InitPlan") || line.startsWith("SubPlan")) {
+                return false;
+            }
+            if (line.startsWith("One-Time Filter:")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int indent(final String line) {
+        int i = 0;
+        while (i < line.length() && line.charAt(i) == ' ') {
+            i++;
+        }
+        return i;
+    }
+
+    private static String chosenLeg(final List<Boolean> executed) {
+        if (executed.size() != 3) {
+            return "an undetermined leg";
+        }
+        if (executed.get(0) && !executed.get(1) && !executed.get(2)) {
+            return "the point leg";
+        }
+        if (!executed.get(0) && (executed.get(1) || executed.get(2))) {
+            return "the range leg (in-range rows + multi-valued rows)";
+        }
+        return "an undetermined leg";
+    }
+
+    private static final String LEG_CTE_START = "sel_leg AS MATERIALIZED (";
+    private static final String UNION_ALL = " UNION ALL ";
+    private static final String WHERE = " WHERE ";
+    private static final String PICK_GATE = " AND (SELECT sp.point_wins FROM sel_pick sp))";
+    private static final String PICK_GATE_NEGATED = " AND NOT (SELECT sp.point_wins FROM sel_pick sp))";
     private static final java.util.regex.Pattern BIND = java.util.regex.Pattern.compile("\\$(\\d+)");
 
     /**
-     * @return the CTE body's {@code WHERE} condition with its {@code $n} binds substituted, read from the rendered SQL
-     * (review round 1, M8: independent of which operator and bind positions the leg uses).
+     * @return the candidate conditions of the selective-leg CTE with their {@code $n} binds substituted, read from the
+     * rendered SQL (review round 1, M8: independent of which operator and bind positions the leg uses): the point leg
+     * alone; {@code range: <in range> UNION ALL <multi-valued>}; or, with the pick,
+     * {@code point: …; range: … UNION ALL …}.
      */
     static String cteCondition(final RenderedSql sql) {
-        final java.util.regex.Matcher body = CTE_BODY.matcher(sql.sql());
-        if (!body.find()) {
-            return "?";
+        final List<String> branches = cteBranches(sql);
+        return switch (branches.size()) {
+            case 0 -> "?";
+            case 1 -> branches.get(0);
+            case 2 -> "range: " + branches.get(0) + UNION_ALL.stripTrailing() + " " + branches.get(1);
+            default -> "point: " + branches.get(0) + "; range: " + branches.get(1) + UNION_ALL.stripTrailing() + " "
+                    + branches.get(2);
+        };
+    }
+
+    /**
+     * @return the {@code WHERE} condition of each {@code UNION ALL} branch of {@code sel_leg} (without the pick's
+     * gate), binds substituted; empty if the statement has no selective-leg CTE.
+     */
+    private static List<String> cteBranches(final RenderedSql sql) {
+        final String text = sql.sql();
+        final int start = text.indexOf(LEG_CTE_START);
+        if (start < 0 || !(text.startsWith("WITH sel_leg AS MATERIALIZED")
+                || text.startsWith("WITH sel_pick AS MATERIALIZED"))) {
+            return List.of();
         }
-        final java.util.regex.Matcher bind = BIND.matcher(body.group(1));
+        final List<String> bodies = new ArrayList<>();
+        int depth = 1;
+        int branchStart = start + LEG_CTE_START.length();
+        int i = branchStart;
+        while (i < text.length() && depth > 0) {
+            final char c = text.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (depth == 1 && text.startsWith(UNION_ALL, i)) {
+                bodies.add(text.substring(branchStart, i));
+                branchStart = i + UNION_ALL.length();
+                i = branchStart - 1;
+            }
+            i++;
+        }
+        bodies.add(text.substring(branchStart, i - 1));
+        return bodies.stream()
+                .map(body -> withoutPickGate(body.substring(body.indexOf(WHERE) + WHERE.length())))
+                .map(condition -> withBinds(condition, sql))
+                .toList();
+    }
+
+    private static String withoutPickGate(final String condition) {
+        for (final String gate : List.of(PICK_GATE, PICK_GATE_NEGATED)) {
+            if (condition.endsWith(gate)) {
+                return condition.substring(1, condition.length() - gate.length());
+            }
+        }
+        return condition;
+    }
+
+    private static String withBinds(final String condition, final RenderedSql sql) {
+        final java.util.regex.Matcher bind = BIND.matcher(condition);
         final StringBuilder out = new StringBuilder();
         while (bind.find()) {
             final Object value = sql.bindValues().get(Integer.parseInt(bind.group(1)) - 1);
@@ -837,7 +1150,8 @@ public class ProductionConfigReadBench {
                 .append(config.getPoolConfig().getFetchSize()).append(", prepared-statement-cache-queries ")
                 .append(config.getPoolConfig().getPreparedStatementCacheQueries()).append(", max-acquire-time ")
                 .append(config.getPoolConfig().getMaxAcquireTime()).append('\n');
-        sb.append("- read fetch size: `PostgresThingsSearchPersistence.DEFAULT_FETCH_SIZE` (100) per statement\n\n");
+        sb.append("- read fetch size: `PostgresThingsSearchPersistence.DEFAULT_FETCH_SIZE` (100) per statement\n");
+        sb.append("- Selective range legs: ").append(legsLine).append("\n\n");
         sb.append("## Session settings as a pooled connection sees them (`SHOW`)\n\n| setting | value |\n|---|---|\n");
         settings.forEach((k, v) -> sb.append("| ").append(k).append(" | ").append(v).append(" |\n"));
         try (Connection jdbc = DriverManager.getConnection(BenchConfig.jdbcUrl(), BenchConfig.user(),
@@ -862,7 +1176,8 @@ public class ProductionConfigReadBench {
             sb.append("\n## Catalog check against the production DDL\n\n")
                     .append("Every index definition, column, constraint, reloption, per-column statistics target and ")
                     .append("extended statistics object of the search tables, compared with a reference built from ")
-                    .append("`PostgresSearchSchema.ddlStatements()` in a rolled-back scratch schema.\n\n")
+                    .append("`PostgresSearchSchema.ddlStatements()` and the system index `sf_multi` in a rolled-back ")
+                    .append("scratch schema.\n\n")
                     .append("- matches production: **").append(check.productionVerdict()).append("** (")
                     .append(check.comparedItems()).append(" items compared)\n- indexes: ").append(check.actualIndexes())
                     .append("\n- differences: ").append(check.differences())
@@ -926,7 +1241,8 @@ public class ProductionConfigReadBench {
 
         final StringBuilder sb = new StringBuilder();
         sb.append("# Production-config search benchmark — summary\n\n");
-        sb.append("Shipped schema (`PostgresSearchSchema.ddlStatements()` only), shipped translator (service ")
+        sb.append("Shipped schema (`PostgresSearchSchema.ddlStatements()` + the system index `sf_multi`), shipped ")
+                .append("translator (service ")
                 .append("`QueryParser` + `ThingsSearchCursor` → `SearchQueryAssembler`/`CreateSqlVisitor`/")
                 .append("`AuthFilterSqlBuilder`), shipped read persistence and pool config (`plan_cache_mode = ")
                 .append("force_custom_plan`), ")
@@ -979,7 +1295,35 @@ public class ProductionConfigReadBench {
     // =================================================================================================================
 
     private ProductionSearchDb newDb() {
-        return new ProductionSearchDb(system, BenchConfig.r2dbcUrl(), BenchConfig.user(), BenchConfig.password());
+        return new ProductionSearchDb(system, BenchConfig.r2dbcUrl(), BenchConfig.user(), BenchConfig.password(),
+                legs());
+    }
+
+    /** @return the selective legs of this run, resolved on first use and then kept for warm, cold and bias alike. */
+    private SelectiveLegs legs() {
+        if (legs == null) {
+            legs = resolveLegs();
+        }
+        return legs;
+    }
+
+    /**
+     * {@code bench.pc.rangeLegs=off}: point legs only. {@code auto}: what the service's probe of the system index
+     * {@code sf_multi} sees on this database.
+     */
+    private SelectiveLegs resolveLegs() {
+        if ("off".equals(BenchConfig.productionConfigRangeLegs())) {
+            legsLine = "off (forced: bench.pc.rangeLegs=off)";
+            return SelectiveLegs.POINT;
+        }
+        try (ProductionSearchDb probeDb = new ProductionSearchDb(system, BenchConfig.r2dbcUrl(), BenchConfig.user(),
+                BenchConfig.password())) {
+            final boolean valid = Boolean.TRUE.equals(SystemIndexProbe.of(SystemSearchIndex.MULTI_VALUED)
+                    .refresh(probeDb.pool())
+                    .block(Duration.ofSeconds(60L)));
+            legsLine = valid ? "on (sf_multi valid)" : "off (sf_multi missing or invalid)";
+            return SelectiveLegs.of(valid);
+        }
     }
 
     private static Variant find(final List<Variant> variants, final String id) {

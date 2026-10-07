@@ -15,11 +15,14 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.search;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
 import javax.annotation.Nullable;
@@ -33,6 +36,11 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.Post
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndex;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexKind;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndexMaintenance;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQuery;
+import org.eclipse.ditto.rql.query.SortDirection;
+import org.eclipse.ditto.rql.query.SortOption;
+import org.eclipse.ditto.rql.query.criteria.CriteriaFactory;
 import org.eclipse.ditto.rql.query.expression.ThingsFieldExpressionFactory;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -49,9 +57,10 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
- * {@link PostgresSearchPersistenceProvider#bootstrapSchema()} and the per-path indexes, against a real PostgreSQL 16
- * (Testcontainers): the maintenance starts in the background only after a successful bootstrap, never after a refused
- * one, does nothing against a newer stored schema, and an invalid entry fails the start before any database work.
+ * {@link PostgresSearchPersistenceProvider#bootstrapSchema()} and the per-path and system indexes, against a real
+ * PostgreSQL 16 (Testcontainers): the maintenance starts in the background only after a successful bootstrap, never
+ * after a refused one, does nothing against a newer stored schema, and an invalid entry fails the start before any
+ * database work; once the system index {@code sf_multi} is valid, the read path renders range legs.
  * <p>
  * Skipped when no Docker daemon is reachable.
  * </p>
@@ -61,8 +70,9 @@ public final class PostgresSearchPathIndexBootstrapIT {
     private static final PostgresDbResource POSTGRES = new PostgresDbResource();
     private static ConnectionFactory connectionFactory;
 
-    private static final PathIndex PROP0 = PathIndex.of("features/*/properties/prop0", PathIndexKind.TRIGRAM,
-            ThingsFieldExpressionFactory.of(Map.of()));
+    private static final ThingsFieldExpressionFactory FEF = ThingsFieldExpressionFactory.of(Map.of());
+    private static final PathIndex PROP0 = PathIndex.of("features/*/properties/prop0", PathIndexKind.TRIGRAM, FEF);
+    private static final String MULTI = SystemSearchIndex.MULTI_VALUED.indexName();
     private static final String PROP0_CONFIG = "[ { path = \"features/*/properties/prop0\", kind = trigram } ]";
 
     @BeforeClass
@@ -90,6 +100,7 @@ public final class PostgresSearchPathIndexBootstrapIT {
         for (final String name : query("SELECT relname::text FROM pg_class WHERE starts_with(relname, 'sf_path_')")) {
             query("DROP INDEX " + name);
         }
+        query("DROP INDEX IF EXISTS " + MULTI);
     }
 
     @Test
@@ -99,23 +110,26 @@ public final class PostgresSearchPathIndexBootstrapIT {
 
             final PathIndexMaintenance.Outcome outcome = await(provider.pathIndexMaintenanceOutcome());
             assertThat(outcome.status()).isEqualTo(PathIndexMaintenance.Status.APPLIED);
-            assertThat(outcome.built()).containsExactly(PROP0.name());
+            assertThat(outcome.built()).containsExactly(MULTI, PROP0.name());
             assertThat(query("SELECT indisvalid::text FROM pg_index WHERE indexrelid = '" + PROP0.name()
                     + "'::regclass")).containsExactly("true");
         });
     }
 
     @Test
-    public void theShippedDefaultLeavesExistingPerPathIndexesAlone() {
-        // the profile leaves paths unset: an instance without the list neither builds nor drops (no mass drop when an
-        // environment variable is missing in one deployment)
+    public void theShippedDefaultBuildsTheSystemIndexAndLeavesPerPathIndexesAlone() {
+        // the profile leaves paths unset: an instance without the list neither builds nor drops per-path indexes (no
+        // mass drop when an environment variable is missing in one deployment); the system index is built regardless
         query(PROP0.createStatement());
+        final String prop0Oid = oid(PROP0.name());
         withProvider(null, provider -> {
             provider.bootstrapSchema();
 
             final PathIndexMaintenance.Outcome outcome = await(provider.pathIndexMaintenanceOutcome());
-            assertThat(outcome.status()).isEqualTo(PathIndexMaintenance.Status.NOT_CONFIGURED);
+            assertThat(outcome.status()).isEqualTo(PathIndexMaintenance.Status.APPLIED);
+            assertThat(outcome.built()).containsExactly(MULTI);
             assertThat(managedIndexCount()).isEqualTo(1);
+            assertThat(oid(PROP0.name())).as("the per-path index is untouched").isEqualTo(prop0Oid);
         });
     }
 
@@ -141,6 +155,7 @@ public final class PostgresSearchPathIndexBootstrapIT {
 
             assertThat(provider.pathIndexMaintenanceOutcome()).isNull();
             assertThat(managedIndexCount()).isZero();
+            assertThat(oid(MULTI)).isEmpty();
         });
     }
 
@@ -156,6 +171,26 @@ public final class PostgresSearchPathIndexBootstrapIT {
             final PathIndexMaintenance.Outcome outcome = await(provider.pathIndexMaintenanceOutcome());
             assertThat(outcome.status()).isEqualTo(PathIndexMaintenance.Status.SCHEMA_VERSION_MISMATCH);
             assertThat(managedIndexCount()).isZero();
+            assertThat(oid(MULTI)).isEmpty();
+        });
+    }
+
+    @Test
+    public void theRangeLegIsRenderedOnceTheSystemIndexIsValid() {
+        withProvider(null, provider -> {
+            provider.bootstrapSchema();
+
+            await(provider.pathIndexMaintenanceOutcome());
+            awaitTrue(() -> provider.multiValuedIndexProbe().getAsBoolean(), "sf_multi valid");
+            final String sql = provider.renderForDiagnostics(rangeQuery(), null);
+            assertThat(sql).contains("UNION ALL").contains("sfc.ord = 1");
+
+            // and back: without sf_multi the same provider renders point legs only (a lone range has no leg then)
+            query("DROP INDEX " + MULTI);
+            awaitTrue(() -> !Boolean.TRUE.equals(provider.multiValuedIndexProbe().refresh(connectionFactory)
+                    .block(Duration.ofSeconds(10L))), "sf_multi seen missing");
+            assertThat(provider.renderForDiagnostics(rangeQuery(), null))
+                    .doesNotContain("UNION ALL").doesNotContain("sel_leg");
         });
     }
 
@@ -208,6 +243,36 @@ public final class PostgresSearchPathIndexBootstrapIT {
         } catch (final Exception e) {
             throw new AssertionError(e);
         }
+    }
+
+    /** {@code and(ge(attributes/p,1),le(attributes/p,2))}, sorted by thing id. */
+    private static PostgresQuery rangeQuery() {
+        final CriteriaFactory cf = CriteriaFactory.getInstance();
+        final ThingsFieldExpressionFactory fef = ThingsFieldExpressionFactory.of(Map.of("thingId", "_id"));
+        return new PostgresQuery(cf.and(List.of(cf.fieldCriteria(fef.filterByAttribute("p"), cf.ge(1)),
+                cf.fieldCriteria(fef.filterByAttribute("p"), cf.le(2)))),
+                List.of(new SortOption(fef.sortByThingId(), SortDirection.ASC)), 25, 0);
+    }
+
+    private static void awaitTrue(final BooleanSupplier condition, final String what) {
+        final Instant deadline = Instant.now().plusSeconds(30L);
+        while (Instant.now().isBefore(deadline)) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            try {
+                Thread.sleep(50L);
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError(e);
+            }
+        }
+        throw new AssertionError("not within 30 s: " + what);
+    }
+
+    /** @return the OID of the relation, or empty if it does not exist. */
+    private static String oid(final String relation) {
+        return query("SELECT coalesce(to_regclass('" + relation + "')::oid::text, '')").get(0);
     }
 
     private static int managedIndexCount() {

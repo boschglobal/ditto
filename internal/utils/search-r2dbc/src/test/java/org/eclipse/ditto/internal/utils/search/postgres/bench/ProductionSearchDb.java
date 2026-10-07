@@ -19,6 +19,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Nullable;
+
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.stream.javadsl.Sink;
 import org.apache.pekko.stream.javadsl.Source;
@@ -26,6 +28,7 @@ import org.eclipse.ditto.base.model.headers.DittoHeaders;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.DefaultPostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.read.PostgresThingsSearchPersistence;
 import org.eclipse.ditto.rql.query.Query;
@@ -37,6 +40,7 @@ import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigValueFactory;
 
 import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.ConnectionFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -62,10 +66,19 @@ final class ProductionSearchDb implements AutoCloseable {
     private final PostgresThingsSearchPersistence persistence;
 
     ProductionSearchDb(final ActorSystem system, final String r2dbcUri, final String user, final String password) {
+        this(system, r2dbcUri, user, password, SelectiveLegs.POINT);
+    }
+
+    /**
+     * @param legs which legs the persistence's selective-leg CTE may materialise ({@link SelectiveLegs#POINT_AND_RANGE}
+     * = as the service once it sees the system index {@code sf_multi} valid).
+     */
+    ProductionSearchDb(final ActorSystem system, final String r2dbcUri, final String user, final String password,
+            final SelectiveLegs legs) {
         this.system = system;
         config = shippedConfig(r2dbcUri, user, password);
         client = DittoPostgresClient.newInstance(config);
-        persistence = PostgresThingsSearchPersistence.of(client);
+        persistence = PostgresThingsSearchPersistence.of(client, () -> legs == SelectiveLegs.POINT_AND_RANGE);
     }
 
     /**
@@ -89,14 +102,23 @@ final class ProductionSearchDb implements AutoCloseable {
         return config;
     }
 
-    /** Times nothing itself: runs the shipped {@code findAll} to completion and returns its page. */
-    ResultList<TimestampedThingId> findAll(final Query query, final List<String> subjects) {
+    /** @return the shipped pool. */
+    ConnectionFactory pool() {
+        return client.getConnectionPool();
+    }
+
+    /**
+     * Times nothing itself: runs the shipped {@code findAll} to completion and returns its page ({@code null} subjects:
+     * the sudo form).
+     */
+    ResultList<TimestampedThingId> findAll(final Query query, @Nullable final List<String> subjects) {
         return run(persistence.findAll(query, subjects, null, HEADERS));
     }
 
-    /** Runs the shipped {@code count} to completion. */
-    long count(final Query query, final List<String> subjects) {
-        return run(persistence.count(query, subjects, HEADERS));
+    /** Runs the shipped {@code count} to completion ({@code null} subjects: {@code sudoCount}). */
+    long count(final Query query, @Nullable final List<String> subjects) {
+        return run(subjects == null ? persistence.sudoCount(query, HEADERS)
+                : persistence.count(query, subjects, HEADERS));
     }
 
     /**
@@ -141,6 +163,18 @@ final class ProductionSearchDb implements AutoCloseable {
     List<String> executeThingIds(final RenderedSql rendered) {
         return Flux.usingWhen(Mono.from(client.getConnectionPool().create()),
                         connection -> Flux.from(rendered.applyTo(connection.createStatement(rendered.sql())).execute())
+                                .flatMap(result -> result.map((row, meta) -> row.get("thing_id", String.class))),
+                        Connection::close)
+                .collectList()
+                .block(TIMEOUT);
+    }
+
+    /** Executes a rendered statement directly and collects its {@code thing_id} column, fetching 1000 rows at a time. */
+    List<String> ids(final RenderedSql rendered) {
+        return Flux.usingWhen(Mono.from(client.getConnectionPool().create()),
+                        connection -> Flux.from(rendered.applyTo(connection.createStatement(rendered.sql()))
+                                        .fetchSize(1000)
+                                        .execute())
                                 .flatMap(result -> result.map((row, meta) -> row.get("thing_id", String.class))),
                         Connection::close)
                 .collectList()

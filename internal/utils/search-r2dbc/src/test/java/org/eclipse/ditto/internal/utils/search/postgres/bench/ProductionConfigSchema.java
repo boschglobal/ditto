@@ -26,14 +26,18 @@ import java.util.regex.Pattern;
 
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSearchSchema;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.PathIndex;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 
 /**
- * The production-config bench mode's schema: exactly {@link PostgresSearchSchema#ddlStatements()} — the SHIPPED search
- * DDL — and nothing else. The only liberty taken is ordering: the statements are split into an order-preserving
- * pre-load phase (the {@code pg_trgm} extension, the three tables and the tables' autovacuum reloptions) and post-load
- * phase (every {@code CREATE INDEX}), so the 1M-thing bulk {@code COPY} does not maintain 12 indexes row by row. The
- * resulting catalog is the same as a production bootstrap's; {@link #verify(Connection)} proves that after the load
- * (index set, default statistics targets, exactly the production reloptions).
+ * The production-config bench mode's schema: the production schema = exactly
+ * {@link PostgresSearchSchema#ddlStatements()} — the SHIPPED search DDL — plus the system indexes
+ * ({@link SystemSearchIndex}, which the service builds {@code CONCURRENTLY} after its bootstrap), and nothing else. The
+ * only liberty taken is ordering: the statements are split into an order-preserving pre-load phase (the {@code pg_trgm}
+ * extension, the three tables and the tables' autovacuum reloptions) and post-load phase (every {@code CREATE INDEX} of
+ * the DDL, then the system indexes as plain {@code CREATE INDEX}: the load is offline), so the 1M-thing bulk
+ * {@code COPY} does not maintain 12 indexes row by row. The resulting catalog is the same as a production bootstrap's
+ * after its index maintenance; {@link #verify(Connection)} proves that after the load (index set, default statistics
+ * targets, exactly the production reloptions).
  */
 final class ProductionConfigSchema {
 
@@ -50,9 +54,16 @@ final class ProductionConfigSchema {
         return filter(false);
     }
 
-    /** @return every production {@code CREATE INDEX} statement, in production order. */
+    /** @return every production {@code CREATE INDEX} statement, in production order, then the system indexes. */
     static List<String> postLoadStatements() {
-        return filter(true);
+        final List<String> statements = new ArrayList<>(filter(true));
+        statements.addAll(systemIndexStatements());
+        return List.copyOf(statements);
+    }
+
+    /** @return the system indexes as plain {@code CREATE INDEX IF NOT EXISTS} statements. */
+    private static List<String> systemIndexStatements() {
+        return java.util.Arrays.stream(SystemSearchIndex.values()).map(SystemSearchIndex::createStatement).toList();
     }
 
     /** @return the production tables (parsed from the DDL). */
@@ -155,17 +166,19 @@ final class ProductionConfigSchema {
     private static final String REFERENCE_SCHEMA = "production_config_ddl_reference";
 
     /**
-     * Compares the live search tables with a REFERENCE built from {@link PostgresSearchSchema#ddlStatements()} in a
-     * scratch schema inside a transaction that is rolled back (nothing persists). Compared, normalised for the schema
-     * name: every index definition ({@code pg_get_indexdef}), every column (type, collation, NOT NULL, default), every
-     * constraint ({@code pg_get_constraintdef}), every relation's reloptions, every per-column statistics target and
-     * every extended statistics object. Anything the production DDL does not create — a covering index, a
-     * {@code SET STATISTICS}, a {@code CREATE STATISTICS}, a reloption — or a same-named but redefined index shows up
-     * as a difference (review round 1, M5). Comparing against the reference instead of hard-coded expectations keeps
-     * the check correct when the production DDL itself gains, e.g., autovacuum reloptions. An operator-configured
-     * per-path trigram index ({@code sf_path_trgm_*} with exactly the shape {@code PathIndexMaintenance} builds) is not
-     * part of the production DDL by design; it is listed in {@link CatalogCheck#perPathIndexes()} instead of being
-     * reported as a difference. Any other index under that name prefix is still a difference.
+     * Compares the live search tables with a REFERENCE built from {@link PostgresSearchSchema#ddlStatements()} and the
+     * system indexes ({@link SystemSearchIndex}) in a scratch schema inside a transaction that is rolled back (nothing
+     * persists); a live catalog without a system index (e.g. a corpus loaded with search schema v2) is a difference.
+     * Compared, normalised for the schema name: every index definition ({@code pg_get_indexdef}), every column (type,
+     * collation, NOT NULL, default), every constraint ({@code pg_get_constraintdef}), every relation's reloptions,
+     * every per-column statistics target and every extended statistics object. Anything the production DDL does not
+     * create — a covering index, a {@code SET STATISTICS}, a {@code CREATE STATISTICS}, a reloption — or a same-named
+     * but redefined index shows up as a difference (review round 1, M5). Comparing against the reference instead of
+     * hard-coded expectations keeps the check correct when the production DDL itself gains, e.g., autovacuum
+     * reloptions. An operator-configured per-path trigram index ({@code sf_path_trgm_*} with exactly the shape
+     * {@code PathIndexMaintenance} builds) is not part of the production DDL by design; it is listed in
+     * {@link CatalogCheck#perPathIndexes()} instead of being reported as a difference. Any other index under that name
+     * prefix is still a difference.
      */
     static CatalogCheck verify(final Connection connection) throws SQLException {
         final String liveSchema;
@@ -197,6 +210,9 @@ final class ProductionConfigSchema {
             // pg_trgm (and its gin_trgm_ops) stays where it is installed; the tables and indexes go to the reference.
             statement.execute("SET LOCAL search_path = " + REFERENCE_SCHEMA + ", " + liveSchema);
             for (final String ddl : PostgresSearchSchema.ddlStatements()) {
+                statement.execute(ddl);
+            }
+            for (final String ddl : systemIndexStatements()) {
                 statement.execute(ddl);
             }
             reference = catalog(connection, REFERENCE_SCHEMA);

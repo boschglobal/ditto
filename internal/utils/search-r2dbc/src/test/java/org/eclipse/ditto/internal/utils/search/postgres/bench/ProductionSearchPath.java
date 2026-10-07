@@ -22,6 +22,7 @@ import org.eclipse.ditto.base.model.headers.DittoHeaders;
 import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresSortClause;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SearchQueryAssembler;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.rql.query.Query;
 import org.eclipse.ditto.thingsearch.model.signals.commands.query.CountThings;
@@ -101,15 +102,36 @@ final class ProductionSearchPath {
         return BenchSearchQueryPath.nextPageCursor(queryThings(filter, options), page);
     }
 
-    /** @return the SQL {@code PostgresThingsSearchPersistence.findAll} executes for {@code query}. */
+    /** @return the SQL {@code PostgresThingsSearchPersistence.findAll} executes for {@code query}, point legs only. */
     static RenderedSql renderFind(final Query query, final List<String> subjects) {
-        return SearchQueryAssembler.findAll(query.getCriteria(), subjects, PostgresSortClause.of(query.getSortOptions()),
-                (long) query.getLimit() + 1L, query.getSkip());
+        return renderFind(query, subjects, SelectiveLegs.POINT);
     }
 
-    /** @return the SQL {@code PostgresThingsSearchPersistence.count} executes for {@code query}. */
+    /**
+     * @param query the query.
+     * @param subjects the auth subjects, or {@code null} for the sudo form.
+     * @param legs which legs the selective-leg CTE may materialise.
+     * @return the SQL {@code PostgresThingsSearchPersistence.findAll} executes for {@code query}.
+     */
+    static RenderedSql renderFind(final Query query, @Nullable final List<String> subjects, final SelectiveLegs legs) {
+        return SearchQueryAssembler.findAll(query.getCriteria(), subjects, PostgresSortClause.of(query.getSortOptions()),
+                (long) query.getLimit() + 1L, query.getSkip(), legs);
+    }
+
+    /** @return the SQL {@code PostgresThingsSearchPersistence.count} executes for {@code query}, point legs only. */
     static RenderedSql renderCount(final Query query, final List<String> subjects) {
-        return SearchQueryAssembler.count(query.getCriteria(), subjects, query.getSkip(), query.getLimit());
+        return renderCount(query, subjects, SelectiveLegs.POINT);
+    }
+
+    /**
+     * @param query the query.
+     * @param subjects the auth subjects, or {@code null} for the sudo form ({@code sudoCount}).
+     * @param legs which legs the selective-leg CTE may materialise.
+     * @return the SQL {@code PostgresThingsSearchPersistence.count} executes for {@code query}.
+     */
+    static RenderedSql renderCount(final Query query, @Nullable final List<String> subjects,
+            final SelectiveLegs legs) {
+        return SearchQueryAssembler.count(query.getCriteria(), subjects, query.getSkip(), query.getLimit(), legs);
     }
 
 }

@@ -33,7 +33,8 @@ import org.junit.Test;
 
 /**
  * Proves the production-config catalog check ({@link ProductionConfigSchema#verify}) accepts exactly the production
- * DDL and reports every bench-only extra the Phase-0 mitigation ladder used — a covering index, a same-named but
+ * schema (the DDL plus the system index {@code sf_multi}), reports a missing system index, and reports every bench-only
+ * extra the Phase-0 mitigation ladder used — a covering index, a same-named but
  * redefined index, a per-column statistics target, an extended statistics object, a reloption — and that the
  * reference schema it builds leaves no trace. An operator-configured per-path trigram index (built outside the
  * production DDL) is listed separately, not reported.
@@ -83,8 +84,8 @@ public final class ProductionConfigSchemaIT {
         assertThat(check.productionVerdict()).isEqualTo("true");
         assertThat(check.actualIndexes()).containsExactlyInAnyOrderElementsOf(
                 ProductionConfigSchema.expectedIndexNames());
-        // 14 indexes + 25 columns + 4 constraints + 2 table reloptions at least.
-        assertThat(check.comparedItems()).isGreaterThanOrEqualTo(45);
+        // 15 indexes (incl. the system index sf_multi) + 25 columns + 4 constraints + 2 table reloptions at least.
+        assertThat(check.comparedItems()).isGreaterThanOrEqualTo(46);
         assertThat(connection.getAutoCommit()).isTrue();
         try (Statement statement = connection.createStatement();
                 var rs = statement.executeQuery("SELECT count(*) FROM pg_namespace "
@@ -92,6 +93,15 @@ public final class ProductionConfigSchemaIT {
             rs.next();
             assertThat(rs.getLong(1)).isZero();
         }
+    }
+
+    @Test
+    public void aCatalogWithoutTheSystemIndexIsReported() throws SQLException {
+        // e.g. a corpus loaded with search schema v2
+        execute("DROP INDEX sf_multi");
+
+        assertThat(ProductionConfigSchema.verify(connection).differences())
+                .anyMatch(d -> d.startsWith("index sf_multi: live=null production=CREATE INDEX sf_multi ON "));
     }
 
     @Test

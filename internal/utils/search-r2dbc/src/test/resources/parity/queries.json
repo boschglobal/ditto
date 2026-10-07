@@ -1003,7 +1003,7 @@
     {
       "name": "not-wildcard-eq",
       "filter": "not(eq(features/*/properties/status,\"on\"))",
-      "comment": "Allowlist entry #8 (sudo-wildcard-value-mongo-degenerate-path, G1 adjudication): under SUDO Mongo's GetFilterBsonVisitor.matchWildcardFeatureValue degrades to a dotted top-level path matching nothing, while Postgres answers the features/* value predicate semantically (PG strict superset; sudo bypasses auth by definition). The sudo run therefore PINS both backends' observed results; every non-sudo situation asserts strict parity (per-feature value+auth coupling identical on both backends). NOTE: the pinned lists are each backend's FIRST default-page-size (25) results of its divergent full match set (Mongo matches all 35, Postgres the 27 things with no feature whose status is \"on\"; Task 2's nenull-* fixtures carry a status:\"on\" property precisely so they land in Mongo's degenerate all-match set but NOT Postgres' semantically-correct one, same as the pre-existing feature-bearing things).",
+      "comment": "Allowlist entry #8 (sudo-wildcard-value-mongo-degenerate-path, G1 adjudication): under SUDO Mongo's GetFilterBsonVisitor.matchWildcardFeatureValue degrades to a dotted top-level path matching nothing, while Postgres answers the features/* value predicate semantically (PG strict superset; sudo bypasses auth by definition). The sudo run therefore PINS both backends' observed results; every non-sudo situation asserts strict parity (per-feature value+auth coupling identical on both backends). NOTE: the pinned lists are each backend's FIRST default-page-size (25) results of its divergent full match set (Mongo matches all 37, Postgres the 29 things with no feature whose status is \"on\"; Task 2's nenull-* fixtures carry a status:\"on\" property precisely so they land in Mongo's degenerate all-match set but NOT Postgres' semantically-correct one, same as the pre-existing feature-bearing things).",
       "expectNonEmptyAuth": "full",
       "divergence": "sudo-wildcard-value-mongo-degenerate-path",
       "expected": {
@@ -1016,6 +1016,8 @@
             "org.eclipse.ditto.parity:nenull-nullvals",
             "org.eclipse.ditto.parity:nenull-realvals",
             "org.eclipse.ditto.parity:nenull-stringvals",
+            "org.eclipse.ditto.parity:range-above",
+            "org.eclipse.ditto.parity:range-straddle",
             "org.eclipse.ditto.parity:rank-bool-false",
             "org.eclipse.ditto.parity:rank-bool-true",
             "org.eclipse.ditto.parity:rank-double",
@@ -1031,15 +1033,15 @@
             "org.eclipse.ditto.parity:rankdiv-num",
             "org.eclipse.ditto.parity:rankdiv-obj-a",
             "org.eclipse.ditto.parity:rankdiv-obj-b",
-            "org.eclipse.ditto.parity:scalars-blue",
-            "org.eclipse.ditto.parity:scalars-green",
-            "org.eclipse.ditto.parity:scalars-red"
+            "org.eclipse.ditto.parity:scalars-blue"
           ]
         },
         "postgres": {
           "sudo": [
             "org.eclipse.ditto.parity:arrays",
             "org.eclipse.ditto.parity:empties",
+            "org.eclipse.ditto.parity:range-above",
+            "org.eclipse.ditto.parity:range-straddle",
             "org.eclipse.ditto.parity:rank-bool-false",
             "org.eclipse.ditto.parity:rank-bool-true",
             "org.eclipse.ditto.parity:rank-double",
@@ -1060,9 +1062,7 @@
             "org.eclipse.ditto.parity:walker-d35",
             "org.eclipse.ditto.parity:walker-i42a",
             "org.eclipse.ditto.parity:walker-i42b",
-            "org.eclipse.ditto.parity:walker-i5",
-            "org.eclipse.ditto.parity:walker-l9b",
-            "org.eclipse.ditto.parity:walker-void-a"
+            "org.eclipse.ditto.parity:walker-i5"
           ]
         }
       }
@@ -1250,6 +1250,31 @@
       }
     },
     {
+      "name": "range-pair-straddling-array",
+      "filter": "and(ge(attributes/region,91700),le(attributes/region,93000))",
+      "expectNonEmptySudo": true
+    },
+    {
+      "name": "range-pair-strict-straddling-array",
+      "filter": "and(gt(attributes/region,91621),lt(attributes/region,93186))",
+      "expectNonEmptySudo": true
+    },
+    {
+      "name": "range-pair-empty-interval-array",
+      "filter": "and(ge(attributes/pair,5),le(attributes/pair,3))",
+      "expectNonEmptySudo": true
+    },
+    {
+      "name": "range-pair-with-eq",
+      "filter": "and(eq(attributes/kind,\"straddle\"),ge(attributes/region,91700),le(attributes/region,93000))",
+      "expectNonEmptySudo": true
+    },
+    {
+      "name": "range-pair-existing-nums-array",
+      "filter": "and(ge(attributes/nums,3),le(attributes/nums,1))",
+      "expectNonEmptySudo": true
+    },
+    {
       "name": "count-all",
       "mode": "count",
       "expectNonEmptySudo": true
@@ -1281,6 +1306,11 @@
           "sudo": 3
         }
       }
+    },
+    {
+      "name": "range-pair-count",
+      "mode": "count",
+      "filter": "and(ge(attributes/region,91700),le(attributes/region,93000))"
     },
     {
       "name": "count-namespace-b",

@@ -23,15 +23,16 @@ import org.eclipse.ditto.rql.query.expression.ThingsFieldExpressionFactory;
 import org.junit.Test;
 
 /**
- * Unit tests for {@link PathIndexMaintenance#plan(List, List)} (what a run drops, repairs and builds for a given
- * configuration and catalog state) and {@link PathIndexMaintenance#isOneSession} (the "not one server session"
- * decision).
+ * Unit tests for {@link PathIndexMaintenance#plan(List, List, List)} (what a run drops, repairs and builds for a given
+ * configuration and catalog state, system indexes included) and {@link PathIndexMaintenance#isOneSession} (the "not
+ * one server session" decision).
  */
 public final class PathIndexMaintenancePlanTest {
 
     private static final ThingsFieldExpressionFactory FEF = ThingsFieldExpressionFactory.of(Map.of());
     private static final PathIndex PROP0 = PathIndex.of("features/*/properties/prop0", PathIndexKind.TRIGRAM, FEF);
     private static final PathIndex CITY = PathIndex.of("attributes/location/city", PathIndexKind.TRIGRAM, FEF);
+    private static final SystemSearchIndex MULTI = SystemSearchIndex.MULTI_VALUED;
 
     @Test
     public void nothingConfiguredAndNothingThereIsEmpty() {
@@ -88,6 +89,39 @@ public final class PathIndexMaintenancePlanTest {
         final Plan plan = PathIndexMaintenance.plan(List.of(CITY, PROP0), List.of());
 
         assertThat(plan.build()).containsExactly(CITY, PROP0);
+    }
+
+    @Test
+    public void aMissingSystemIndexIsBuiltEvenWithoutAConfiguredList() {
+        final Plan plan = PathIndexMaintenance.plan(List.of(MULTI), null, List.of(valid(PROP0.name())));
+
+        assertThat(plan.buildSystem()).containsExactly(MULTI);
+        assertThat(plan.dropInvalid()).isEmpty();
+        assertThat(plan.dropUnconfigured()).as("an unset list manages no per-path index").isEmpty();
+        assertThat(plan.build()).isEmpty();
+    }
+
+    @Test
+    public void anInvalidSystemIndexIsDroppedAndRebuilt() {
+        final Plan plan = PathIndexMaintenance.plan(List.of(MULTI), List.of(), List.of(invalid(MULTI.indexName())));
+
+        assertThat(plan.dropInvalid()).containsExactly(MULTI.indexName());
+        assertThat(plan.buildSystem()).containsExactly(MULTI);
+    }
+
+    @Test
+    public void aValidSystemIndexIsNeverDroppedAsUnconfigured() {
+        final Plan plan = PathIndexMaintenance.plan(List.of(MULTI), List.of(), List.of(valid(MULTI.indexName())));
+
+        assertThat(plan.isEmpty()).isTrue();
+    }
+
+    @Test
+    public void aSystemIndexThisRunDoesNotManageIsLeftAlone() {
+        // e.g. the test factory without system indexes, on a database that has sf_multi
+        final Plan plan = PathIndexMaintenance.plan(List.of(), List.of(), List.of(valid(MULTI.indexName())));
+
+        assertThat(plan.isEmpty()).isTrue();
     }
 
     @Test

@@ -312,6 +312,57 @@ public final class SqlRendererTest {
         assertThat(sql(Sql.raw("1"))).isEqualTo("1");
     }
 
+    // ============================================================== union, derived table, scalar subquery
+
+    @Test
+    public void unionAllBranchesRenderInOrderAndTheLimitAppliesToTheWholeUnion() {
+        final Select union = Sql.select().column(Sql.raw("1")).from("search_flat", "c")
+                .where(Sql.eq(Sql.col("c", "wpath"), Sql.text("/a")))
+                .unionAll(Sql.select().column(Sql.raw("1")).from("search_flat", "c")
+                        .where(Sql.and(Sql.eq(Sql.col("c", "wpath"), Sql.text("/b")),
+                                Sql.eq(Sql.col("c", "ord"), Sql.raw("1"))))
+                        .build())
+                .limit(Sql.raw("pc.n + 1"))
+                .build();
+
+        final RenderedSql rendered = Sql.render(union);
+
+        assertThat(rendered.sql()).isEqualTo("SELECT 1 FROM search_flat c WHERE c.wpath = $1 UNION ALL "
+                + "SELECT 1 FROM search_flat c WHERE (c.wpath = $2 AND c.ord = 1) LIMIT pc.n + 1");
+        assertThat(rendered.bindValues()).containsExactly("/a", "/b");
+    }
+
+    @Test
+    public void derivedTableAndScalarSubqueryRenderParenthesised() {
+        final Select pointCount = Sql.select().column(Sql.raw("count(*)"), "n")
+                .from(Sql.select().column(Sql.raw("1")).from("search_flat", "c").limit(Sql.raw("50000")).build(),
+                        "pr")
+                .build();
+        final Select pick = Sql.select()
+                .column(Sql.le(Sql.col("pc", "n"),
+                        Sql.scalar(Sql.select().column(Sql.raw("count(*)")).from("search_flat", "c").build())),
+                        "point_wins")
+                .from(pointCount, "pc")
+                .build();
+
+        assertThat(Sql.render(pick).sql()).isEqualTo("SELECT pc.n <= (SELECT count(*) FROM search_flat c) AS "
+                + "point_wins FROM (SELECT count(*) AS n FROM (SELECT 1 FROM search_flat c LIMIT 50000) pr) pc");
+    }
+
+    @Test
+    public void aUnionBranchMustBeAPlainSelect() {
+        final Select limited = Sql.select().column(Sql.raw("1")).from("t").limit(Sql.raw("1")).build();
+        assertThatThrownBy(() -> Sql.select().column(Sql.raw("1")).from("t").unionAll(limited))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void aDerivedTableNeedsAValidAlias() {
+        final Select inner = Sql.select().column(Sql.raw("1")).from("t").build();
+        assertThatThrownBy(() -> Sql.select().column(Sql.raw("1")).from(inner, "not an alias"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     // ================================================================================ bind application (type hints)
 
     @Test

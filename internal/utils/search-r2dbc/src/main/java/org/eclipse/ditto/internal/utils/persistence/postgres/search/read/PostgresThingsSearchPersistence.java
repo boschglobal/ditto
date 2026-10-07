@@ -21,6 +21,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.function.BooleanSupplier;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
@@ -31,6 +32,7 @@ import org.eclipse.ditto.internal.models.streaming.LowerBound;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresSortClause;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SearchQueryAssembler;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
 import org.eclipse.ditto.json.JsonArray;
 import org.eclipse.ditto.json.JsonFactory;
@@ -122,25 +124,42 @@ public final class PostgresThingsSearchPersistence implements ThingsSearchPersis
     private final ConnectionFactory connectionFactory;
     private final int fetchSize;
     private final Duration streamIdleTimeout;
+    private final BooleanSupplier rangeLegsAvailable;
 
     private PostgresThingsSearchPersistence(final ConnectionFactory connectionFactory, final int fetchSize,
-            final Duration streamIdleTimeout) {
+            final Duration streamIdleTimeout, final BooleanSupplier rangeLegsAvailable) {
         this.connectionFactory = connectionFactory;
         this.fetchSize = fetchSize;
         this.streamIdleTimeout = streamIdleTimeout;
+        this.rangeLegsAvailable = Objects.requireNonNull(rangeLegsAvailable, "rangeLegsAvailable");
     }
 
     /**
+     * Point legs only (no range legs): the read path as before search schema v3.
+     *
      * @param client the shared PostgreSQL client (one connection pool per service, via {@code PostgresClientExtension}).
      * @return the read persistence.
      */
     public static PostgresThingsSearchPersistence of(final DittoPostgresClient client) {
-        return new PostgresThingsSearchPersistence(
-                Objects.requireNonNull(client, "client").getConnectionPool(), DEFAULT_FETCH_SIZE,
-                DEFAULT_STREAM_IDLE_TIMEOUT);
+        return of(client, () -> false);
     }
 
     /**
+     * @param client the shared PostgreSQL client (one connection pool per service, via {@code PostgresClientExtension}).
+     * @param rangeLegsAvailable whether the system index {@code sf_multi} is valid (the service passes its
+     * {@code SystemIndexProbe}); read once per statement, so range legs start and stop with the index.
+     * @return the read persistence.
+     */
+    public static PostgresThingsSearchPersistence of(final DittoPostgresClient client,
+            final BooleanSupplier rangeLegsAvailable) {
+        return new PostgresThingsSearchPersistence(
+                Objects.requireNonNull(client, "client").getConnectionPool(), DEFAULT_FETCH_SIZE,
+                DEFAULT_STREAM_IDLE_TIMEOUT, rangeLegsAvailable);
+    }
+
+    /**
+     * Point legs only (no range legs).
+     *
      * @param connectionFactory a connection factory (a pool, or a plain testkit factory) whose connections back the
      * read statements.
      * @param fetchSize the server-side cursor batch size for the streaming reads.
@@ -148,8 +167,24 @@ public final class PostgresThingsSearchPersistence implements ThingsSearchPersis
      */
     static PostgresThingsSearchPersistence forConnectionFactory(final ConnectionFactory connectionFactory,
             final int fetchSize) {
+        return forConnectionFactory(connectionFactory, fetchSize, () -> false);
+    }
+
+    /**
+     * @param connectionFactory a connection factory (a pool, or a plain testkit factory) whose connections back the
+     * read statements.
+     * @param fetchSize the server-side cursor batch size for the streaming reads.
+     * @param rangeLegsAvailable whether the system index {@code sf_multi} is valid; read once per statement.
+     * @return the read persistence.
+     */
+    static PostgresThingsSearchPersistence forConnectionFactory(final ConnectionFactory connectionFactory,
+            final int fetchSize, final BooleanSupplier rangeLegsAvailable) {
         return new PostgresThingsSearchPersistence(Objects.requireNonNull(connectionFactory, "connectionFactory"),
-                fetchSize, DEFAULT_STREAM_IDLE_TIMEOUT);
+                fetchSize, DEFAULT_STREAM_IDLE_TIMEOUT, rangeLegsAvailable);
+    }
+
+    private SelectiveLegs selectiveLegs() {
+        return SelectiveLegs.of(rangeLegsAvailable.getAsBoolean());
     }
 
     // =================================================================================================================
@@ -161,14 +196,15 @@ public final class PostgresThingsSearchPersistence implements ThingsSearchPersis
             final DittoHeaders dittoHeaders) {
         final RenderedSql rendered = SearchQueryAssembler.count(query.getCriteria(),
                 Objects.requireNonNull(authorizationSubjectIds, "authorizationSubjectIds"), query.getSkip(),
-                query.getLimit());
+                query.getLimit(), selectiveLegs());
         return countSource(rendered);
     }
 
     @Override
     public Source<Long, NotUsed> sudoCount(final Query query, final DittoHeaders dittoHeaders) {
         final RenderedSql rendered =
-                SearchQueryAssembler.count(query.getCriteria(), null, query.getSkip(), query.getLimit());
+                SearchQueryAssembler.count(query.getCriteria(), null, query.getSkip(), query.getLimit(),
+                        selectiveLegs());
         return countSource(rendered);
     }
 
@@ -195,7 +231,7 @@ public final class PostgresThingsSearchPersistence implements ThingsSearchPersis
         final int limit = query.getLimit();
         final long limitPlusOne = (long) limit + 1L;
         final RenderedSql rendered = SearchQueryAssembler.findAll(query.getCriteria(), authorizationSubjectIds,
-                sortClause, limitPlusOne, skip);
+                sortClause, limitPlusOne, skip, selectiveLegs());
         final Mono<ResultList<TimestampedThingId>> result = executeRows(rendered,
                 (row, meta) -> new Hit(
                         ThingId.of(row.get("thing_id", String.class)),
@@ -213,7 +249,7 @@ public final class PostgresThingsSearchPersistence implements ThingsSearchPersis
         final PostgresSortClause sortClause = PostgresSortClause.of(query.getSortOptions());
         final RenderedSql rendered = SearchQueryAssembler.findAllUnlimited(query.getCriteria(),
                 Objects.requireNonNull(authorizationSubjectIds, "authorizationSubjectIds"), sortClause, limit,
-                query.getSkip());
+                query.getSkip(), selectiveLegs());
         final Flux<ThingId> ids =
                 executeRows(rendered, (row, meta) -> ThingId.of(row.get("thing_id", String.class)));
         return Source.fromPublisher(ids).idleTimeout(streamIdleTimeout);

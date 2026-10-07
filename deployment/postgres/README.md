@@ -542,6 +542,11 @@ each bump declares its `MIN_COMPATIBLE_VERSION` (`PostgresSchemaDescriptor#minCo
 - Both versions run side by side during a roll, so a "compatible" change must also let the new code
   cope with rows the old code writes.
 
+- An index whose plain build would block writes on a populated table is not part of the DDL: it is
+  built `CONCURRENTLY` after the bootstrap (search: the per-path indexes; since search schema v3 the
+  system index `sf_multi`). Introducing one still bumps `VERSION` (search v3 kept v2's DDL and
+  checksum, `MIN_COMPATIBLE_VERSION` 1), so that older code mid-roll leaves it to the newer code.
+
 `CREATE TABLE IF NOT EXISTS` never changes an *existing* table's shape: a version that adds columns
 to an already-created table must ship `ALTER TABLE … ADD COLUMN IF NOT EXISTS …` statements for
 them, not just a changed `CREATE TABLE` block that Postgres silently skips for the existing table.

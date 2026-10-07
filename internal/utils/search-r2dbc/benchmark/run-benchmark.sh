@@ -34,13 +34,15 @@
 # Production-config stages (shipped schema + shipped translator; own container, see README.md):
 #   pc-up        start the production-config container (postgres:16, image-default server settings,
 #                named data volume)
-#   pc-load      ProductionConfigLoadBench: same corpus, schema ONLY from PostgresSearchSchema.ddlStatements()
+#   pc-load      ProductionConfigLoadBench: same corpus, schema = PostgresSearchSchema.ddlStatements() + sf_multi
 #   pc-read      ProductionConfigReadBench#warm: shapes 1-5 via the service parser + SearchQueryAssembler +
 #                PostgresThingsSearchPersistence; warm rounds + EXPLAIN (ANALYZE, BUFFERS)
 #   pc-cold      ProductionConfigReadBench#cold: per shape, container stop + Docker-VM page-cache drop +
 #                start, first execution timed (+ one cold EXPLAIN)
 #   pc-bias      ProductionConfigReadBench#corpusBias: read-only corpus-bias counts; run it AFTER pc-cold
 #                (it reads the pages the first cold samples need, and the host cache is never dropped)
+#   pc-invariance  ProductionConfigReadBench#legInvariance: the requests with a two-sided range, with point legs
+#                only and with range legs, must return the same results (invariance.md; fails on a difference)
 #   production-config   pc-up pc-load pc-read pc-cold pc-bias (asks for confirmation first)
 #   pc-status    show the production-config container / corpus state
 #   pc-down      remove the production-config container (add --purge to also delete its data volume)
@@ -55,6 +57,9 @@
 #   --cold-samples N    pc-cold: cold first executions per shape (default 3)
 #   --results-dir DIR   pc-*: evidence folder, relative to the module
 #                (default src/test/resources/bench/results/production-config)
+#   --range-legs MODE   pc-read/pc-cold/pc-invariance: selective range legs: auto (default; as the
+#                service: while the system index sf_multi is valid) | off (point legs only)
+#   --variants LIST     pc-read: comma list of variant ids to run (default: all), e.g. 1,5,2,ce-a,ce-a-sudo,ce-b,ce-c
 #
 # Environment:
 #   MVN          maven binary (default: mvn on PATH); extra Maven flags via MAVEN_ARGS (e.g. MAVEN_ARGS=-o)
@@ -85,6 +90,8 @@ SEED=42
 PC_ROUNDS=3
 PC_COLD_SAMPLES=3
 PC_RESULTS_DIR=""
+PC_RANGE_LEGS=auto
+PC_VARIANTS=""
 QUICK=0
 YES=0
 PURGE=0
@@ -106,12 +113,14 @@ while [ $# -gt 0 ]; do
         --rounds) PC_ROUNDS="$2"; shift 2 ;;
         --cold-samples) PC_COLD_SAMPLES="$2"; shift 2 ;;
         --results-dir) PC_RESULTS_DIR="$2"; shift 2 ;;
-        -h|--help) sed -n '15,66p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --range-legs) PC_RANGE_LEGS="$2"; shift 2 ;;   # pc-read/pc-cold/pc-invariance: auto (default) | off
+        --variants) PC_VARIANTS="$2"; shift 2 ;;       # pc-read: comma list of variant ids (default: all)
+        -h|--help) sed -n '15,71p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) STAGES+=("$1"); shift ;;
     esac
 done
-[ ${#STAGES[@]} -gt 0 ] || { sed -n '15,66p' "${BASH_SOURCE[0]}"; exit 1; }
+[ ${#STAGES[@]} -gt 0 ] || { sed -n '15,71p' "${BASH_SOURCE[0]}"; exit 1; }
 
 if [ "$QUICK" = 1 ] && [ "$COUNT" = 1000000 ]; then
     COUNT=50000
@@ -287,10 +296,14 @@ pc_env() {
 
 pc_run_bench() { # args: -Dtest spec, extra -D props...
     local spec="$1"; shift
+    local props=("$@" -Dbench.pc.rangeLegs="$PC_RANGE_LEGS")
+    if [ -n "$PC_VARIANTS" ]; then
+        props+=(-Dbench.pc.variants="$PC_VARIANTS")
+    fi
     if [ -n "$PC_RESULTS_DIR" ]; then
-        run_bench "$spec" "$@" -Dbench.pc.resultsDir="$PC_RESULTS_DIR"
+        run_bench "$spec" "${props[@]}" -Dbench.pc.resultsDir="$PC_RESULTS_DIR"
     else
-        run_bench "$spec" "$@"
+        run_bench "$spec" "${props[@]}"
     fi
 }
 
@@ -338,6 +351,13 @@ stage_pc_cold() {
 stage_pc_bias() {
     stage_pc_up; pc_env
     pc_run_bench 'ProductionConfigReadBench#corpusBias'
+}
+
+# Selective-leg invariance: every request with a two-sided range, rendered with point legs only and with range legs,
+# must return the same results (writes invariance.md, fails on a difference).
+stage_pc_invariance() {
+    stage_pc_up; pc_env
+    pc_run_bench 'ProductionConfigReadBench#legInvariance'
 }
 
 stage_pc_status() {
@@ -416,6 +436,7 @@ for stage in "${STAGES[@]}"; do
         pc-read)     stage_pc_read ;;
         pc-cold)     stage_pc_cold ;;
         pc-bias)     stage_pc_bias ;;
+        pc-invariance) stage_pc_invariance ;;
         pc-status)   stage_pc_status ;;
         pc-down)     stage_pc_down ;;
         production-config)

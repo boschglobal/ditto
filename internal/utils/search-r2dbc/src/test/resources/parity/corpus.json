@@ -40,6 +40,8 @@
     "zsort-b",
     "zsort-c",
     "zsort-d",
-    "zsort-e"
+    "zsort-e",
+    "range-straddle",
+    "range-above"
   ]
 }

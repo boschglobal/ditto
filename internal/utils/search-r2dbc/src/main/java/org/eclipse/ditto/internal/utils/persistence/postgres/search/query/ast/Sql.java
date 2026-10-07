@@ -282,6 +282,14 @@ public final class Sql {
         return new Exists(subquery, true);
     }
 
+    /**
+     * @param subquery a {@code SELECT} returning one row with one column.
+     * @return the scalar subquery {@code (<subquery>)}.
+     */
+    public static SqlExpression scalar(final Select subquery) {
+        return new ScalarSubquery(subquery);
+    }
+
     // ---- jsonb operators ------------------------------------------------------------------------------------------
 
     /** @return {@code (jsonb #> path)} — {@code path} must be a {@code text[]} bind. */

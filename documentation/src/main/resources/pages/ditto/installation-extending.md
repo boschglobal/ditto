@@ -396,7 +396,7 @@ POSTGRES_SEARCH_PATH_INDEXES='[{"path":"features/*/properties/serialNumber","kin
 * `path`: the search field exactly as you write it in an RQL filter: `attributes/…`, `features/<featureId>/properties/…`, `features/*/properties/…`, `…/desiredProperties/…`, `features/<featureId or *>/definition`, or a field mapped to one of these. `features/*/properties/x` and `features/env/properties/x` are different paths: index the form your queries use. `thingId` and `namespace` are columns of `search_things`, not paths, and are rejected.
 * `kind`: `trigram`, the only kind so far.
 * An invalid entry (an unknown field, a missing or unknown `kind`, a duplicate) fails the start of the search service.
-* **Unset versus empty.** While `paths` is not set (the default; a blank `POSTGRES_SEARCH_PATH_INDEXES` counts as not set), the service manages no per-path index: it builds none and drops none, and logs (INFO) which `sf_path_*` indexes exist. Only a set list is applied, and an explicitly empty list (`paths = []`, or `POSTGRES_SEARCH_PATH_INDEXES='[]'`) drops every `sf_path_*` index.
+* **Unset versus empty.** While `paths` is not set (the default; a blank `POSTGRES_SEARCH_PATH_INDEXES` counts as not set), the service manages no per-path index: it builds none and drops none, and logs (INFO) which `sf_path_*` indexes exist. Only a set list is applied, and an explicitly empty list (`paths = []`, or `POSTGRES_SEARCH_PATH_INDEXES='[]'`) drops every `sf_path_*` index (the system index `sf_multi` is maintained independently of this list and never dropped by it).
 
 For each entry the search service builds:
 
@@ -439,7 +439,7 @@ To see whether a build or drop is running:
 
 **Removing a path drops its index.** At the next start the service drops (`DROP INDEX CONCURRENTLY`) every `sf_path_*` index whose path is no longer in the (set) list, as Ditto drops a MongoDB custom search index that is removed from `custom-indexes`. A per-path index costs maintenance on every write to its path, so a forgotten one would cost write throughput without serving any query.
 
-* Only per-path indexes are dropped. This rests on the names: the service only drops indexes of `search_flat` whose name starts with `sf_path_`, a prefix no other index of the search schema uses, and the hash in the name keeps different paths and definitions apart. Do not give your own indexes that prefix.
+* Only per-path indexes are dropped. This rests on the names: the service only drops indexes of `search_flat` whose name starts with `sf_path_`, a prefix no other index of the search schema uses, and the hash in the name keeps different paths and definitions apart (the system index `sf_multi` is maintained independently of this list and never dropped by it). Do not give your own indexes that prefix.
 * **All search instances that share the database must use the same list** (one configuration source, changed in one rollout). With different lists, each instance drops at its start what its list lacks and builds what it adds, so the indexes are dropped and rebuilt again at every start, and each rebuild reads the whole table. During a rolling change this happens once: an instance with the old list does not rebuild a dropped index before its own next start.
 * An instance that must not manage the indexes (for example a blue/green twin on the same database) leaves `paths` unset; it then only logs at INFO which `sf_path_*` indexes it found and leaves them alone.
 
@@ -448,6 +448,29 @@ To see whether a build or drop is running:
 * A build reads the whole `search_flat` heap twice (build and validation scan), however few rows the path has, so its duration grows with the whole table.
 * A larger `maintenance_work_mem` for the DDL role speeds up GIN builds, e.g. `ALTER ROLE <ddl role> SET maintenance_work_mem = '512MB'`.
 * Every write to a configured path also updates its index.
+
+#### Range filters and the system index sf_multi
+
+A filter with a two-sided numeric range on one field (`ge` or `gt` together with `le` or `lt` on the same field), for example `and(eq(attributes/location/city,"Stuttgart"),ge(features/env/properties/temperature,-15),le(features/env/properties/temperature,-14.01))`, may start from the range instead of the equality:
+
+* With an equality and a range in the same filter, the search counts their index entries in the same statement (the equality up to 50,000 entries, the range up to one more than the equality) and starts from the one with fewer entries; a tie keeps the equality. A two-sided range alone is started from directly.
+* Results never change: the start only narrows the candidates, and the whole filter, including every authorization check, is still applied.
+* One-sided ranges, string ranges, `features/*` fields and ranges under `or`/`not` keep the previous plan.
+
+**Arrays.** Two range conditions may be met by different elements of an array, as on MongoDB: `[91621, 91214, 93186]` matches `and(ge(attributes/region,91700),le(attributes/region,93000))`. A range start therefore also includes every thing with more than one value at that field. These things are found with the index `sf_multi ON search_flat (wpath, thing_id) WHERE ord = 1`, which belongs to search schema version 3.
+
+**How the index is built.**
+
+* After the start of the first version-3 instance, in the background, with `CREATE INDEX CONCURRENTLY`, by the same maintenance as the per-path indexes: one instance builds it under the session advisory lock and logs `Building system search index sf_multi (i/n)` with progress lines, and an INVALID index left by a failed or interrupted build is repaired at the next start.
+* It is built whether `path-indexes.paths` is set or not; that list never governs it.
+* It needs the same session-capable connection as the per-path indexes: with `ditto.postgresql.pooler-mode = transaction`, set `ditto.postgresql.search.path-indexes.direct-uri`. Without one the service logs a WARN, builds nothing, and range filters keep the previous plan.
+* Until an instance sees the index valid (it checks at its start, after its own maintenance run and every minute), its range filters keep the previous plan.
+
+**Cost.** On the 1M-thing benchmark corpus (68.5 million `search_flat` rows), the concurrent build took 72 seconds, and the index is 213 MB with 2.3 million entries. It holds an entry only for a field that has more than one value in a thing. Like every `CREATE INDEX CONCURRENTLY`, the build reads the whole `search_flat` heap twice.
+
+**Do not drop it.** A dropped `sf_multi` is rebuilt at the next start; until then range filters keep the previous plan.
+
+**Version-2 images** (during a rolling upgrade or after a rollback) run against a version-3 schema unchanged and ignore the index.
 
 #### Prerequisites, migration and known limitations
 

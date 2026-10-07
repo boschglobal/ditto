@@ -80,11 +80,30 @@ public final class SearchQueryAssemblerTest {
     }
 
     @Test
-    public void rangeOnlyCriterionHasNoCtePlainExistsChain() {
+    public void rangeOnlyCriterionHasNoCteWithPointLegsOnly() {
         final Criteria criteria = cf.fieldCriteria(fef.filterByAttribute("range"), cf.gt(5));
         final RenderedSql r = SearchQueryAssembler.findAll(criteria, SUBJECTS, thingIdSort(), 26L, 0L);
         assertThat(r.sql()).doesNotContain("WITH ").doesNotContain("sel_leg");
         assertThat(r.sql()).startsWith("SELECT st.thing_id, st.t_modified");
+    }
+
+    @Test
+    public void rangeOnlyCriterionGetsARangeLegWhenRangeLegsAreAvailable() {
+        // a lone one-sided range still has none
+        final Criteria oneSided = cf.fieldCriteria(fef.filterByAttribute("range"), cf.gt(5));
+        assertThat(SearchQueryAssembler.findAll(oneSided, SUBJECTS, thingIdSort(), 26L, 0L,
+                SelectiveLegs.POINT_AND_RANGE).sql()).doesNotContain("sel_leg");
+
+        final Criteria twoSided = cf.and(List.of(
+                cf.fieldCriteria(fef.filterByAttribute("range"), cf.ge(5)),
+                cf.fieldCriteria(fef.filterByAttribute("range"), cf.le(9))));
+        final RenderedSql r = SearchQueryAssembler.findAll(twoSided, SUBJECTS, thingIdSort(), 26L, 0L,
+                SelectiveLegs.POINT_AND_RANGE);
+        assertThat(r.sql()).startsWith("WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE "
+                + "(sfc.wpath = $1 AND sfc.val_num >= $2 AND sfc.val_num <= $3) UNION ALL SELECT sfc.thing_id FROM "
+                + "search_flat sfc WHERE (sfc.wpath = $4 AND sfc.ord = 1))");
+        assertThat(r.sql()).contains("EXISTS (SELECT 1 FROM sel_leg sl WHERE sl.thing_id = st.thing_id)")
+                .contains("st.global_read && ");
     }
 
     @Test

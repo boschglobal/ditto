@@ -28,9 +28,9 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
  * </p>
  * <p>
  * <strong>Rule for schema bumps:</strong> every bump of {@link PostgresSearchSchema#VERSION} adds a literal fixture
- * like this one for the version it replaces ({@code PostgresSearchSchemaV2} at the bump to v3, with checksum
- * {@code c51c0ddb092c925e6b2b1413aed8ae8e5c7826edcb3772af669832761fc21169}), pins its checksum in
- * {@code SearchSchemaChecksumPreservationTest}, and uses it in the upgrade and mixed-version tests.
+ * like this one for the version it replaces ({@link PostgresSearchSchemaV2} was added at the bump to v3; next:
+ * {@code PostgresSearchSchemaV3} at the bump to v4), pins its checksum in {@code SearchSchemaChecksumPreservationTest},
+ * and uses it in the upgrade and mixed-version tests.
  * </p>
  */
 final class PostgresSearchSchemaV1 {
