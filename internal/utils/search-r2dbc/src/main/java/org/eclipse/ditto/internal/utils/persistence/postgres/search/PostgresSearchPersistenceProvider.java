@@ -194,9 +194,10 @@ public final class PostgresSearchPersistenceProvider implements SearchPersistenc
             }
             throw e;
         }
-        // Register the search schema with the shared client's runtime self-heal: a statement hitting a missing table
-        // (42P01) then recreates exactly this descriptor's tables and retries. Registration is here, after a
-        // successful bootstrap and before the search read/updater paths issue runtime statements.
+        // Register the search schema with the shared client's runtime self-heal. Note: the search read/updater paths
+        // open their connections from the raw pool (getConnectionPool()), so no search statement is heal-wrapped; a
+        // missing search table is re-created only by the schema check of the next start. Registration is here, after
+        // a successful bootstrap.
         PostgresClientExtension.get(actorSystem).getClient()
                 .registerSchemaDescriptor(PostgresSearchSchema.descriptor());
         final ConnectionFactory pool = PostgresClientExtension.get(actorSystem).getClient().getConnectionPool();

@@ -134,8 +134,8 @@ public final class PostgresSchemaHealer {
 
     /**
      * Registers a component schema this healer recreates on {@link #heal()}. Called by each component's schema
-     * bootstrap (idempotent — descriptors are singletons, re-registration is a no-op); a heal replays the create-only
-     * DDL of every registered descriptor.
+     * bootstrap (idempotent — descriptors are singletons, re-registration is a no-op); a heal runs the schema check
+     * and, where needed, the idempotent DDL of every registered descriptor.
      *
      * @param descriptor the component schema descriptor.
      */
@@ -144,7 +144,7 @@ public final class PostgresSchemaHealer {
     }
 
     /**
-     * Recreates the schema (idempotent, create-only), coalescing concurrent callers onto a single in-flight heal.
+     * Recreates the schema (idempotent DDL), coalescing concurrent callers onto a single in-flight heal.
      *
      * @return a {@link Mono} completing when the schema has been (re)created; {@link Mono#error(Throwable)} carrying an
      * {@link IllegalStateException} when healing is disabled (callers guard on {@link #isEnabled()} and surface the

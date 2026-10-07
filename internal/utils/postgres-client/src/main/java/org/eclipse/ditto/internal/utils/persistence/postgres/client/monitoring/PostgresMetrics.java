@@ -49,10 +49,11 @@ public final class PostgresMetrics {
     public static final String POOL_PENDING = "ditto_persistence_pool_pending";
 
     /**
-     * Schema self-heal counter metric name — incremented once per on-demand schema heal (a runtime statement hit a
-     * missing table {@code 42P01}, so the schema was recreated and the statement retried). Tagged
-     * {@value #TAG_ENGINE}={@value #ENGINE_POSTGRES}. The WARN log companion of this counter flags the masks-data-loss
-     * trade-off; a non-zero rate means a database was wiped/recreated under a running service.
+     * Schema self-heal counter metric name — incremented once per component schema whose on-demand heal ran DDL (a
+     * runtime statement hit a missing table {@code 42P01}, so the schema was recreated and the statement retried); a
+     * heal that ran no DDL or failed is not counted. Tagged {@value #TAG_ENGINE}={@value #ENGINE_POSTGRES}. The WARN
+     * log companion of this counter flags the masks-data-loss trade-off; a non-zero rate means a table was dropped or
+     * a database wiped/recreated under a running service.
      */
     public static final String SELF_HEAL_COUNT = "ditto_persistence_schema_self_heal";
 

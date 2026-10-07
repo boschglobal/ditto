@@ -105,8 +105,10 @@ public final class SchemaVerifier {
 
     /**
      * The self-heal decision over the stored {@code schema_version} row. Only the "newer stored version" rule of
-     * {@link #verifyStoredVersion} applies (the heal never compared checksums and still doesn't): with no row, an older
-     * or the same version the heal re-runs its create-only DDL as before; with a newer version it runs no DDL — a no-op
+     * {@link #verifyStoredVersion} applies (unlike a boot, a same-version checksum mismatch is not refused): with no
+     * row, an older or the same version this returns {@link SchemaVersionDecision#APPLY}, and
+     * {@link #decideComponentDdl(SchemaVersionDecision, boolean, Set)} then skips the DDL only for a current row (same
+     * version and checksum) with every table and index present; with a newer version the heal runs no DDL — a no-op
      * when the newer schema is compatible, a failure when it isn't.
      *
      * @param component the logical component identifier (for the diagnostic message).

@@ -40,12 +40,15 @@ import io.r2dbc.spi.ConnectionFactoryOptions;
  * and never blocks boot.
  * </p>
  * <p>
- * <strong>Backpressure caveat:</strong> the pool-wide {@code fetch-size=0} disables backpressure on the read path —
- * r2dbc-postgresql treats {@code 0} as "materialise the entire result set" before the Pekko {@code Source} can exert
- * demand. The long, genuinely-unbounded streaming read-journal queries therefore bind a positive per-statement
- * {@code Statement.fetchSize(...)} (see {@code PostgresPersistenceOperations.STREAMING_FETCH_SIZE}) to open a
- * server-side portal and restore demand-driven fetching; the write path keeps {@code fetch-size=0} to stay safe under
- * PgBouncer transaction pooling.
+ * <strong>Read path with {@code fetch-size=0}:</strong> r2dbc-postgresql sends one fetch-all {@code Execute} per
+ * statement and still reads the rows demand-driven (it requests backend messages only while the subscriber has demand,
+ * and reactor-netty stops reading the socket otherwise), so client memory stays bounded; but the server produces the
+ * whole result in one go and blocks on the unread socket while the consumer is slow, holding the statement and its
+ * snapshot until {@code statement_timeout}. The long, genuinely-unbounded streaming read-journal queries therefore bind
+ * a positive per-statement {@code Statement.fetchSize(...)}
+ * (see {@code PostgresPersistenceOperations.STREAMING_FETCH_SIZE}) to open a server-side portal, so the server
+ * produces the rows fetch by fetch on demand; the write path keeps {@code fetch-size=0} to stay safe under PgBouncer
+ * transaction pooling.
  * </p>
  */
 public final class ConnectionPoolFactory {
@@ -154,9 +157,11 @@ public final class ConnectionPoolFactory {
         // buildDdlOptions(), so each caller picks its own credentials (H-1 DDL credential-layering).
         final ConnectionFactoryOptions.Builder builder = ConnectionFactoryOptions.parse(config.getUri()).mutate();
 
-        // fetch-size=0 -> no server-side portal/cursor; keeps transaction pooling safe but DISABLES backpressure
-        // (whole result set materialised on read). Unbounded streaming read-journal statements override this per
-        // statement with a positive Statement.fetchSize(...) — see PostgresPersistenceOperations.STREAMING_FETCH_SIZE.
+        // fetch-size=0 -> no server-side portal/cursor; keeps transaction pooling safe. The driver still reads the
+        // rows demand-driven (client memory stays bounded), but the server produces the whole result at once and
+        // blocks on the unread socket under a slow consumer. Unbounded streaming read-journal statements override
+        // this per statement with a positive Statement.fetchSize(...) — see
+        // PostgresPersistenceOperations.STREAMING_FETCH_SIZE.
         builder.option(PostgresqlConnectionFactoryProvider.FETCH_SIZE, poolConfig.getFetchSize());
         // prepared-statement-cache-queries=0 -> unnamed statements; safe on any PgBouncer version / pool mode.
         builder.option(PostgresqlConnectionFactoryProvider.PREPARED_STATEMENT_CACHE_QUERIES,

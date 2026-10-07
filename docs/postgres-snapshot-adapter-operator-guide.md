@@ -104,7 +104,7 @@ Two `include` rules are load-bearing:
 | `POSTGRES_URI` | yes | — | R2DBC connection URI (`r2dbc:postgresql://…`) |
 | `POSTGRES_USER` | yes | — | Runtime database role |
 | `POSTGRES_PASSWORD` | yes | — | Runtime database role password |
-| `POSTGRES_DDL_USER` | no | *(reuse runtime)* | Role used for DDL during schema bootstrap |
+| `POSTGRES_DDL_USER` | no | *(reuse runtime)* | Role used for DDL: schema bootstrap, runtime self-heal and (things-search) per-path index builds |
 | `POSTGRES_DDL_PASSWORD` | no | *(reuse runtime)* | DDL role password |
 | `POSTGRES_SSL_MODE` | no | `verify-full` | SSL verification mode; use `disable` for local plaintext |
 | `POSTGRES_POOL_MAX_SIZE` | no | `25` | Connections per service instance (journal, snapshot store and read journal share one pool). Keep Σ ((replicas + maxSurge) × max-size) over all PostgreSQL-backed services plus reserved connections ≤ `max_connections` (a rolling update adds `maxSurge` pods per service); see `deployment/postgres/README.md`, "Connection budget" |
@@ -276,14 +276,15 @@ full annotated example.
 
 ## Known limitations
 
-* **`snapshotStreamingActor` is not functional on PostgreSQL.** At boot a non-fatal
-  `IllegalArgumentException` may appear because the backend provides no Mongo-style read-journal
-  plugin (`ditto-postgres-<entity>-journal-read`). Entity **write and recover** work correctly; the
-  background snapshot-streaming / persistence-cleanup / search-sync paths are not yet ported to
-  PostgreSQL.
-* **`MongoHealthChecker` may report `UP` even without MongoDB.** The health indicator does not
-  check PostgreSQL connectivity. Trust table contents and actor-recovery log lines as the real
-  liveness signal.
+* **Differences from the MongoDB backend and the schema self-heal** (stored JSON key order, U+0000,
+  live journal queries, snapshot streaming reads whole snapshots, pool overload; what a self-heal does and
+  how to disable and monitor it) are described in
+  `documentation/src/main/resources/pages/ditto/installation-extending.md`, section "Operating PostgreSQL".
+* **Snapshot streaming, background cleanup and the persistence ping run on PostgreSQL** through the
+  backend's read journal (`PostgresReadJournal`). Snapshot streaming is bound to the service's own entity
+  tables (`read-journal.entity`, `POSTGRES_READ_JOURNAL_ENTITY`).
+* **Health check:** the persistence health check of a PostgreSQL-backed service runs `SELECT 1` on its
+  connection pool (`PostgresHealthChecker`), so it reports PostgreSQL's reachability, not MongoDB's.
 * **No migration tooling.** Moving event history from MongoDB to PostgreSQL is an operator task;
   no automated migration path is included.
 
@@ -300,12 +301,14 @@ consumers that re-parse the payload (via `JsonFactory`) always recover the same 
 The four canonicalisation rules PG16 applies (probed 2026-06-15; pinned by
 `org.eclipse.ditto.internal.utils.persistence.postgres.JsonbCanonicalizationIT`):
 
-1. **Object keys are sorted alphabetically** within each nested object. (Top-level key order is *not*
-   promised by `jsonb` — treat it as undefined; do not rely on it.)
+1. **Object keys are not kept in the order they were written**, at any nesting level. PostgreSQL 16 stores
+   them shorter keys first, then in byte order; that is an implementation detail, not a contract — do not
+   rely on any key order.
 2. **Scientific notation is flattened** to plain decimal: `1E10` → `10000000000`, `-2.5E-3` → `-0.0025`.
 3. **Arbitrary-precision integers are preserved** beyond the IEEE-754 double range (no float-precision
    loss): `9007199254740993` survives intact.
-4. **Whitespace inside string keys/values is preserved**; inter-token (structural) whitespace is stripped.
+4. **Whitespace inside string keys/values is preserved**; whitespace between tokens is normalised (`jsonb`
+   prints `", "` and `": "` separators).
 
 Operational consequence: do **not** compare raw `event::text` / `snapshot::text` bytes for equality
 against the originally written JSON, and do not assume any field ordering when querying the text form.

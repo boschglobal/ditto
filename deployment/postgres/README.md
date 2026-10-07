@@ -146,8 +146,8 @@ transaction pooling (`pool.fetch-size = 0`: no server-side cursors;
 `pool.prepared-statement-cache-queries = 0`: unnamed statements;
 `PgBouncerTransactionPoolingIT` runs the persistence round trip through
 PgBouncer in `pool_mode=transaction`). Set `ditto.postgresql.pooler-mode =
-transaction` (`POSTGRES_POOLER_MODE`) for the startup cross-check, configure
-`statement_timeout` as in
+transaction` (`POSTGRES_POOLER_MODE`) for the startup cross-check, list Ditto's
+startup parameters in `track_extra_parameters` as recommended in
 [Statement timeout: role default and PgBouncer](#statement-timeout-role-default-and-pgbouncer),
 and give per-path search index builds a direct URI
 (`ditto.postgresql.search.path-indexes.direct-uri`). Size behind PgBouncer as:
@@ -229,9 +229,27 @@ on the path to PostgreSQL:
 | Path | Timeout in effect |
 |---|---|
 | Direct connection | the startup parameter; it overrides the role default |
-| PgBouncer with `track_extra_parameters = statement_timeout` and `ignore_startup_parameters = extra_float_digits` | the startup parameter: PgBouncer applies each client's value to the server connection it hands out |
+| PgBouncer with `track_extra_parameters = statement_timeout` and `ignore_startup_parameters = extra_float_digits` (recommended) | the startup parameter: PgBouncer applies each client's value to the server connection it hands out |
 | PgBouncer with `ignore_startup_parameters = extra_float_digits,statement_timeout` | the role default only: PgBouncer drops the startup parameter |
 | PgBouncer with `statement_timeout` in neither | n/a: PgBouncer refuses the connection (`unsupported startup parameter: statement_timeout`) |
+
+**Recommended: `track_extra_parameters`.** It makes PgBouncer apply Ditto's
+values per client, as on a direct connection; `ignore_startup_parameters`
+drops them silently, so only the role default above is left. things-search
+sends a second startup parameter, `plan_cache_mode`
+(`ditto.postgresql.force-custom-plan`, on by default for search), which
+PgBouncer refuses, drops or applies in the same way (verified with PgBouncer
+1.26.0). Configure:
+
+```ini
+ignore_startup_parameters = extra_float_digits
+track_extra_parameters = statement_timeout,plan_cache_mode
+```
+
+A dropped `plan_cache_mode` matters once named prepared statements are enabled
+(`prepared-statement-cache-queries` above 0): PostgreSQL may then switch the
+search statements to generic plans. With the default `0`, every statement is
+planned with its values anyway.
 
 - The PgBouncer rows hold for session and transaction pooling alike. They were
   verified with PgBouncer 1.26.0; `PgBouncerStatementTimeoutIT` covers the
@@ -512,6 +530,11 @@ stored version is newer, it runs no DDL. With a compatible newer schema the heal
 failed statement is retried once. With an incompatible one the heal fails and the original error
 surfaces. With the same version and checksum it follows the boot's rule as well: it runs no DDL while
 every table and index exists, and its DDL runs under the same 500 ms `lock_timeout`.
+The self-heal runs in policies, things and connectivity only; things-search
+re-creates a missing table at its next start. What a heal does, why it masks
+data loss, and how to monitor and disable it:
+`documentation/src/main/resources/pages/ditto/installation-extending.md`,
+section "Operating PostgreSQL".
 
 ### Rolling upgrades
 

@@ -363,8 +363,8 @@ public final class PostgresSchemaManager {
     }
 
     /**
-     * The <strong>create-only</strong> sibling of {@link #bootstrapReactive()}, used by the runtime schema self-heal
-     * when a statement hits a missing table ({@code 42P01}). It runs the exact same {@code CREATE … IF NOT EXISTS} DDL
+     * The <strong>heal</strong> sibling of {@link #bootstrapReactive()}, used by the runtime schema self-heal
+     * when a statement hits a missing table ({@code 42P01}). It runs the exact same idempotent DDL
      * inside one transaction, guarded by the <em>same</em> {@link #ADVISORY_LOCK_KEY} advisory xact lock as the boot
      * bootstrap (so a hot heal serialises against a concurrent first-boot bootstrap cluster-wide), but deliberately
      * <strong>omits</strong> the live-catalog verification and the {@code schema_version} row upsert.
@@ -388,7 +388,7 @@ public final class PostgresSchemaManager {
      * DDL, it does so after {@link #SET_DDL_LOCK_TIMEOUT}.
      * </p>
      *
-     * @return the create-only heal as a reactive pipeline (single transaction, connection released on every terminal
+     * @return the heal as a reactive pipeline (single transaction, connection released on every terminal
      * path), emitting {@link SchemaVersionDecision#APPLY} when the DDL ran, and
      * {@link SchemaVersionDecision#UP_TO_DATE} or {@link SchemaVersionDecision#COMPATIBLE_NEWER} when it deliberately
      * did not.

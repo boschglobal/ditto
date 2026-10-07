@@ -26,7 +26,8 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
 /**
  * The canonical, programmatic DDL definition of the PostgreSQL persistence schema.
  * <p>
- * Every statement carries {@code IF NOT EXISTS}. The per-entity tables (one set each for {@code things},
+ * Every statement is idempotent ({@code CREATE … IF NOT EXISTS}, {@code DROP INDEX IF EXISTS},
+ * {@code ALTER TABLE … SET}). The per-entity tables (one set each for {@code things},
  * {@code policies}, {@code connections}, {@code wot}) have these shapes:
  * </p>
  * <ul>
@@ -39,11 +40,13 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
  *     deleted.</li>
  *     <li>{@code <e>_snaps} — {@code pid TEXT COLLATE "C"}, {@code sn}, {@code snapshot JSONB}, {@code lifecycle},
  *     {@code written_at};
- *     {@code PRIMARY KEY (pid, sn, written_at)} (so a re-snapshot at the same sequence number is allowed) +
- *     {@code btree (pid, sn DESC)} + a partial index on {@code lifecycle = 'DELETED'}.</li>
+ *     {@code PRIMARY KEY (pid, sn, written_at)} (so a re-snapshot at the same sequence number is allowed; it serves
+ *     every snaps access path, so v2 drops v1's {@code (pid, sn DESC)} index) + the partial index
+ *     {@code <e>_snaps_lifecycle_idx} on {@code lifecycle} {@code WHERE lifecycle = 'DELETED'}.</li>
  * </ul>
  * <p>
- * A single {@code schema_version(component, version, checksum)} table backs the refuse-to-boot guard. Each table
+ * A single {@code schema_version(component, version, checksum, min_compatible_version)} table (owned by
+ * {@code PostgresSchemaManager}) backs the refuse-to-boot guard. Each table
  * additionally gets {@code ALTER TABLE … SET (autovacuum_vacuum_scale_factor = 0.01)} issued in the same bootstrap
  * transaction so the high-churn journal and snapshot tables are vacuumed aggressively.
  * </p>
@@ -162,9 +165,9 @@ public final class PostgresSchema {
     };
 
     /**
-     * @return this component's own ordered list of DDL statements (CREATE TABLE / CREATE INDEX / ALTER TABLE …
-     * autovacuum), <strong>excluding</strong> the shared {@code schema_version} table (owned by
-     * {@code PostgresSchemaManager}). Order is stable so the checksum is deterministic.
+     * @return this component's own ordered list of DDL statements (CREATE TABLE / CREATE INDEX /
+     * DROP INDEX IF EXISTS / ALTER TABLE … autovacuum), <strong>excluding</strong> the shared {@code schema_version}
+     * table (owned by {@code PostgresSchemaManager}). Order is stable so the checksum is deterministic.
      */
     public static List<String> ddlStatements() {
         final List<String> statements = new ArrayList<>();

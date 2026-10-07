@@ -2,6 +2,20 @@
 
 Status: phase 1 complete (commit `bda04b5009`). **Phase 2 IMPLEMENTED + verified against real Postgres on 2026-06-01** via `/forge-implement` — all 18 beads tickets closed across 9 commits (`409d7e784e`..`e8fc36324f`, local on `postgres-190626-feat-dev`, not yet pushed). `mvn verify` is green with the Maven enforcer enabled: 100 unit tests + 27 Testcontainers integration tests against real PostgreSQL 16 and real PgBouncer, 0 failures (1 documented skip — live-Mongo migrator IT). Every keystone correctness gate passed on real PG (`[C1]` HWM-survives-delete, `[H1]` GIN `@>` index hard-gate + descending priority, `[H4]` idempotency, `[H9]` criteria/two-form delete, `[G1]` JSONB recovery, `[H13]` refuse-to-boot, N=2 concurrent-DDL race, `[H12]` lost-write). No defects found in the implementation. **Known follow-ups (NOT done):** (1) only `ThingPersistenceActor` is wired to the provider — Policy/Connection/WotValidationConfig still return hardcoded Mongo plugin-ids, so Postgres activates Thing-first; (2) push branch + open PR; (3) live-Mongo migrator IT needs `mongodb-driver-sync` + `testcontainers:mongodb` in the BOM; (4) `[M8]` COPY-throughput + `[H12]` pool-sizing load spikes in a load environment. **Implementation note:** the bom Maven-enforcer execution must keep `<inherited>false</inherited>` on its `requireUpperBoundDeps`/pin guards (bom is the parent pom of nearly every module; an inherited `requireUpperBoundDeps` breaks the whole build on a pre-existing byte-buddy/assertj convergence gap) — split into an inherited `enforce-no-pekko-r2dbc-plugin` ban + a bom-only `enforce-bom-version-pins`.
 
+> **Superseded in parts.** This design note is kept as written. Where it differs from the shipped code,
+> the code and the operator documents win:
+> - §7 pool block: `max-size = 100` (now 25 per service instance), `max-acquire-time = 30s` (now 4 s, with
+>   `acquire-retry = 0`, a pending-acquire queue of 2 × `max-size` and `connect-timeout = 2s`), and
+>   "search n/a (stays Mongo)" (things-search can run on PostgreSQL). Current values and reasoning:
+>   `internal/utils/postgres-client/src/main/resources/ditto-postgres-client.conf` and
+>   `deployment/postgres/README.md`, section "Connection budget".
+> - §11 "DDL is additive-only" / "strictly additive": persistence schema v2 drops the `(pid, sn DESC)`
+>   snaps index (`DROP INDEX IF EXISTS`), and every schema bump declares a `min_compatible_version`.
+>   Current rules: `deployment/postgres/README.md`, sections "Schema upgrades" and
+>   "Rules for schema bumps (developers)".
+> - The `(pid, sn DESC)` snaps index in the schema listings: dropped in schema v2; the primary key
+>   `(pid, sn, written_at)` serves every snapshot access path.
+
 > **Single source of truth.** This file folds in the former companion docs
 > `postgres-tags-approach.md` (now §10) and `postgres-cleanup-approach.md` (now §11),
 > which have been deleted. All schema, SQL, tag and cleanup details live here.

@@ -70,8 +70,8 @@ import reactor.core.publisher.Mono;
  * The four canonicalisation rules PG16 {@code jsonb} applies to a stored value are:
  * </p>
  * <ol>
- *     <li><b>Object keys are sorted alphabetically</b> within each nested object (top-level key order is NOT promised by
- *     jsonb — treat it as undefined; this IT therefore does not assert any top-level ordering).</li>
+ *     <li><b>Object keys are not kept in insertion order</b>, at every nesting level: PG16 orders them by length, then
+ *     bytewise (an implementation detail, not a contract; only the canonical-form snapshot test pins it).</li>
  *     <li><b>Scientific notation is flattened</b> to plain decimal ({@code 1E10} → {@code 10000000000},
  *     {@code -2.5E-3} → {@code -0.0025}).</li>
  *     <li><b>Arbitrary-precision integers are preserved</b> beyond the IEEE-754 double range (no float-precision
@@ -101,9 +101,9 @@ public final class JsonbCanonicalizationIT {
 
     /**
      * The documented canonical {@code event::text} form PG16 emits for {@link #PROBE_INPUT} (probe run 2026-06-15).
-     * Note: nested-object keys are sorted ({@code keys} → {@code {"a": 2, "b": 1}}); the TOP-LEVEL order here is PG16's
-     * observed insertion order and is NOT a contract — only the per-value canonicalisation (rules 2-4) and nested-key
-     * sorting (rule 1) are guaranteed. This snapshot pins PG16's exact output as a regression guard.
+     * Note: jsonb reorders keys at every level (PG16: by length, then bytewise, so {@code keys} comes first and the
+     * nested object becomes {@code {"a": 2, "b": 1}}). That order is NOT a contract — only the per-value
+     * canonicalisation (rules 2-4) is; this snapshot pins PG16's exact output as a regression guard.
      */
     private static final String CANONICAL_FORM =
             "{\"keys\": {\"a\": 2, \"b\": 1}, \"  ws  \": \"x\", \"bigint\": 9007199254740993, "

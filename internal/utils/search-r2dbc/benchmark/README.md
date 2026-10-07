@@ -151,7 +151,8 @@ ilike p95 2,294 → 49 ms, ~47×) and **E5** (materialized selective-leg CTE: 6.
 reads, **43.2× faster cold start** — 3,441 ms → 80 ms, measured via symmetric container-restart
 probes). E5 is the chosen production translator strategy.
 
-Also measured: EXISTS-chain beats semi-join translation ~1.3–4.5× across 2/3-predicate mixes,
+Also measured: EXISTS-chain beats semi-join translation ~1.0–4.7× at p95 (~1.15–3.6× at p50)
+across 2/3-predicate mixes (`src/test/resources/bench/results/comparison-summary.md`),
 and a two-predicate AND uses the index on *both* legs — something a Mongo wildcard index cannot
 do (it serves one predicate field per query).
 

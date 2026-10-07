@@ -805,9 +805,10 @@ public final class PostgresPersistenceOperations {
 
     /**
      * Like {@link #querySource} but binds a positive {@link Statement#fetchSize(int)} ({@link #STREAMING_FETCH_SIZE}) so
-     * an unbounded streaming read-journal query opens a server-side portal and is driven by Pekko-stream demand instead
-     * of being fully materialised onto the heap (see {@link #STREAMING_FETCH_SIZE}). Use ONLY for read-journal streaming
-     * statements with no {@code LIMIT}; never on the write path.
+     * an unbounded streaming read-journal query opens a server-side portal and the server produces its rows fetch by
+     * fetch as Pekko-stream demand asks for them, instead of producing the whole result in one go (see
+     * {@link #STREAMING_FETCH_SIZE}). Use ONLY for read-journal streaming statements with no {@code LIMIT}; never on
+     * the write path.
      */
     private <T> Source<T, NotUsed> streamingQuerySource(final String sql,
             @Nullable final java.util.function.Consumer<Statement> binder,

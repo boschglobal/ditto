@@ -20,8 +20,10 @@
 --                         *_snaps (x4 entity types) and schema_version.
 --   ditto_ddl  -- DDL role: OWNS the schema and all tables; runs CREATE in the
 --                 bootstrap DDL transaction (PostgresSchemaManager, [H2]).
---                 Used ONLY by the schema manager via the `ddl-credentials`
---                 block in the persistence HOCON (§7). Bootstrap-only.
+--                 Used via the `ddl-credentials` block in the HOCON (§7)
+--                 by the schema bootstrap, the runtime self-heal and the
+--                 per-path search index builds (CREATE/DROP INDEX
+--                 CONCURRENTLY).
 --   ditto_app  -- runtime role: DML-only (SELECT/INSERT/UPDATE/DELETE).
 --                 No CREATE, no ownership. This is the role behind the runtime
 --                 `uri` (${POSTGRES_URI}) the actors use on the hot path.

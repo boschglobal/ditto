@@ -81,14 +81,16 @@ public interface PostgresConfig {
     Duration getStatementTimeout();
 
     /**
-     * Whether the runtime schema self-heal is enabled. When {@code true} and a runtime SQL statement hits a missing
-     * table (PostgreSQL SQLSTATE {@code 42P01}), the backend recreates the schema (idempotent {@code CREATE … IF NOT
-     * EXISTS}) and retries the statement once, mirroring MongoDB's implicit-collection-create-on-first-use behaviour so
-     * a dropped/recreated database self-heals instead of failing every persistence call. Default {@code true}.
+     * Whether the runtime schema self-heal is enabled. When {@code true} and a runtime SQL statement of the persistence
+     * backend hits a missing table (PostgreSQL SQLSTATE {@code 42P01}), the backend re-runs the schema check and, where
+     * needed, the schema's idempotent DDL, and retries the statement once, mirroring MongoDB's
+     * implicit-collection-create-on-first-use behaviour so a dropped/recreated database self-heals instead of failing
+     * every persistence call. The search backend's statements are not heal-wrapped. Default {@code true}.
      * <p>
      * This <strong>masks data loss</strong> (a wiped database silently self-heals to empty tables) — the same trade-off
-     * MongoDB already has, which is why each heal emits a WARN + metric. Set {@code false} to fail loud instead: the
-     * original {@code 42P01} error then surfaces unchanged.
+     * MongoDB already has. A heal that ran DDL logs a WARN and increments {@code ditto_persistence_schema_self_heal}; a
+     * heal that ran no DDL or failed is not counted. Set {@code false} to fail loud instead: the original
+     * {@code 42P01} error then surfaces unchanged.
      * </p>
      *
      * @return whether schema self-heal is enabled.
@@ -97,8 +99,8 @@ public interface PostgresConfig {
 
     /**
      * Whether to force {@code plan_cache_mode=force_custom_plan} on every connection this pool opens (bound as an
-     * r2dbc-postgresql {@code options} startup GUC, so it survives PgBouncer {@code RESET} between transaction-pooled
-     * borrows exactly like {@code statement_timeout}).
+     * r2dbc-postgresql {@code options} startup parameter, like {@code statement_timeout}; behind PgBouncer it must be
+     * listed in {@code track_extra_parameters}, see {@code ditto-postgres-client.conf}).
      * <p>
      * This is the <strong>plancache generic-plan-flip guard</strong> (a HARD Phase-D requirement of the PostgreSQL
      * things-search backend — see the search plan §3.5 and bench-results doc §8.2). r2dbc-postgresql, like pgjdbc,
@@ -268,7 +270,8 @@ public interface PostgresConfig {
     }
 
     /**
-     * The separate DDL-runner role (owns the schema; bootstrap-only). Empty when not configured.
+     * The separate DDL-runner role (owns the schema; used by the schema bootstrap, the runtime self-heal and the
+     * per-path search index builds). Empty when not configured.
      */
     @Immutable
     interface DdlCredentialsConfig {
