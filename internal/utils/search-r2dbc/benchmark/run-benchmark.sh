@@ -47,6 +47,16 @@
 #   pc-status    show the production-config container / corpus state
 #   pc-down      remove the production-config container (add --purge to also delete its data volume)
 #
+# Production write-path soak stages (shipped write flow, text-heavy twin; own container, see README.md):
+#   soak-up      start the soak container (postgres:16 + BENCH_SOAK_PG_ARGS, data volume or host path,
+#                port bound to 127.0.0.1); nothing to start when BENCH_SOAK_URL names an external database
+#   soak-load    WriteSoakBench#load: production DDL, COPY of the twin corpus exactly as the shipped writer stores
+#                it (chunked; --load-from N resumes), production indexes + sf_multi, VACUUM (ANALYZE), catalog check
+#   soak-run     WriteSoakBench#soak: warm-up + gated soak through PostgresSearchUpdaterFlow at --rate;
+#                windows, vacuum cycles, throughput-gate and bloat-plateau verdicts (summary.md)
+#   soak-status  show the soak container / corpus state
+#   soak-down    remove the soak container (add --purge to also delete its named data volume)
+#
 # Options:
 #   --count N    corpus size for `load` / `pc-load` (default 1000000)
 #   --seed N     corpus seed (default 42)
@@ -55,11 +65,20 @@
 #   --purge      with `down` / `pc-down`: also remove the data volume
 #   --rounds N   pc-read: warm rounds (default 3; each = every shape, 3 warmup + 20 timed)
 #   --cold-samples N    pc-cold: cold first executions per shape (default 3)
-#   --results-dir DIR   pc-*: evidence folder, relative to the module
-#                (default src/test/resources/bench/results/production-config)
+#   --results-dir DIR   pc-* / soak-*: evidence folder, relative to the module or absolute
+#                (defaults src/test/resources/bench/results/production-config and .../write-bench/10m-soak:
+#                the committed evidence; pass a scratch folder for trial runs)
 #   --range-legs MODE   pc-read/pc-cold/pc-invariance: selective range legs: auto (default; as the
 #                service: while the system index sf_multi is valid) | off (point legs only)
 #   --variants LIST     pc-read: comma list of variant ids to run (default: all), e.g. 1,5,2,ce-a,ce-a-sudo,ce-b,ce-c
+#   --soak-seconds N    soak-run: gated period (default 3600; the gate needs >= 3600)
+#   --warmup-seconds N  soak-run: warm-up before the gated period, reported but not gated (default 300)
+#   --plateau-seconds N soak-run: trailing part of the gated period for the plateau verdict (default 3600)
+#   --rate R            soak-run: offered updates/s (default 220)
+#   --gate-rate R       soak-run: rate every gated window must reach (default 200)
+#   --workers N         soak-run: concurrent writers, at most the shipped pool max-size 25 (default 24)
+#   --load-from N       soak-load: resume an interrupted load at corpus index N (default 0 = drop and reload)
+#   --maintenance-work-mem V   soak-load: session maintenance_work_mem for the index builds, e.g. 4GB
 #
 # Environment:
 #   MVN          maven binary (default: mvn on PATH); extra Maven flags via MAVEN_ARGS (e.g. MAVEN_ARGS=-o)
@@ -67,6 +86,12 @@
 #   BENCH_CONTAINER  container name (default ditto-search-bench-pg)
 #   BENCH_PC_PORT / BENCH_PC_CONTAINER / BENCH_PC_VOLUME   production-config container
 #                (defaults 55433 / ditto-search-bench-pc / ditto-search-bench-pc-data)
+#   BENCH_SOAK_PORT / BENCH_SOAK_CONTAINER / BENCH_SOAK_VOLUME   soak container (defaults 55434 /
+#                ditto-search-bench-soak / ditto-search-bench-soak-data; the volume may be an absolute host path,
+#                e.g. an empty sub-directory of a mounted gp3 volume)
+#   BENCH_SOAK_PG_ARGS  postgres flags for the soak container, e.g. "-c shared_buffers=16GB -c max_wal_size=16GB"
+#   BENCH_SOAK_SHM      shared memory of the soak container (default 1g; keep it above shared_buffers)
+#   BENCH_SOAK_URL / BENCH_SOAK_USER / BENCH_SOAK_PASSWORD   an external soak database (JDBC URL; no container)
 #   DOCKER_HOST  honoured by docker and by the cold-run harness
 #                (OrbStack: unix://$HOME/.orbstack/run/docker.sock)
 
@@ -85,6 +110,13 @@ PC_CONTAINER="${BENCH_PC_CONTAINER:-ditto-search-bench-pc}"
 PC_PORT="${BENCH_PC_PORT:-55433}"
 PC_VOLUME="${BENCH_PC_VOLUME:-ditto-search-bench-pc-data}"
 
+SOAK_CONTAINER="${BENCH_SOAK_CONTAINER:-ditto-search-bench-soak}"
+SOAK_PORT="${BENCH_SOAK_PORT:-55434}"
+SOAK_VOLUME="${BENCH_SOAK_VOLUME:-ditto-search-bench-soak-data}"
+SOAK_PG_ARGS="${BENCH_SOAK_PG_ARGS:-}"
+SOAK_SHM="${BENCH_SOAK_SHM:-1g}"
+SOAK_URL="${BENCH_SOAK_URL:-}"
+
 COUNT=1000000
 SEED=42
 PC_ROUNDS=3
@@ -92,6 +124,14 @@ PC_COLD_SAMPLES=3
 PC_RESULTS_DIR=""
 PC_RANGE_LEGS=auto
 PC_VARIANTS=""
+SOAK_SECONDS=""
+SOAK_WARMUP=""
+SOAK_PLATEAU=""
+SOAK_RATE=""
+SOAK_GATE_RATE=""
+SOAK_WORKERS=""
+SOAK_LOAD_FROM=""
+SOAK_MWM=""
 QUICK=0
 YES=0
 PURGE=0
@@ -115,18 +155,37 @@ while [ $# -gt 0 ]; do
         --results-dir) PC_RESULTS_DIR="$2"; shift 2 ;;
         --range-legs) PC_RANGE_LEGS="$2"; shift 2 ;;   # pc-read/pc-cold/pc-invariance: auto (default) | off
         --variants) PC_VARIANTS="$2"; shift 2 ;;       # pc-read: comma list of variant ids (default: all)
-        -h|--help) sed -n '15,71p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --soak-seconds) SOAK_SECONDS="$2"; shift 2 ;;
+        --warmup-seconds) SOAK_WARMUP="$2"; shift 2 ;;
+        --plateau-seconds) SOAK_PLATEAU="$2"; shift 2 ;;
+        --rate) SOAK_RATE="$2"; shift 2 ;;
+        --gate-rate) SOAK_GATE_RATE="$2"; shift 2 ;;
+        --workers) SOAK_WORKERS="$2"; shift 2 ;;
+        --load-from) SOAK_LOAD_FROM="$2"; shift 2 ;;
+        --maintenance-work-mem) SOAK_MWM="$2"; shift 2 ;;
+        -h|--help) sed -n '15,96p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) STAGES+=("$1"); shift ;;
     esac
 done
-[ ${#STAGES[@]} -gt 0 ] || { sed -n '15,71p' "${BASH_SOURCE[0]}"; exit 1; }
+[ ${#STAGES[@]} -gt 0 ] || { sed -n '15,96p' "${BASH_SOURCE[0]}"; exit 1; }
 
 if [ "$QUICK" = 1 ] && [ "$COUNT" = 1000000 ]; then
     COUNT=50000
 fi
 
-command -v docker >/dev/null || die "docker not found on PATH"
+# every stage but `build` needs docker, except the soak stages against an external database (BENCH_SOAK_URL)
+NEEDS_DOCKER=0
+for stage in "${STAGES[@]}"; do
+    case "$stage" in
+        build) ;;
+        soak-*) [ -n "$SOAK_URL" ] || NEEDS_DOCKER=1 ;;
+        *) NEEDS_DOCKER=1 ;;
+    esac
+done
+if [ "$NEEDS_DOCKER" = 1 ]; then
+    command -v docker >/dev/null || die "docker not found on PATH"
+fi
 command -v "$MVN" >/dev/null || die "maven not found (set MVN=/path/to/mvn)"
 
 # Connection coordinates: BenchConfig reads these as env vars (sysprop fallback),
@@ -391,6 +450,110 @@ stage_pc_down() {
     fi
 }
 
+# --- production write-path soak (shipped write flow, text-heavy twin) --------------------------------------------
+
+soak_env() {
+    export BENCH_PG_URL="${SOAK_URL:-jdbc:postgresql://localhost:${SOAK_PORT}/bench}"
+    export BENCH_PG_USER="${BENCH_SOAK_USER:-bench}"
+    export BENCH_PG_PASSWORD="${BENCH_SOAK_PASSWORD:-bench}"
+}
+
+soak_run_bench() { # args: -Dtest spec
+    local spec="$1"
+    local props=(-Dbench.count="$COUNT" -Dbench.seed="$SEED")
+    if [ -n "$PC_RESULTS_DIR" ]; then props+=(-Dbench.soak.resultsDir="$PC_RESULTS_DIR"); fi
+    if [ -n "$SOAK_SECONDS" ]; then props+=(-Dbench.soak.seconds="$SOAK_SECONDS"); fi
+    if [ -n "$SOAK_WARMUP" ]; then props+=(-Dbench.soak.warmupSeconds="$SOAK_WARMUP"); fi
+    if [ -n "$SOAK_PLATEAU" ]; then props+=(-Dbench.soak.plateauSeconds="$SOAK_PLATEAU"); fi
+    if [ -n "$SOAK_RATE" ]; then props+=(-Dbench.soak.targetRate="$SOAK_RATE"); fi
+    if [ -n "$SOAK_GATE_RATE" ]; then props+=(-Dbench.soak.gateRate="$SOAK_GATE_RATE"); fi
+    if [ -n "$SOAK_WORKERS" ]; then props+=(-Dbench.soak.workers="$SOAK_WORKERS"); fi
+    if [ -n "$SOAK_LOAD_FROM" ]; then props+=(-Dbench.soak.loadFrom="$SOAK_LOAD_FROM"); fi
+    if [ -n "$SOAK_MWM" ]; then props+=(-Dbench.soak.maintenanceWorkMem="$SOAK_MWM"); fi
+    run_bench "$spec" "${props[@]}"
+}
+
+soak_exists()  { docker ps -a --format '{{.Names}}' | grep -qx "$SOAK_CONTAINER"; }
+soak_running() { docker ps    --format '{{.Names}}' | grep -qx "$SOAK_CONTAINER"; }
+
+stage_soak_up() {
+    if [ -n "$SOAK_URL" ]; then
+        log "external soak database ${SOAK_URL}: no container to start"
+        return 0
+    fi
+    if soak_running; then
+        log "container ${SOAK_CONTAINER} already running"
+    elif soak_exists; then
+        log "starting existing container ${SOAK_CONTAINER}"
+        docker start "$SOAK_CONTAINER" >/dev/null
+    else
+        log "creating container ${SOAK_CONTAINER} (postgres:16, 127.0.0.1:${SOAK_PORT}, data ${SOAK_VOLUME}, flags: ${SOAK_PG_ARGS:-image defaults})"
+        # shellcheck disable=SC2086 # BENCH_SOAK_PG_ARGS is a list of postgres flags
+        docker run -d --name "$SOAK_CONTAINER" \
+            -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+            --shm-size="$SOAK_SHM" -p "127.0.0.1:${SOAK_PORT}:5432" \
+            -v "${SOAK_VOLUME}:/var/lib/postgresql/data" "$IMAGE" postgres $SOAK_PG_ARGS >/dev/null
+    fi
+    local saved="$CONTAINER"
+    CONTAINER="$SOAK_CONTAINER"; wait_ready; CONTAINER="$saved"
+    log "soak bench DB ready on 127.0.0.1:${SOAK_PORT}"
+}
+
+stage_soak_load() {
+    stage_soak_up; soak_env
+    if [ "$COUNT" -gt 1000000 ] && [ "$YES" != 1 ]; then
+        printf '\n  soak-load of %s things: hours of loading and roughly the load.md bytes-per-thing x count of disk.\n' "$COUNT"
+        printf 'Proceed? [y/N] '
+        read -r reply
+        case "$reply" in y|Y|yes|YES) ;; *) die "aborted" ;; esac
+    fi
+    log "write-soak load: count=${COUNT} seed=${SEED} from=${SOAK_LOAD_FROM:-0} (from 0 drops + recreates the search tables)"
+    soak_run_bench 'WriteSoakBench#load'
+}
+
+stage_soak_run() {
+    stage_soak_up; soak_env
+    log "write-soak run: count=${COUNT} rate=${SOAK_RATE:-220} gated=${SOAK_SECONDS:-3600}s warm-up=${SOAK_WARMUP:-300}s"
+    soak_run_bench 'WriteSoakBench#soak'
+}
+
+stage_soak_status() {
+    if [ -n "$SOAK_URL" ]; then
+        echo "external soak database: ${SOAK_URL}"
+    elif soak_running; then
+        echo "container: ${SOAK_CONTAINER} RUNNING (127.0.0.1:${SOAK_PORT}, data ${SOAK_VOLUME})"
+        docker exec "$SOAK_CONTAINER" psql -U bench -d bench -Atc \
+            "SELECT 'things: ' || count(*) FROM search_things" 2>/dev/null || echo "schema: not loaded"
+        docker exec "$SOAK_CONTAINER" psql -U bench -d bench -Atc \
+            "SELECT 'database: ' || pg_size_pretty(pg_database_size('bench'))" 2>/dev/null || true
+    elif soak_exists; then
+        echo "container: ${SOAK_CONTAINER} exists but is STOPPED"
+    else
+        echo "container: ${SOAK_CONTAINER} does not exist"
+    fi
+}
+
+stage_soak_down() {
+    if [ -n "$SOAK_URL" ]; then
+        log "external soak database: nothing to remove"
+        return 0
+    fi
+    if soak_exists; then
+        docker rm -f "$SOAK_CONTAINER" >/dev/null
+        echo "removed container ${SOAK_CONTAINER}"
+    else
+        echo "container ${SOAK_CONTAINER} does not exist"
+    fi
+    if [ "$PURGE" = 1 ]; then
+        if docker volume inspect "$SOAK_VOLUME" >/dev/null 2>&1; then
+            docker volume rm "$SOAK_VOLUME" >/dev/null || die "could not remove volume ${SOAK_VOLUME}"
+            echo "removed volume ${SOAK_VOLUME}"
+        else
+            echo "${SOAK_VOLUME} is not a named Docker volume (a host path is not removed by this script)"
+        fi
+    fi
+}
+
 confirm_production_config_run() {
     [ "$YES" = 1 ] && return 0
     printf '\n  Production-config search benchmark at count=%s:\n' "$COUNT"
@@ -439,6 +602,11 @@ for stage in "${STAGES[@]}"; do
         pc-invariance) stage_pc_invariance ;;
         pc-status)   stage_pc_status ;;
         pc-down)     stage_pc_down ;;
+        soak-up)     stage_soak_up ;;
+        soak-load)   stage_soak_load ;;
+        soak-run)    stage_soak_run ;;
+        soak-status) stage_soak_status ;;
+        soak-down)   stage_soak_down ;;
         production-config)
             confirm_production_config_run
             stage_pc_up; stage_pc_load; stage_pc_read; stage_pc_cold; stage_pc_bias

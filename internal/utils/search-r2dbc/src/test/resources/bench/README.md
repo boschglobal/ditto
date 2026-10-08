@@ -203,3 +203,51 @@ All durations/rate/pool-size/worker-count knobs are overridable via `-Dbench.wri
 `results/write-bench/` are from the brief's full reduced-scale durations (16 workers, 200 upd/s target, 2,000-
 thing pools, 10 min / 2x5 min) — see `docs/superpowers/specs/2026-07-03-postgres-search-bench-results.md` for
 the full synthesis and the provisional gate verdict.
+
+## Production write-path soak (shipped write flow, text-heavy twin)
+
+`WriteSoakBench` (bench naming: never part of a build) measures sustained search writes the way the service performs
+them, against the production DDL.
+
+| | |
+|---|---|
+| Schema | `PostgresSearchSchema.ddlStatements()` + `sf_multi` via `ProductionConfigSchema`, incl. the search tables' autovacuum reloptions; catalog-checked before the soak |
+| Corpus | `SoakTwin`, `--count` things: ~70–80 flat rows per thing, ~2/3 of the value rows strings, 1 in 10 things with three 500–600-character texts (TOASTed doc rows). COPY-loaded with exactly the rows the shipped writer stores (`WriteSoakIT` proves a re-write keeps every flat row's ctid) |
+| Updates | each update rewrites one of two groups of five leaves (strings, a number, a boolean; one group holds a two-element array) plus `_revision` and `_modified`: 12–13 flat rows deleted and inserted, ~60 % text rows (`sf_text`, `sf_trgm`), some `ord = 1` rows (`sf_multi`) |
+| Write path | `EnforcedThingMapper.toWriteModel` → `PostgresSearchUpdaterFlow.of(client)` on the shipped `ditto-postgres-search` pool; `--workers` writers (≤ pool max-size 25), one write in flight each, one writer per thing; a shared rate limiter offers `--rate` (default 220/s) and drops missed slots |
+| Windows | every `bench.soak.windowSeconds` (30 s), on absolute boundaries: updates and rate (over the measured window), errors, p50/p95/max latency, WAL bytes and full-page images, per-update `search_flat` deletes/inserts, `n_dead_tup`/sizes/autovacuum counts for `search_flat`, `search_things` and its TOAST table, running vacuums |
+| Vacuum | `pg_stat_progress_vacuum` + `pg_stat_activity` every 2 s: cycles with duration, index passes (`index_vacuum_count`), wait events (`Timeout:VacuumDelay` = held back by the cost limit; `IO:*` = storage) |
+
+Verdicts (`summary.md`):
+
+- **throughput gate**: met when the gated windows (after the warm-up) cover ≥ 3600 s, every one reaches `--gate-rate`
+  (default 200/s), and no update failed. The offered rate is 10 % above the gate, because the rate limiter never
+  exceeds its target and a window at exactly the target can miss it by scheduling jitter;
+- **bloat plateau**: per relation, over the last `--plateau-seconds` (the last `plateau / window` gated windows, picked
+  by count so timer jitter cannot move the boundaries):
+  - dead tuples bounded: ≥ 1 autovacuum completed, and the peak `n_dead_tup` stayed ≤ 2 × the autovacuum trigger;
+  - size flat: `pg_total_relation_size` grew ≤ 0.5 % over the second half.
+
+At 10M things, `search_flat`'s trigger at scale factor 0.01 is several million dead rows, i.e. most of an hour of churn
+at 220 updates/s. A plateau verdict on `search_flat` therefore needs a gated period long enough for at least one
+completed cycle inside the plateau window.
+
+```
+R=internal/utils/search-r2dbc/benchmark/run-benchmark.sh
+$R build                                                            # reactor deps into ~/.m2 first
+$R soak-up soak-load --count 50000 --results-dir /abs/scratch/soak --yes
+$R soak-run --count 50000 --soak-seconds 600 --warmup-seconds 60 --plateau-seconds 300 --results-dir /abs/scratch/soak --yes
+$R soak-down --purge
+```
+
+`--results-dir` defaults to the committed evidence folder `results/write-bench/10m-soak/`; pass a scratch folder for
+anything but the measured run. Production-like servers take their settings through `BENCH_SOAK_PG_ARGS` (container)
+or run elsewhere (`BENCH_SOAK_URL`, no Docker needed). An external database must accept non-TLS connections: the write
+pool runs the shipped profile with `ssl.mode = disable` (`ProductionSearchDb`), so Amazon RDS needs
+`rds.force_ssl = 0`. Numbers from a laptop VM are functional checks only.
+
+A soak needs a freshly loaded corpus. Every soak starts each thing at revision 2, and the shipped upsert has no revision
+predicate, so on a corpus an earlier soak has written the writers would replay that soak's documents without changing
+a flat row. `soak-run` therefore refuses a corpus with any thing past revision 1, or one loaded with another `--seed`.
+Run a dry run on its own (small) corpus and reload (`soak-load`) before every re-run. `--load-from` equal to
+`--count` repeats only the post-load (indexes, `VACUUM`, catalog check) of a load that failed after its last COPY.

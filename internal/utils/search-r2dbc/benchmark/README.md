@@ -345,11 +345,17 @@ Stages can be run individually (they build on each other in this order):
 | `production-config` | `pc-up pc-load pc-read pc-cold pc-bias`: the shipped-schema + shipped-translator baseline (§5), own container `ditto-search-bench-pc` (port 55433, volume `ditto-search-bench-pc-data`) | ~25 min at 1M (load 678 s; warm 551 s, cold 161 s, bias 11 s) |
 | `pc-load` / `pc-read` / `pc-cold` / `pc-bias` | the stages individually, in this order (`--rounds N`, `--cold-samples N`, `--results-dir DIR`); `pc-bias` only after `pc-cold` (it reads the pages the first cold samples need); `pc-status`, `pc-down [--purge]` | see above |
 | `pc-invariance` | the selective-leg requests (shapes 1/5, the counter-examples `ce-*`, two `attributes/region` array filters) with point legs only and with range legs: same request results and same full ordered sudo match lists (`invariance.md`), fails on a difference | hours at 1M (each iteration runs the request and the full sudo match list in both modes, ~1.7 min per shape-1 iteration) |
+| `soak-up` / `soak-load` / `soak-run` | production write-path soak (`WriteSoakBench`): own container `ditto-search-bench-soak` (127.0.0.1:55434, volume `ditto-search-bench-soak-data`); load the text-heavy soak twin with the production DDL (`--count N`, resumable with `--load-from N`), then a warm-up + gated soak through the shipped `PostgresSearchUpdaterFlow` with per-window throughput, latency, WAL, dead tuples, sizes and autovacuum activity, and the throughput-gate / bloat-plateau verdicts; `soak-status`, `soak-down [--purge]` | load ~minutes per 100k things on a laptop; soak = warm-up + `--soak-seconds` |
 
 Production-config knobs: `--range-legs auto|off` (selective range legs as the service uses them while the system
 index `sf_multi` is valid, or forced off: point legs only; recorded in `environment.md`) and `--variants LIST`
 (`pc-read`: only these variant ids, e.g. `1,5,2,ce-a,ce-a-sudo,ce-b,ce-c`). The `pc-load` catalog check includes
 `sf_multi`, so a corpus loaded with search schema v2 has to be reloaded.
+
+Write-soak knobs: `--soak-seconds N` (gated period, default 3600), `--warmup-seconds N` (300), `--plateau-seconds N`
+(3600), `--rate R` (offered, 220/s), `--gate-rate R` (200/s), `--workers N` (24, ≤ the shipped pool's 25),
+`--maintenance-work-mem V` (load), `BENCH_SOAK_PG_ARGS` (server flags), `BENCH_SOAK_URL` (external database). See
+`src/test/resources/bench/README.md` "Production write-path soak" for the twin, the windows and the verdict rules.
 
 Knobs: `--count N` / `--seed N` (corpus), `--yes` (skip confirmation), `--quick` (50k corpus +
 short write windows — for demos only, numbers are not comparable), `MVN=<path>` to pick a Maven

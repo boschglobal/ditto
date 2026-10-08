@@ -167,6 +167,74 @@ final class BenchConfig {
         return java.util.Collections.unmodifiableSet(ids);
     }
 
+    // --- production write-path soak knobs (WriteSoakBench) ---------------------------------------------------------
+
+    /** @return where the write-soak evidence is written, from {@code bench.soak.resultsDir}. */
+    static java.nio.file.Path soakResultsDir() {
+        return java.nio.file.Path.of(property("bench.soak.resultsDir",
+                "src/test/resources/bench/results/write-bench/10m-soak"));
+    }
+
+    /** @return the gated soak period (every window in it counts for the throughput gate); default 3600 s. */
+    static java.time.Duration soakGated() {
+        return java.time.Duration.ofSeconds(longProperty("bench.soak.seconds", 3600L));
+    }
+
+    /** @return the warm-up before the gated period (sampled and reported, not gated); default 300 s. */
+    static java.time.Duration soakWarmup() {
+        return java.time.Duration.ofSeconds(longProperty("bench.soak.warmupSeconds", 300L));
+    }
+
+    /** @return the trailing part of the gated period the bloat-plateau verdict looks at; default 3600 s. */
+    static java.time.Duration soakPlateau() {
+        return java.time.Duration.ofSeconds(longProperty("bench.soak.plateauSeconds", 3600L));
+    }
+
+    /** @return the sample window; default 30 s. */
+    static java.time.Duration soakWindow() {
+        return java.time.Duration.ofSeconds(longProperty("bench.soak.windowSeconds", 30L));
+    }
+
+    /** @return how often running (auto)vacuums are polled for progress and wait events; default 2 s. */
+    static java.time.Duration soakVacuumPoll() {
+        return java.time.Duration.ofSeconds(longProperty("bench.soak.vacuumPollSeconds", 2L));
+    }
+
+    /** @return the concurrent writers, one write in flight each; default 24 (the shipped pool has 25). */
+    static int soakWorkers() {
+        return (int) longProperty("bench.soak.workers", 24L);
+    }
+
+    /** @return the offered aggregate update rate; default 220/s, 10 % above the gate (see the bench README). */
+    static double soakTargetRate() {
+        final String v = property("bench.soak.targetRate", null);
+        return v != null ? Double.parseDouble(v) : 220.0;
+    }
+
+    /** @return the rate every gated window must reach; default 200/s. */
+    static double soakGateRate() {
+        final String v = property("bench.soak.gateRate", null);
+        return v != null ? Double.parseDouble(v) : 200.0;
+    }
+
+    /** @return things per COPY chunk (each chunk commits on its own, so a load can resume); default 10,000. */
+    static int soakLoadChunk() {
+        return (int) longProperty("bench.soak.loadChunk", 10_000L);
+    }
+
+    /** @return the corpus index a resumed load starts at; default 0 = drop the search tables and load from scratch. */
+    static long soakLoadFrom() {
+        return longProperty("bench.soak.loadFrom", 0L);
+    }
+
+    /**
+     * @return a session {@code maintenance_work_mem} for the post-load index builds, or {@code null} = the server's.
+     */
+    @javax.annotation.Nullable
+    static String soakMaintenanceWorkMem() {
+        return property("bench.soak.maintenanceWorkMem", null);
+    }
+
     private static long longProperty(final String key, final long defaultValue) {
         final String v = property(key, null);
         return v != null ? Long.parseLong(v) : defaultValue;

@@ -32,10 +32,12 @@ import org.postgresql.core.BaseConnection;
  */
 final class CopyLoader {
 
-    private static final String THINGS_COLUMNS =
+    /** Column list of {@code COPY search_things} (shared with the write-soak loader). */
+    static final String THINGS_COLUMNS =
             "(thing_id, namespace, revision, policy_id, policy_rev, referenced_policies, global_read, thing, "
                     + "policy_auth, features_auth, t_modified, delete_at)";
-    private static final String FLAT_COLUMNS =
+    /** Column list of {@code COPY search_flat} (shared with the write-soak loader). */
+    static final String FLAT_COLUMNS =
             "(thing_id, path, wpath, f_id, ord, type_rank, val_bool, val_num, val_text)";
 
     private CopyLoader() {
@@ -90,7 +92,8 @@ final class CopyLoader {
         };
     }
 
-    private static long copyIn(final Connection connection, final String sql, final Iterator<String> lines)
+    /** Streams pre-formatted COPY lines into {@code sql}; @return the number of rows copied. */
+    static long copyIn(final Connection connection, final String sql, final Iterator<String> lines)
             throws SQLException, IOException {
         final CopyManager copyManager = new CopyManager(connection.unwrap(BaseConnection.class));
         return copyManager.copyIn(sql, new LineIteratorReader(lines));

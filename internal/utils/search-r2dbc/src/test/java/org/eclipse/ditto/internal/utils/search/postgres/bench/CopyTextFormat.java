@@ -13,9 +13,17 @@
 package org.eclipse.ditto.internal.utils.search.postgres.bench;
 
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.List;
 
 import javax.annotation.Nullable;
+
+import org.eclipse.ditto.json.JsonArray;
+import org.eclipse.ditto.json.JsonArrayBuilder;
+import org.eclipse.ditto.json.JsonObject;
+import org.eclipse.ditto.json.JsonObjectBuilder;
+import org.eclipse.ditto.json.JsonValue;
+import org.eclipse.ditto.thingsearch.persistence.api.model.SearchIndexDocument;
 
 /**
  * Renders {@link ThingRecord}/{@link FlatRow} instances as {@code COPY ... FROM STDIN} TEXT-format lines
@@ -62,6 +70,64 @@ final class CopyTextFormat {
                 r.valNum() == null ? NULL : r.valNum().toPlainString(),
                 textOrNull(r.valText())
         ) + "\n";
+    }
+
+    /**
+     * The {@code search_things} COPY line of a backend-neutral search document, column for column what
+     * {@code PostgresSearchUpdaterFlow} binds for a full write: the referenced policies as an array of policy-tag JSON,
+     * the per-feature read auth as a {@code feature-id -> auth} object, {@code t_modified} parsed from the payload's
+     * {@code _modified} (NULL when absent or unparseable) and {@code delete_at} NULL.
+     */
+    static String documentLine(final SearchIndexDocument document) {
+        final JsonArrayBuilder referencedPolicies = JsonArray.newBuilder();
+        document.referencedPolicies().forEach(tag -> referencedPolicies.add(tag.toJson()));
+        final JsonObjectBuilder featuresAuth = JsonObject.newBuilder();
+        document.features().forEach(feature -> featuresAuth.set(feature.featureId(), feature.auth()));
+        return String.join("\t",
+                text(document.thingId().toString()),
+                text(document.namespace()),
+                Long.toString(document.revision()),
+                document.policyId().map(policyId -> text(policyId.toString())).orElse(NULL),
+                Long.toString(document.policyRevision()),
+                text(referencedPolicies.build().toString()),
+                textArray(document.globalRead()),
+                text(document.thing().toString()),
+                text(document.policyAuth().toString()),
+                text(featuresAuth.build().toString()),
+                modifiedOrNull(document.thing()),
+                NULL
+        ) + "\n";
+    }
+
+    /** A row of the shipped {@code ThingFlattener} as a {@code search_flat} COPY line. */
+    static String flatLine(final org.eclipse.ditto.internal.utils.persistence.postgres.search.flatten.FlatRow r) {
+        return String.join("\t",
+                text(r.thingId()),
+                text(r.path()),
+                text(r.wpath()),
+                textOrNull(r.fId()),
+                Integer.toString(r.ord()),
+                Short.toString(r.typeRank()),
+                r.valBool() == null ? NULL : (r.valBool() ? "t" : "f"),
+                r.valNum() == null ? NULL : r.valNum().toPlainString(),
+                textOrNull(r.valText())
+        ) + "\n";
+    }
+
+    private static String modifiedOrNull(final JsonObject thing) {
+        return thing.getValue("_modified")
+                .filter(JsonValue::isString)
+                .map(JsonValue::asString)
+                .map(CopyTextFormat::instantTextOrNull)
+                .orElse(NULL);
+    }
+
+    private static String instantTextOrNull(final String isoTimestamp) {
+        try {
+            return escape(Instant.parse(isoTimestamp).toString());
+        } catch (final DateTimeParseException e) {
+            return NULL;
+        }
     }
 
     private static String text(final String s) {
