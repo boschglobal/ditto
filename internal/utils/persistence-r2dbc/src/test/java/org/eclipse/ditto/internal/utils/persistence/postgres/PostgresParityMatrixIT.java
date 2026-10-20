@@ -309,7 +309,8 @@ public final class PostgresParityMatrixIT {
 
     // =================================================================================================
     // getNewestSnapshotsAbove — DELETED-lifecycle exclusion. The `__lifecycle` marker is lifted into the
-    // `lifecycle` column on save; includeDeleted=false filters `lifecycle IS DISTINCT FROM 'DELETED'`, so a
+    // `lifecycle` column on save; includeDeleted=false drops a pid whose newest snapshot is DELETED (filtered in
+    // `PostgresReadJournal` after the newest-per-pid pick; no SQL filters on `lifecycle`), so a
     // tombstoned snapshot is hidden from cleanup unless includeDeleted=true. ageWindow is Duration.ZERO so
     // the freshly-seeded rows (written_at ≈ now()) are not excluded by the `written_at < now() - $::interval`
     // age predicate.

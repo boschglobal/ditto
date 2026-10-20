@@ -39,16 +39,16 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.Table
  *     independently of the journal rows, so the highest sequence number survives even after journal entries are
  *     deleted.</li>
  *     <li>{@code <e>_snaps} — {@code pid TEXT COLLATE "C"}, {@code sn}, {@code snapshot JSONB}, {@code lifecycle},
- *     {@code written_at};
- *     {@code PRIMARY KEY (pid, sn, written_at)} (so a re-snapshot at the same sequence number is allowed; it serves
- *     every snaps access path, so v2 drops v1's {@code (pid, sn DESC)} index) + the partial index
- *     {@code <e>_snaps_lifecycle_idx} on {@code lifecycle} {@code WHERE lifecycle = 'DELETED'}.</li>
+ *     {@code written_at}; {@code PRIMARY KEY (pid, sn, written_at)} (so a re-snapshot at the same sequence number is
+ *     allowed) and no other index: the primary key serves every snapshot access path (v2 dropped v1's
+ *     {@code (pid, sn DESC)} index), and {@code DELETED} snapshots are filtered in the application after the
+ *     newest-per-pid pick, which no index on {@code lifecycle} could serve (v3 dropped that partial index).</li>
  * </ul>
  * <p>
  * A single {@code schema_version(component, version, checksum, min_compatible_version)} table (owned by
- * {@code PostgresSchemaManager}) backs the refuse-to-boot guard. Each table
- * additionally gets {@code ALTER TABLE … SET (autovacuum_vacuum_scale_factor = 0.01)} issued in the same bootstrap
- * transaction so the high-churn journal and snapshot tables are vacuumed aggressively.
+ * {@code PostgresSchemaManager}) backs the refuse-to-boot guard. Each table additionally gets autovacuum storage
+ * parameters ({@code ALTER TABLE … SET (…)}) issued in the same bootstrap transaction: every table is vacuumed after
+ * 1 % dead rows, and the journal and snapshot tables, which cleanup prunes, also get a larger vacuum cost budget.
  * </p>
  * <p>
  * The {@link #ddlStatements()} list holds this component's own tables/indexes (the shared {@code schema_version} table
@@ -69,21 +69,38 @@ public final class PostgresSchema {
 
     /**
      * Bumped on any DDL change (the checksum covers every statement), per the schema-evolution policy; each bump also
-     * declares {@link #MIN_COMPATIBLE_VERSION}.
+     * declares {@link #MIN_COMPATIBLE_VERSION} and adds a literal test fixture of the version it replaces (see
+     * {@code SchemaChecksumPreservationTest}).
      * v2: v1's {@code (pid, sn DESC)} snaps index dropped — redundant under the loose-index-scan queries.
+     * v3: the unused partial snaps index on {@code lifecycle = 'DELETED'} dropped; the journal and snapshot tables get
+     * a larger autovacuum cost budget.
      */
-    public static final int VERSION = 2;
+    public static final int VERSION = 3;
 
     /**
      * The oldest code schema version that can run against the {@link #VERSION} schema (stored as
      * {@code schema_version.min_compatible_version}); see {@code PostgresSchemaDescriptor#minCompatibleVersion()} for
      * the bump rules. v2 is the first version that declares one; it is 2 because v1 code predates the compatibility
-     * check.
+     * check. v3 keeps 2: an index drop and changed storage parameters leave v2 code working against the v3 schema.
      */
     public static final int MIN_COMPATIBLE_VERSION = 2;
 
     /** The per-entity prefixes that get a full journal/journal_seq/snaps table set. */
     public static final List<String> ENTITIES = List.of("things", "policies", "connections", "wot");
+
+    /**
+     * Autovacuum storage parameters of the tables cleanup deletes from ({@code <e>_journal}, {@code <e>_snaps}):
+     * vacuum after 1 % dead rows (PostgreSQL's default is 20 %), with a cost budget of 2000 per
+     * {@code autovacuum_vacuum_cost_delay} (the server default is 200), so that the vacuum after a mass prune is not
+     * held back by the cost throttle. A table with its own cost limit is left out of PostgreSQL's cost balancing
+     * between autovacuum workers: each worker on such a table uses this budget in full. Only parameters that
+     * PostgreSQL 10, the persistence backend's minimum, knows.
+     */
+    private static final String PRUNED_TABLE_RELOPTIONS =
+            "autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_limit = 2000";
+
+    /** The high-water-mark table ({@code <e>_journal_seq}) is updated in place and never pruned: trigger only. */
+    private static final String JOURNAL_SEQ_RELOPTIONS = "autovacuum_vacuum_scale_factor = 0.01";
 
     /**
      * The byte-ordered collation that every persistence-id column must declare so that {@code pid > $1 ORDER BY pid}
@@ -177,11 +194,11 @@ public final class PostgresSchema {
             statements.add(createJournalSeqTable(entity));
             statements.add(createSnapsTable(entity));
             statements.add(dropSnapsPidSnIndex(entity));
-            statements.add(createSnapsLifecycleIndex(entity));
+            statements.add(dropSnapsLifecycleIndex(entity));
             // autovacuum tuning — transactional ALTER in the SAME bootstrap txn.
-            statements.add(autovacuum(entity + "_journal"));
-            statements.add(autovacuum(entity + "_journal_seq"));
-            statements.add(autovacuum(entity + "_snaps"));
+            statements.add(autovacuum(entity + "_journal", PRUNED_TABLE_RELOPTIONS));
+            statements.add(autovacuum(entity + "_journal_seq", JOURNAL_SEQ_RELOPTIONS));
+            statements.add(autovacuum(entity + "_snaps", PRUNED_TABLE_RELOPTIONS));
         }
         return List.copyOf(statements);
     }
@@ -247,13 +264,15 @@ public final class PostgresSchema {
         return "DROP INDEX IF EXISTS " + entity + "_snaps_pid_sn_desc_idx";
     }
 
-    private static String createSnapsLifecycleIndex(final String entity) {
-        return "CREATE INDEX IF NOT EXISTS " + entity + "_snaps_lifecycle_idx ON " + entity
-                + "_snaps (lifecycle) WHERE lifecycle = 'DELETED'";
+    private static String dropSnapsLifecycleIndex(final String entity) {
+        // v3 upgrade: the partial index on lifecycle = 'DELETED' served no query. DELETED snapshots are filtered in the
+        // application after the newest-per-pid pick ("exclude the pid if its newest snapshot is DELETED"), which no
+        // index on lifecycle can serve, and cleanup reads with includeDeleted = true.
+        return "DROP INDEX IF EXISTS " + entity + "_snaps_lifecycle_idx";
     }
 
-    private static String autovacuum(final String table) {
-        return "ALTER TABLE " + table + " SET (autovacuum_vacuum_scale_factor = 0.01)";
+    private static String autovacuum(final String table, final String reloptions) {
+        return "ALTER TABLE " + table + " SET (" + reloptions + ")";
     }
 
     private static Map<String, String> orderedColumns(final String... nameTypePairs) {

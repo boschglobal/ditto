@@ -15,6 +15,10 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.schema;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.PostgresSchemaManager;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.schema.SchemaBootException;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.testkit.PostgresDbResource;
@@ -22,7 +26,12 @@ import org.junit.AfterClass;
 import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.Result;
@@ -31,7 +40,8 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /**
- * Integration test for {@link PostgresSchemaManager} against a real PostgreSQL (PG 16) via Testcontainers.
+ * Integration test for {@link PostgresSchemaManager} against a real PostgreSQL (PG 16) via Testcontainers. The upgrade
+ * and mixed-version cases run the literal v2 fixture ({@link PostgresSchemaV2}) against the current schema.
  * <p>
  * Runs under the failsafe phase ({@code *IT}); skipped offline / when no Docker daemon is reachable (the
  * {@link #startContainer() Assume} guard turns an unreachable Docker into a skip, not a failure).
@@ -109,47 +119,164 @@ public final class PostgresSchemaManagerIT {
     }
 
     @Test
-    public void v2BootsAgainstANewerCompatibleSchemaWithoutRunningDdlOrTouchingTheRow() {
+    public void currentCodeBootsAgainstANewerCompatibleSchemaWithoutRunningDdlOrTouchingTheRow() {
+        final int newer = PostgresSchema.VERSION + 1;
         PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
-        // Simulate a v3 pod mid-roll: it advanced the shared row (declaring v2 compatible) and dropped an index that
-        // the v2 DDL creates.
-        runDdl("UPDATE schema_version SET version = 3, checksum = 'v3-checksum', min_compatible_version = 2 "
-                + "WHERE component = '" + PostgresSchema.COMPONENT + "'");
+        // Simulate a newer pod mid-roll: it advanced the shared row (declaring this version compatible) and dropped
+        // an index that this code's DDL creates.
+        runDdl("UPDATE schema_version SET version = " + newer + ", checksum = 'newer-checksum', "
+                + "min_compatible_version = " + PostgresSchema.VERSION
+                + " WHERE component = '" + PostgresSchema.COMPONENT + "'");
         runDdl("DROP INDEX things_journal_tags_idx");
         try {
-            // A v2 pod restarts: it must boot, run no DDL and leave the v3 row alone.
+            // A pod of this version restarts: it must boot, run no DDL and leave the newer row alone.
             PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
 
-            assertThat(indexExists("things_journal_tags_idx")).as("v2 DDL must not run against the v3 schema")
+            assertThat(indexExists("things_journal_tags_idx"))
+                    .as("this code's DDL must not run against the newer schema")
                     .isFalse();
-            assertThat(storedRow()).isEqualTo("3/v3-checksum/2");
+            assertThat(storedRow()).isEqualTo(newer + "/newer-checksum/" + PostgresSchema.VERSION);
         } finally {
-            restoreV2Schema();
+            restoreCurrentSchema();
         }
     }
 
     @Test
-    public void v2RefusesANewerIncompatibleSchema() {
+    public void currentCodeRefusesANewerIncompatibleSchema() {
+        final int newer = PostgresSchema.VERSION + 1;
         PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
-        runDdl("UPDATE schema_version SET version = 3, checksum = 'v3-checksum', min_compatible_version = 3 "
-                + "WHERE component = '" + PostgresSchema.COMPONENT + "'");
+        runDdl("UPDATE schema_version SET version = " + newer + ", checksum = 'newer-checksum', "
+                + "min_compatible_version = " + newer + " WHERE component = '" + PostgresSchema.COMPONENT + "'");
         try {
             assertThatThrownBy(() -> PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor())
                     .bootstrap())
                     .isInstanceOf(SchemaBootException.class)
-                    .hasMessageContaining("min_compatible_version 3");
-            assertThat(storedRow()).isEqualTo("3/v3-checksum/3");
+                    .hasMessageContaining("min_compatible_version " + newer);
+            assertThat(storedRow()).isEqualTo(newer + "/newer-checksum/" + newer);
         } finally {
-            restoreV2Schema();
+            restoreCurrentSchema();
         }
     }
 
-    /** Puts the shared row back to this code's v2 values and re-runs the bootstrap (re-creates dropped indexes). */
-    private static void restoreV2Schema() {
+    private static final List<String> PRUNED_TABLE_V3 =
+            List.of("autovacuum_vacuum_scale_factor=0.01", "autovacuum_vacuum_cost_limit=2000");
+    private static final List<String> SCALE_FACTOR_ONLY = List.of("autovacuum_vacuum_scale_factor=0.01");
+
+    @Test
+    public void freshBootstrapCreatesNoLifecycleIndexAndSetsTheV3Reloptions() {
+        reset();
+
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+
+        for (final String e : PostgresSchema.ENTITIES) {
+            assertThat(indexExists(e + "_snaps_lifecycle_idx")).as(e).isFalse();
+            assertThat(reloptions(e + "_journal")).as(e).containsExactlyInAnyOrderElementsOf(PRUNED_TABLE_V3);
+            assertThat(reloptions(e + "_snaps")).as(e).containsExactlyInAnyOrderElementsOf(PRUNED_TABLE_V3);
+            assertThat(reloptions(e + "_journal_seq")).as(e).containsExactlyElementsOf(SCALE_FACTOR_ONLY);
+        }
+        assertThat(storedRow()).isEqualTo("3/" + PostgresSchemaManager.checksum(PostgresSchema.descriptor()) + "/2");
+    }
+
+    @Test
+    public void upgradeFromV2DropsTheLifecycleIndexesSetsTheReloptionsInPlaceAndAdvancesTheRowTo3() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSchemaV2.descriptor()).bootstrap();
+        assertThat(storedRow()).isEqualTo("2/" + PostgresSchemaV2.CHECKSUM + "/2");
+        for (final String e : PostgresSchema.ENTITIES) {
+            assertThat(indexExists(e + "_snaps_lifecycle_idx")).as(e + " before the upgrade").isTrue();
+        }
+        assertThat(reloptions("things_journal")).containsExactlyElementsOf(SCALE_FACTOR_ONLY);
+        final String journalFile = relfilenode("things_journal");
+        final String snapsFile = relfilenode("things_snaps");
+
+        // the first v3 pod of a rolling upgrade
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+
+        for (final String e : PostgresSchema.ENTITIES) {
+            assertThat(indexExists(e + "_snaps_lifecycle_idx")).as(e + ": the upgrade drops it").isFalse();
+            assertThat(reloptions(e + "_journal")).as(e).containsExactlyInAnyOrderElementsOf(PRUNED_TABLE_V3);
+            assertThat(reloptions(e + "_snaps")).as(e).containsExactlyInAnyOrderElementsOf(PRUNED_TABLE_V3);
+            assertThat(reloptions(e + "_journal_seq")).as(e).containsExactlyElementsOf(SCALE_FACTOR_ONLY);
+        }
+        assertThat(relfilenode("things_journal")).as("setting reloptions does not rewrite the table")
+                .isEqualTo(journalFile);
+        assertThat(relfilenode("things_snaps")).as("setting reloptions does not rewrite the table")
+                .isEqualTo(snapsFile);
+        assertThat(storedRow()).isEqualTo("3/" + PostgresSchemaManager.checksum(PostgresSchema.descriptor()) + "/2");
+    }
+
+    @Test
+    public void v2BootsAgainstAStoredV3SchemaWithoutRecreatingTheLifecycleIndex() {
+        reset();
+        PostgresSchemaManager.of(connectionFactory, PostgresSchemaV2.descriptor()).bootstrap();
+        PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+        final String v3Row = storedRow();
+        final ListAppender<ILoggingEvent> managerLog = captureManagerLog();
+        try {
+            // A not-yet-upgraded v2 pod restarts mid-roll. Its DDL (CREATE INDEX IF NOT EXISTS <e>_snaps_lifecycle_idx)
+            // would re-create the indexes v3 dropped: their absence afterwards proves that no DDL ran.
+            PostgresSchemaManager.of(connectionFactory, PostgresSchemaV2.descriptor()).bootstrap();
+
+            for (final String e : PostgresSchema.ENTITIES) {
+                assertThat(indexExists(e + "_snaps_lifecycle_idx")).as(e + ": v2 DDL must not run against v3")
+                        .isFalse();
+                assertThat(reloptions(e + "_journal")).as(e).containsExactlyInAnyOrderElementsOf(PRUNED_TABLE_V3);
+            }
+            assertThat(storedRow()).as("the row is not written back to v2").isEqualTo(v3Row)
+                    .startsWith("3/").endsWith("/2");
+            assertThat(managerLog.list.stream()
+                    .filter(event -> event.getLevel() == Level.INFO)
+                    .map(ILoggingEvent::getFormattedMessage))
+                    .anySatisfy(message -> assertThat(message)
+                            .contains("stored schema version 3")
+                            .contains("this code's version 2")
+                            .contains("Running no DDL"));
+        } finally {
+            releaseManagerLog(managerLog);
+        }
+    }
+
+    /** Puts the shared row back to this code's values and re-runs the bootstrap (re-creates dropped indexes). */
+    private static void restoreCurrentSchema() {
         runDdl("UPDATE schema_version SET version = " + PostgresSchema.VERSION + ", checksum = '"
                 + PostgresSchemaManager.checksum(PostgresSchema.descriptor()) + "', min_compatible_version = "
                 + PostgresSchema.MIN_COMPATIBLE_VERSION + " WHERE component = '" + PostgresSchema.COMPONENT + "'");
         PostgresSchemaManager.of(connectionFactory, PostgresSchema.descriptor()).bootstrap();
+    }
+
+    /** Drops every persistence table and the shared row table: the next bootstrap starts from an empty database. */
+    private static void reset() {
+        final String tables = PostgresSchema.ENTITIES.stream()
+                .flatMap(e -> Stream.of(e + "_journal", e + "_journal_seq", e + "_snaps"))
+                .collect(Collectors.joining(", "));
+        runDdl("DROP TABLE IF EXISTS " + tables + ", schema_version CASCADE");
+    }
+
+    private static List<String> reloptions(final String table) {
+        final String joined = scalar("SELECT coalesce(array_to_string(reloptions, ','), '') FROM pg_class "
+                + "WHERE oid = to_regclass('" + table + "')");
+        return joined.isEmpty() ? List.of() : List.of(joined.split(","));
+    }
+
+    private static String relfilenode(final String table) {
+        return scalar("SELECT relfilenode::text FROM pg_class WHERE oid = to_regclass('" + table + "')");
+    }
+
+    private static ListAppender<ILoggingEvent> captureManagerLog() {
+        // logback-test.xml roots at WARN; the compatible-newer line is INFO
+        final Logger logger = (Logger) LoggerFactory.getLogger(PostgresSchemaManager.class);
+        logger.setLevel(Level.INFO);
+        final ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void releaseManagerLog(final ListAppender<ILoggingEvent> appender) {
+        final Logger logger = (Logger) LoggerFactory.getLogger(PostgresSchemaManager.class);
+        logger.detachAppender(appender);
+        logger.setLevel(null);
+        appender.stop();
     }
 
     private static String storedRow() {

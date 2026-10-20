@@ -36,8 +36,10 @@ public final class AppendBench {
     public void w1SingleAppend() throws Exception {
         BenchProtocol.Timing pgT = null;
         BenchProtocol.Timing mongoT = null;
+        String pgVacuum = "";
         if (BenchConfig.runPg()) {
-            try (Connection c = BenchConfig.openPg()) {
+            try (Connection c = BenchConfig.openPg(); Connection vacuumProbe = BenchConfig.openPg()) {
+                final String vacuumAtStart = PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe));
                 c.setAutoCommit(false);
                 try (PreparedStatement insert = c.prepareStatement(PersistenceShapes.PG_INSERT_EVENT);
                         PreparedStatement upsert = c.prepareStatement(PersistenceShapes.PG_UPSERT_SEQ)) {
@@ -56,6 +58,8 @@ public final class AppendBench {
                         c.commit();
                     });
                 }
+                pgVacuum = "\n- PG autovacuum in progress at start: " + vacuumAtStart + "; at end: "
+                        + PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe)) + "\n";
             }
         }
         if (BenchConfig.runMongo()) {
@@ -89,7 +93,7 @@ public final class AppendBench {
                 }
             }
         }
-        BenchProtocol.writeEvidence("w1-single-append.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("w1-single-append"),
                 BenchProtocol.runHeader("W1 — single append txn")
                         + RecoveryBench.resultTable(List.of(
                                 RecoveryBench.sideBySide("append (journal + high-water-mark)", pgT, mongoT)))
@@ -97,7 +101,7 @@ public final class AppendBench {
                         + "Mongo: ordered 1-doc bulkWrite, WriteConcern JOURNALED; the plugin's async "
                         + "realtime-collection insert runs fire-and-forget outside the timed path exactly "
                         + "as in ScalaDriverPersistenceJournaller.batchAppend (plan deviation 4). "
-                        + "Mongo deleteMany/insert plans are not explainable — timings only.\n");
+                        + "Mongo deleteMany/insert plans are not explainable — timings only.\n" + pgVacuum);
     }
 
     @Test

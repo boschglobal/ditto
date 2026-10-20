@@ -24,6 +24,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.bson.Document;
 import org.junit.AfterClass;
@@ -227,6 +228,47 @@ public final class LoaderSmokeIT {
                 assertThat(CleanupShapeBench.mongoPage(snaps, lb, RETENTION, limit))
                         .isEqualTo(oracle.mongoPage(lb, true, limit))
                         .noneMatch(e -> e.pid().equals(gen.pid(fresh)));
+            }
+        }
+    }
+
+    @Test
+    public void aBoundedCreditPacedSweepStopsAtItsDeadlineAndRecordsOnlyCompletelySweptPids() throws Exception {
+        final CorpusGenerator gen = new CorpusGenerator(SEED, COUNT);
+        final Properties props = new Properties();
+        props.setProperty("user", "bench");
+        props.setProperty("password", "bench");
+        props.setProperty("prepareThreshold", "0");
+        try (Connection connection = DriverManager.getConnection(postgres.getJdbcUrl(), props)) {
+            PgLoadBench.run(connection, gen, false);
+
+            // credits pace: 3 batches per 3 s window. The bound is checked before each batch's credit wait, so a 7 s
+            // bound allows the windows at 0, 3 and 6 s plus at most one batch that waited past the bound.
+            final SweepEngine.SweepResult bounded =
+                    SweepEngine.sweepPg(connection, true, new AtomicBoolean(false), Duration.ofSeconds(7));
+            assertThat(bounded.deadlineReached()).isTrue();
+            assertThat(bounded.batches()).isBetween(1L, 10L);
+            assertThat(bounded.sweptPids()).hasSize((int) bounded.pids());
+            assertSweptDownToTheirSnapshot(connection, bounded.sweptPids());
+
+            final SweepEngine.SweepResult rest =
+                    SweepEngine.sweepPg(connection, false, new AtomicBoolean(false), Duration.ZERO);
+            assertThat(rest.deadlineReached()).isFalse();
+            assertThat(rest.sweptPids()).isNotEmpty().hasSize((int) rest.pids());
+            assertSweptDownToTheirSnapshot(connection, rest.sweptPids());
+        }
+    }
+
+    private static void assertSweptDownToTheirSnapshot(final Connection connection,
+            final List<SweepEngine.SweptPid> swept) throws Exception {
+        try (PreparedStatement ps = connection.prepareStatement(PersistenceShapes.PG_MIN_EVENT_SN)) {
+            for (final SweepEngine.SweptPid p : swept) {
+                ps.setString(1, p.pid());
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertThat(rs.next()).isTrue();
+                    assertThat(rs.getLong("sn")).as(p.pid() + " swept down to its snapshot")
+                            .isEqualTo(p.snapshotSn());
+                }
             }
         }
     }

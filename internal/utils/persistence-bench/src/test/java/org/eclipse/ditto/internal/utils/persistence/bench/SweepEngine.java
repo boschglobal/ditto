@@ -16,6 +16,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -40,10 +42,43 @@ public final class SweepEngine {
     }
 
     public record SweepSample(int windowIndex, long pidsDone, long rowsDeleted, double pidsPerSec,
-            double rowsPerSec, long deadTuples, long journalTotalBytes, long snapsTotalBytes) {}
+            double rowsPerSec, long deadTuples, long journalTotalBytes, long snapsTotalBytes, String vacuum) {}
+
+    /** A pid whose whole delete plan ran inside the sweep; the pid in progress when a deadline hits is not one. */
+    public record SweptPid(String pid, long snapshotSn, long eventRowsDeleted) {}
 
     public record SweepResult(long pids, long eventRowsDeleted, long snapRowsDeleted, long batches,
-            double durationSeconds, List<SweepSample> samples) {}
+            double durationSeconds, List<SweepSample> samples, List<SweptPid> sweptPids, boolean deadlineReached,
+            Instant finishedAt) {}
+
+    /** Wall-clock bound of a sweep; a zero or negative bound never expires. Package-private for SweepDeadlineTest. */
+    static final class Deadline {
+        private final boolean bounded;
+        private final long deadlineNanos;
+        private boolean reached;
+
+        Deadline(final Duration bound) {
+            bounded = !bound.isZero() && !bound.isNegative();
+            deadlineNanos = System.nanoTime() + (bounded ? bound.toNanos() : 0L);
+        }
+
+        /** Reads the clock; once the bound has passed, stays reached. */
+        boolean reached() {
+            if (bounded && !reached && System.nanoTime() - deadlineNanos >= 0) {
+                reached = true;
+            }
+            return reached;
+        }
+
+        /** Whether a check during the sweep found the bound passed (no clock read). */
+        boolean wasReached() {
+            return reached;
+        }
+    }
+
+    interface VacuumProbe {
+        String inProgress() throws Exception;
+    }
 
     /** Package-private for CreditPacerTest; interval is injectable for the same reason. */
     static final class CreditPacer {
@@ -52,7 +87,7 @@ public final class SweepEngine {
         private long windowStart = System.nanoTime();
         private int inWindow;
 
-        CreditPacer(final boolean enabled, final java.time.Duration interval) {
+        CreditPacer(final boolean enabled, final Duration interval) {
             this.enabled = enabled;
             intervalNanos = interval.toNanos();
         }
@@ -85,6 +120,13 @@ public final class SweepEngine {
         final long startNanos = System.nanoTime();
         long nextSampleNanos = startNanos + BenchConfig.sampleIntervalSeconds() * 1_000_000_000L;
         int windowIndex;
+        final Deadline deadline;
+        final List<SweptPid> swept = new ArrayList<>();
+        VacuumProbe vacuumProbe = () -> "—";
+
+        Counters(final Duration bound) {
+            deadline = new Deadline(bound);
+        }
 
         void maybeSample(final StatsProbe probe) throws Exception {
             if (System.nanoTime() < nextSampleNanos) {
@@ -94,7 +136,8 @@ public final class SweepEngine {
             final long[] s = probe.stats();
             final long rows = eventRows + snapRows;
             samples.add(new SweepSample(windowIndex++, pids, rows,
-                    (pids - lastPids) / interval, (rows - lastRows) / interval, s[0], s[1], s[2]));
+                    (pids - lastPids) / interval, (rows - lastRows) / interval, s[0], s[1], s[2],
+                    vacuumProbe.inProgress()));
             System.out.printf("[bench] sweep window %d: pids=%d rows=%d (%.0f rows/s) dead=%d%n",
                     windowIndex - 1, pids, rows, (rows - lastRows) / interval, s[0]);
             lastPids = pids;
@@ -104,7 +147,8 @@ public final class SweepEngine {
 
         SweepResult finish() {
             return new SweepResult(pids, eventRows, snapRows, batches,
-                    (System.nanoTime() - startNanos) / 1e9, samples);
+                    (System.nanoTime() - startNanos) / 1e9, samples, List.copyOf(swept), deadline.wasReached(),
+                    Instant.now());
         }
     }
 
@@ -112,10 +156,23 @@ public final class SweepEngine {
         long[] stats() throws Exception;   // {deadTuples, journalBytes, snapsBytes}
     }
 
+    /** {@link #sweepPg(Connection, boolean, AtomicBoolean, Duration)} without a wall-clock bound. */
     public static SweepResult sweepPg(final Connection c, final boolean creditsPace,
             final AtomicBoolean stop) throws Exception {
+        return sweepPg(c, creditsPace, stop, Duration.ZERO);
+    }
+
+    /**
+     * Sweeps until the pid stream is exhausted, {@code stop} is set, or {@code bound} (if positive) has passed. The
+     * bound is checked before every delete batch, between pids and between pages; a credit-paced batch whose check
+     * passed may still start up to one credit interval (3 s) after the bound, because it then waits for its credit.
+     * The pid in progress when the bound hits is not counted as swept.
+     */
+    public static SweepResult sweepPg(final Connection c, final boolean creditsPace,
+            final AtomicBoolean stop, final Duration bound) throws Exception {
         final CreditPacer pacer = new CreditPacer(creditsPace, PersistenceShapes.CREDIT_INTERVAL);
-        final Counters counters = new Counters();
+        final Counters counters = new Counters(bound);
+        counters.vacuumProbe = () -> PgVacuumProbe.formatProgress(PgVacuumProbe.progress(c));
         final StatsProbe probe = () -> pgStats(c);
         try (PreparedStatement page = c.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE);
                 PreparedStatement minEv = c.prepareStatement(PersistenceShapes.PG_MIN_EVENT_SN);
@@ -123,7 +180,7 @@ public final class SweepEngine {
                 PreparedStatement delEv = c.prepareStatement(PersistenceShapes.PG_DELETE_EVENTS);
                 PreparedStatement delSnap = c.prepareStatement(PersistenceShapes.PG_DELETE_SNAPS)) {
             String lowerBound = "";
-            while (!stop.get()) {
+            while (!stop.get() && !counters.deadline.reached()) {
                 page.setString(1, lowerBound);
                 page.setString(2, "");
                 page.setString(3, "");
@@ -143,7 +200,7 @@ public final class SweepEngine {
                 }
                 lowerBound = rows.get(rows.size() - 1)[0];
                 for (final String[] row : rows) {
-                    if (stop.get()) {
+                    if (stop.get() || counters.deadline.reached()) {
                         break;
                     }
                     final String pid = row[0];
@@ -156,17 +213,26 @@ public final class SweepEngine {
                             evMin = rs.wasNull() ? null : v;
                         }
                     }
+                    long pidEventRows = 0;
                     if (evMin != null) {
                         for (final CleanupPlanner.Range r : CleanupPlanner.eventDeleteRanges(
                                 evMin, snapshotSn, PersistenceShapes.WRITES_PER_CREDIT)) {
+                            if (counters.deadline.reached()) {
+                                break;
+                            }
                             pacer.acquire();
                             delEv.setString(1, pid);
                             delEv.setLong(2, r.fromSn());
                             delEv.setLong(3, r.toSn());
-                            counters.eventRows += delEv.executeUpdate();
+                            final int deleted = delEv.executeUpdate();
+                            counters.eventRows += deleted;
+                            pidEventRows += deleted;
                             counters.batches++;
                             counters.maybeSample(probe);
                         }
+                    }
+                    if (counters.deadline.reached()) {
+                        break;   // this pid's delete plan may be incomplete: it is not counted as swept
                     }
                     minSnap.setString(1, pid);
                     Long snMin = null;
@@ -179,6 +245,9 @@ public final class SweepEngine {
                     if (snMin != null) {
                         for (final CleanupPlanner.Range r : CleanupPlanner.snapshotDeleteRanges(
                                 snMin, snapshotSn, false, false, PersistenceShapes.WRITES_PER_CREDIT)) {
+                            if (counters.deadline.reached()) {
+                                break;
+                            }
                             pacer.acquire();
                             delSnap.setString(1, pid);
                             delSnap.setLong(2, r.fromSn());
@@ -188,7 +257,11 @@ public final class SweepEngine {
                             counters.maybeSample(probe);
                         }
                     }
+                    if (counters.deadline.reached()) {
+                        break;
+                    }
                     counters.pids++;
+                    counters.swept.add(new SweptPid(pid, snapshotSn, pidEventRows));
                     counters.maybeSample(probe);
                 }
             }
@@ -196,15 +269,22 @@ public final class SweepEngine {
         return counters.finish();
     }
 
+    /** {@link #sweepMongo(MongoDatabase, boolean, AtomicBoolean, Duration)} without a wall-clock bound. */
     public static SweepResult sweepMongo(final MongoDatabase db, final boolean creditsPace,
             final AtomicBoolean stop) throws Exception {
+        return sweepMongo(db, creditsPace, stop, Duration.ZERO);
+    }
+
+    /** The MongoDB counterpart of {@link #sweepPg(Connection, boolean, AtomicBoolean, Duration)}. */
+    public static SweepResult sweepMongo(final MongoDatabase db, final boolean creditsPace,
+            final AtomicBoolean stop, final Duration bound) throws Exception {
         final MongoCollection<Document> journal = db.getCollection(PersistenceShapes.JOURNAL);
         final MongoCollection<Document> snaps = db.getCollection(PersistenceShapes.SNAPS);
         final CreditPacer pacer = new CreditPacer(creditsPace, PersistenceShapes.CREDIT_INTERVAL);
-        final Counters counters = new Counters();
+        final Counters counters = new Counters(bound);
         final StatsProbe probe = () -> mongoStats(db);
         String lowerBound = "";
-        while (!stop.get()) {
+        while (!stop.get() && !counters.deadline.reached()) {
             // the aggregation emits ONE doc: {_id:null, m:<max pid of the raw page>, i:[items...]}
             Document pageDoc = null;
             for (final Document d : snaps.aggregate(
@@ -217,23 +297,32 @@ public final class SweepEngine {
             lowerBound = pageDoc.getString("m");
             final List<Document> items = pageDoc.getList("i", Document.class);
             for (final Document item : items) {
-                if (stop.get()) {
+                if (stop.get() || counters.deadline.reached()) {
                     break;
                 }
                 final String pid = item.getString("_id");
                 final long snapshotSn = item.getLong("sn");
                 final Document minEvDoc = journal.find(new Document("pid", pid))
                         .sort(new Document("to", 1)).limit(1).projection(new Document("to", 1)).first();
+                long pidEventRows = 0;
                 if (minEvDoc != null) {
                     for (final CleanupPlanner.Range r : CleanupPlanner.eventDeleteRanges(
                             minEvDoc.getLong("to"), snapshotSn, PersistenceShapes.WRITES_PER_CREDIT)) {
+                        if (counters.deadline.reached()) {
+                            break;
+                        }
                         pacer.acquire();
-                        counters.eventRows += journal.deleteMany(
+                        final long deleted = journal.deleteMany(
                                 PersistenceShapes.deleteEventsFilter(pid, r.fromSn(), r.toSn()))
                                 .getDeletedCount();
+                        counters.eventRows += deleted;
+                        pidEventRows += deleted;
                         counters.batches++;
                         counters.maybeSample(probe);
                     }
+                }
+                if (counters.deadline.reached()) {
+                    break;   // this pid's delete plan may be incomplete: it is not counted as swept
                 }
                 final Document minSnapDoc = snaps.find(new Document("pid", pid))
                         .sort(new Document("sn", 1)).limit(1).projection(new Document("sn", 1)).first();
@@ -241,6 +330,9 @@ public final class SweepEngine {
                     for (final CleanupPlanner.Range r : CleanupPlanner.snapshotDeleteRanges(
                             minSnapDoc.getLong("sn"), snapshotSn, false, false,
                             PersistenceShapes.WRITES_PER_CREDIT)) {
+                        if (counters.deadline.reached()) {
+                            break;
+                        }
                         pacer.acquire();
                         counters.snapRows += snaps.deleteMany(
                                 PersistenceShapes.deleteSnapshotsFilter(pid, r.fromSn(), r.toSn()))
@@ -249,7 +341,11 @@ public final class SweepEngine {
                         counters.maybeSample(probe);
                     }
                 }
+                if (counters.deadline.reached()) {
+                    break;
+                }
                 counters.pids++;
+                counters.swept.add(new SweptPid(pid, snapshotSn, pidEventRows));
                 counters.maybeSample(probe);
             }
         }
@@ -295,9 +391,10 @@ public final class SweepEngine {
                     String.format("%.0f", s.rowsPerSec()),
                     s.deadTuples() < 0 ? "—" : String.valueOf(s.deadTuples()),
                     String.format("%.1f MB", s.journalTotalBytes() / 1048576.0),
-                    String.format("%.1f MB", s.snapsTotalBytes() / 1048576.0)));
+                    String.format("%.1f MB", s.snapsTotalBytes() / 1048576.0),
+                    s.vacuum()));
         }
         return BenchProtocol.table(List.of("window", "pids done", "rows deleted", "pids/s", "rows/s",
-                "dead tuples", "journal size", "snaps size"), rows);
+                "dead tuples", "journal size", "snaps size", "autovacuum in progress"), rows);
     }
 }

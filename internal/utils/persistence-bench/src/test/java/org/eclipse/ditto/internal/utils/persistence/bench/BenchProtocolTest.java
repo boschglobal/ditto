@@ -82,6 +82,19 @@ public final class BenchProtocolTest {
     }
 
     @Test
+    public void aLabelSuffixesTheEvidenceNameAndNoLabelKeepsIt() {
+        final CorpusGenerator backdated = new CorpusGenerator(42L, 10L);
+        final CorpusGenerator fresh = new CorpusGenerator(42L, 10L, 0.3, 1_790_000_000_000L);
+        assertThat(BenchProtocol.corpusEvidenceName("load-pg", backdated, "")).isEqualTo("load-pg.md");
+        assertThat(BenchProtocol.corpusEvidenceName("load-pg", backdated, "cl2000-pg"))
+                .isEqualTo("load-pg-cl2000-pg.md");
+        assertThat(BenchProtocol.corpusEvidenceName("load-pg", fresh, "cl2000-pg"))
+                .isEqualTo("load-pg-fresh-share-0.3-cl2000-pg.md");
+        assertThat(BenchProtocol.labelled("c4-before-after", "")).isEqualTo("c4-before-after");
+        assertThat(BenchProtocol.labelled("c4-before-after", "cl2000-pg")).isEqualTo("c4-before-after-cl2000-pg");
+    }
+
+    @Test
     public void freshCorpusLineCountsTheFreshOnlyPids() {
         assertThat(BenchProtocol.freshCorpusLine(new CorpusGenerator(42L, 10L))).isEmpty();
 

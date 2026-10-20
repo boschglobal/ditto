@@ -182,7 +182,7 @@ public final class RecoveryBench {
     private static BenchProtocol.Timing pgReplay(final Connection pg, final CorpusGenerator gen,
             final List<Long> pidIndexes, final boolean fromSnapshot) throws Exception {
         try (PreparedStatement ps = pg.prepareStatement(PersistenceShapes.PG_REPLAY)) {
-            return BenchProtocol.measure(iteration -> {
+            return BenchProtocol.measure(BenchConfig.warmups(), timedIterations(pidIndexes), iteration -> {
                 final long idx = pidIndexes.get(iteration % pidIndexes.size());
                 ps.setString(1, gen.pid(idx));
                 ps.setLong(2, fromSnapshot ? gen.latestSnapshotSn(idx) + 1 : 1L);
@@ -209,7 +209,7 @@ public final class RecoveryBench {
     private static BenchProtocol.Timing mongoReplay(final MongoDatabase db, final CorpusGenerator gen,
             final List<Long> pidIndexes, final boolean fromSnapshot) {
         final MongoCollection<Document> journal = db.getCollection(PersistenceShapes.JOURNAL);
-        return BenchProtocol.measure(iteration -> {
+        return BenchProtocol.measure(BenchConfig.warmups(), timedIterations(pidIndexes), iteration -> {
             final long idx = pidIndexes.get(iteration % pidIndexes.size());
             final long from = fromSnapshot ? gen.latestSnapshotSn(idx) + 1 : 1L;
             journal.find(PersistenceShapes.replayFilter(gen.pid(idx), from, Long.MAX_VALUE))
@@ -283,6 +283,25 @@ public final class RecoveryBench {
             result.add(found.get(i % found.size()));
         }
         return result;
+    }
+
+    /**
+     * Up to n distinct class pids, in corpus order, never cycled: after a sweep, a second read of a pid is a different
+     * measurement (the first full-scan read marks the dead index entries it passes).
+     */
+    public static List<Long> pickDistinctPids(final CorpusGenerator gen, final CorpusGenerator.PidClass cls,
+            final int n, final long fromIndex) {
+        final List<Long> found = gen.findPidIndexes(cls, n, fromIndex);
+        if (found.size() <= BenchConfig.warmups()) {
+            throw new IllegalStateException("only " + found.size() + " pids of class " + cls + " in a corpus of "
+                    + gen.pidCount() + "; need more than the " + BenchConfig.warmups() + " warm-ups");
+        }
+        return List.copyOf(found);
+    }
+
+    /** The timed executions a pick list allows: bench.iterations, fewer when the list has fewer pids. */
+    static int timedIterations(final List<Long> pidIndexes) {
+        return Math.min(BenchConfig.iterations(), pidIndexes.size() - BenchConfig.warmups());
     }
 
     static List<String> sideBySide(final String label, final BenchProtocol.Timing pg,

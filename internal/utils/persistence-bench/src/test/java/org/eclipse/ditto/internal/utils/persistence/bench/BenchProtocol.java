@@ -146,13 +146,16 @@ public final class BenchProtocol {
 
     /** Standard evidence-file preamble recording all run parameters. */
     public static String runHeader(final String title) {
+        final String label = BenchConfig.evidenceLabel();
         return "# " + title + "\n\n"
                 + "- generated: " + Instant.now() + "\n"
                 + "- corpus: count=" + BenchConfig.count() + " seed=" + BenchConfig.seed() + freshCorpusSuffix() + "\n"
                 + "- backend(s): " + BenchConfig.backend() + "\n"
                 + "- protocol: " + BenchConfig.warmups() + " warmup + " + BenchConfig.iterations()
                 + " timed executions, nearest-rank percentiles, pgjdbc prepareThreshold=0\n"
-                + "- cleanup defaults: reads-per-query=100, writes-per-credit=100 (DefaultCleanupConfig)\n\n";
+                + "- cleanup defaults: reads-per-query=100, writes-per-credit=100 (DefaultCleanupConfig)\n"
+                + (label.isEmpty() ? "" : "- evidence label: " + label + "\n")
+                + "\n";
     }
 
     /** Empty for the backdated corpus, so evidence headers of share-0 runs keep their format. */
@@ -164,11 +167,29 @@ public final class BenchProtocol {
     }
 
     /**
+     * {@code base.md}, or {@code base-<label>.md} with {@code bench.evidenceLabel}, so that a labelled run never
+     * overwrites committed evidence.
+     */
+    public static String evidenceName(final String base) {
+        return labelled(base, BenchConfig.evidenceLabel()) + ".md";
+    }
+
+    static String labelled(final String base, final String label) {
+        return label.isEmpty() ? base : base + "-" + label;
+    }
+
+    /**
      * The evidence file name for a corpus: {@code base.md} for the backdated corpus, a fresh-share
-     * suffix otherwise, so a fresh-share run never overwrites the backdated corpus's evidence.
+     * suffix otherwise, so a fresh-share run never overwrites the backdated corpus's evidence; then the
+     * {@code bench.evidenceLabel} suffix, if any.
      */
     public static String corpusEvidenceName(final String base, final CorpusGenerator gen) {
-        return gen.freshShare() > 0.0 ? base + "-fresh-share-" + gen.freshShare() + ".md" : base + ".md";
+        return corpusEvidenceName(base, gen, BenchConfig.evidenceLabel());
+    }
+
+    static String corpusEvidenceName(final String base, final CorpusGenerator gen, final String label) {
+        final String corpusBase = gen.freshShare() > 0.0 ? base + "-fresh-share-" + gen.freshShare() : base;
+        return labelled(corpusBase, label) + ".md";
     }
 
     /** One evidence line with the corpus's fresh-only pid counts; empty for the backdated corpus. */

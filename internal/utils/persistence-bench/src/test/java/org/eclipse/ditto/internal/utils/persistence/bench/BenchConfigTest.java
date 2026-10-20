@@ -63,4 +63,17 @@ public final class BenchConfigTest {
         // without fresh pids the base is unused
         BenchConfig.checkFreshWindow(new CorpusGenerator(42L, 10L, 0.0, hourAgo), now);
     }
+
+    @Test
+    public void reloptionOverridesMustBeWrittenLikeTheSchemaDdl() {
+        assertThat(BenchConfig.checkReloptions("")).isEmpty();
+        assertThat(BenchConfig.checkReloptions(
+                "autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_limit = 800"))
+                .isEqualTo("autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_limit = 800");
+        assertThatThrownBy(() -> BenchConfig.checkReloptions("autovacuum_vacuum_cost_limit=800"))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> BenchConfig.checkReloptions(
+                "autovacuum_vacuum_cost_limit = 800); DROP TABLE things_journal; --"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

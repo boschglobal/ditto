@@ -40,8 +40,10 @@ public final class SnapshotBench {
         BenchProtocol.Timing mongoFresh = null;
         BenchProtocol.Timing mongoOverwrite = null;
 
+        String pgVacuum = "";
         if (BenchConfig.runPg()) {
-            try (Connection c = BenchConfig.openPg()) {
+            try (Connection c = BenchConfig.openPg(); Connection vacuumProbe = BenchConfig.openPg()) {
+                final String vacuumAtStart = PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe));
                 c.setAutoCommit(true);
                 try (PreparedStatement ps = c.prepareStatement(PersistenceShapes.PG_SAVE_SNAPSHOT)) {
                     final String pid = "thing:bench.w2:pg";
@@ -64,6 +66,8 @@ public final class SnapshotBench {
                         ps.executeUpdate();
                     });
                 }
+                pgVacuum = "\n- PG autovacuum in progress at start: " + vacuumAtStart + "; at end: "
+                        + PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe)) + "\n";
             }
         }
         if (BenchConfig.runMongo()) {
@@ -88,13 +92,13 @@ public final class SnapshotBench {
                 });
             }
         }
-        BenchProtocol.writeEvidence("w2-snapshot-write.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("w2-snapshot-write"),
                 BenchProtocol.runHeader("W2 — snapshot write (~4 KB)")
                         + RecoveryBench.resultTable(List.of(
                                 RecoveryBench.sideBySide("fresh insert (new sn per iteration)", pgFresh, mongoFresh),
                                 RecoveryBench.sideBySide("overwrite (same pid/sn/ts key)", pgOverwrite, mongoOverwrite)))
                         + "\nPG: INSERT ... ON CONFLICT (pid, sn, written_at) DO UPDATE. "
                         + "Mongo: replaceOne({pid,sn,ts}, upsert=true), WriteConcern JOURNALED "
-                        + "(ScalaDriverPersistenceSnapshotter.saveSnapshot).\n");
+                        + "(ScalaDriverPersistenceSnapshotter.saveSnapshot).\n" + pgVacuum);
     }
 }

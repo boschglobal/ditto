@@ -33,6 +33,9 @@ import com.mongodb.client.MongoClients;
 public final class BenchConfig {
 
     private static final Pattern RETENTION = Pattern.compile("(\\d+)([dhms])");
+    private static final Pattern RELOPTIONS =
+            Pattern.compile("autovacuum_[a-z_]+ = [0-9.]+(, autovacuum_[a-z_]+ = [0-9.]+)*");
+    private static final Pattern LABEL = Pattern.compile("[a-z0-9-]*");
 
     private BenchConfig() {
     }
@@ -157,6 +160,51 @@ public final class BenchConfig {
 
     public static int settleTimeoutSeconds() {
         return Integer.parseInt(property("bench.c4.settleTimeoutSeconds", "BENCH_C4_SETTLE_TIMEOUT", "900"));
+    }
+
+    /**
+     * Suffix for the evidence files of the load, W1/W2 and C3/C4/C5 scenarios, e.g. "cl2000-pg" writes
+     * c4-before-after-cl2000-pg.md; "" (default) keeps the committed names.
+     */
+    public static String evidenceLabel() {
+        final String label = property("bench.evidenceLabel", "BENCH_EVIDENCE_LABEL", "");
+        if (!LABEL.matcher(label).matches()) {
+            throw new IllegalArgumentException(
+                    "evidence label: lower-case letters, digits and '-' only: '" + label + "'");
+        }
+        return label;
+    }
+
+    /**
+     * Replaces the persistence schema's autovacuum storage parameters of things_journal and things_snaps at load
+     * time, written as in the schema DDL, e.g. "autovacuum_vacuum_scale_factor = 0.01"; "" (default) loads the
+     * production values. things_journal_seq always keeps the production value.
+     */
+    public static String pgReloptionsOverride() {
+        return checkReloptions(property("bench.pg.reloptions", "BENCH_PG_RELOPTIONS", ""));
+    }
+
+    static String checkReloptions(final String reloptions) {
+        if (!reloptions.isEmpty() && !RELOPTIONS.matcher(reloptions).matches()) {
+            throw new IllegalArgumentException(
+                    "reloptions must look like 'autovacuum_a = 1, autovacuum_b = 0.5': '" + reloptions + "'");
+        }
+        return reloptions;
+    }
+
+    /** true: VACUUM (ANALYZE) the three corpus tables before C3 / C5, so every run sweeps a settled corpus. */
+    public static boolean c3VacuumFirst() {
+        return Boolean.parseBoolean(property("bench.c3.vacuumFirst", "BENCH_C3_VACUUM_FIRST", "false"));
+    }
+
+    /** false: C4 skips its OFFLINE VACUUM FULL / compact step. */
+    public static boolean c4OfflineReclaim() {
+        return Boolean.parseBoolean(property("bench.c4.offlineReclaim", "BENCH_C4_OFFLINE_RECLAIM", "true"));
+    }
+
+    /** Wall-clock bound of the C5 window sweep; 0 s (default) = unbounded. */
+    public static Duration sweepMaxDuration() {
+        return Duration.ofSeconds(Long.parseLong(property("bench.sweep.maxSeconds", "BENCH_SWEEP_MAX_SECONDS", "0")));
     }
 
     /**

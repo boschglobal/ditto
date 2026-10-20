@@ -18,7 +18,7 @@
 #   run-benchmark.sh <stage...> [options]
 #
 # Stages (in dependency order):
-#   up           start BOTH long-lived bench containers (postgres:16 tuned, mongo:7.0 WT-cache 4GB)
+#   up           start the long-lived bench containers of --backend (postgres:16 tuned, mongo:7.0 WT-cache 4GB)
 #   build        mvn install -DskipTests the bench module + its reactor dependencies
 #   load         PgLoadBench + MongoLoadBench — generate + bulk-load the corpus, build indexes
 #   smoke        LoaderSmokeIT on Testcontainers (independent of the bench DBs)
@@ -28,6 +28,11 @@
 #   retention    CleanupShapeBench  — C1 with the production min age (--retention, default 3d) vs 0;
 #                load with --fresh-share first: on the backdated corpus every row qualifies
 #   sweep        CleanupSweepBench  — C3 full sweep (DESTRUCTIVE: empties cleanup backlog), C4 proof
+#   c3           CleanupSweepBench#c3FullSweep only (DESTRUCTIVE)
+#   wcheck       W1 single append + W2 snapshot write only (both write fixed probe pids: once per load)
+#   c4           CleanupSweepBench#c4BeforeAfterProof only (run after c3)
+#   window       CleanupSweepBench#c5CreditPacedWindow: credit-paced sweep bounded by BENCH_SWEEP_MAX_SECONDS
+#                (DESTRUCTIVE for the pids it reaches; --backend pg)
 #   mixed        MixedChurnBench    — M1 cleanup concurrent with churn (post-sweep corpus)
 #   all          up load recovery write cleanup sweep mixed (asks for confirmation first)
 #   status       show container / corpus / result-file state
@@ -57,6 +62,15 @@
 #   BENCH_MONGO_PORT       host port for MongoDB (default 57017)
 #   BENCH_PG_CONTAINER     container name (default ditto-persistence-bench-pg)
 #   BENCH_MONGO_CONTAINER  container name (default ditto-persistence-bench-mongo)
+#
+# Scenario settings are environment variables read by BenchConfig (this script rejects -D options):
+#   BENCH_ITERATIONS, BENCH_WARMUPS, BENCH_SAMPLE_INTERVAL, BENCH_SWEEP_PACE, BENCH_C4_SETTLE_TIMEOUT
+#   BENCH_EVIDENCE_LABEL      suffix for the load/W1/W2/C3/C4/C5 evidence names (default: the committed names)
+#   BENCH_PG_RELOPTIONS       replaces the schema's storage parameters of things_journal/things_snaps at load
+#   BENCH_C3_VACUUM_FIRST     true: VACUUM (ANALYZE) the corpus before C3/C5
+#   BENCH_C4_OFFLINE_RECLAIM  false: skip C4's VACUUM FULL / compact
+#   BENCH_SWEEP_MAX_SECONDS   bound of the window stage
+# Pass the same --count to every stage (the default is 1000000; C4 picks its pids from it).
 
 set -euo pipefail
 
@@ -85,7 +99,7 @@ PG_ARGS=(-c shared_buffers=4GB -c effective_cache_size=12GB -c work_mem=64MB)
 # Mirrors deployment/docker/docker-compose.yml plus a 4GB WT cache for memory symmetry with PG.
 MONGO_ARGS=(--storageEngine wiredTiger --noscripting --wiredTigerCacheSizeGB 4)
 
-usage() { sed -n '14,60p' "${BASH_SOURCE[0]}"; }
+usage() { awk 'NR >= 14 { if (/^#/) print; else exit }' "${BASH_SOURCE[0]}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -246,6 +260,37 @@ stage_sweep() {
     run_bench 'CleanupSweepBench#c4BeforeAfterProof' $(quick_props)
 }
 
+stage_c3() {
+    stage_up
+    log "C3 full sweep — DESTRUCTIVE: deletes journal/snapshot rows below each latest snapshot"
+    # shellcheck disable=SC2046
+    run_bench 'CleanupSweepBench#c3FullSweep' $(quick_props)
+}
+
+stage_wcheck() {
+    stage_up
+    # W1 inserts and W2 upserts fixed probe pids: run once per load
+    # shellcheck disable=SC2046
+    run_bench 'AppendBench#w1SingleAppend' $(quick_props)
+    # shellcheck disable=SC2046
+    run_bench SnapshotBench $(quick_props)
+}
+
+stage_c4() {
+    stage_up
+    # shellcheck disable=SC2046
+    run_bench 'CleanupSweepBench#c4BeforeAfterProof' $(quick_props)
+}
+
+stage_window() {
+    stage_up
+    [ "$BACKEND" = pg ] || die "the window stage is PostgreSQL-only: pass --backend pg"
+    [ -n "${BENCH_SWEEP_MAX_SECONDS:-}" ] || die "the window stage needs BENCH_SWEEP_MAX_SECONDS"
+    log "C5 credit-paced window of ${BENCH_SWEEP_MAX_SECONDS} s — DESTRUCTIVE for the pids it reaches"
+    # shellcheck disable=SC2046
+    run_bench 'CleanupSweepBench#c5CreditPacedWindow' $(quick_props)
+}
+
 stage_mixed() {
     stage_up
     # M1-only churn concentration: with the default pid spread no churn pid can reach the
@@ -328,6 +373,10 @@ for stage in "${STAGES[@]}"; do
         cleanup) stage_cleanup ;;
         retention) stage_retention ;;
         sweep) stage_sweep ;;
+        c3) stage_c3 ;;
+        wcheck) stage_wcheck ;;
+        c4) stage_c4 ;;
+        window) stage_window ;;
         mixed) stage_mixed ;;
         all) confirm_full_run; stage_up; stage_load; stage_recovery; stage_write; stage_cleanup; stage_sweep; stage_mixed ;;
         status) stage_status ;;

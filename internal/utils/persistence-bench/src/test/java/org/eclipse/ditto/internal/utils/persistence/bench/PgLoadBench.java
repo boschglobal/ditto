@@ -23,15 +23,17 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
+import org.eclipse.ditto.internal.utils.persistence.postgres.schema.PostgresSchema;
 import org.junit.Test;
 import org.postgresql.PGConnection;
 import org.postgresql.copy.CopyIn;
 import org.postgresql.copy.CopyManager;
 
 /**
- * Bulk-loads the corpus into PostgreSQL via COPY, then builds constraints/indexes/storage params
- * so the end state is identical to PostgresSchema.ddlStatements() for the "things" entity, then
- * ANALYZEs and records counts + sizes into load-pg.md. Never runs in CI (no *Test/*IT name);
+ * Bulk-loads the corpus into PostgreSQL via COPY, then adds the primary keys plus the persistence
+ * schema's own things_* index and storage-parameter statements (taken from
+ * PostgresSchema.ddlStatements()), then ANALYZEs and records counts, sizes and storage parameters
+ * into load-pg.md. Never runs in CI (no *Test/*IT name);
  * invoke via: mvn -pl internal/utils/persistence-bench test -Dtest=PgLoadBench -DfailIfNoTests=false
  */
 public final class PgLoadBench {
@@ -48,18 +50,42 @@ public final class PgLoadBench {
             "CREATE TABLE things_snaps (pid TEXT NOT NULL COLLATE \"C\", sn BIGINT NOT NULL, "
                     + "snapshot JSONB NOT NULL, lifecycle TEXT, written_at TIMESTAMPTZ NOT NULL)");
 
-    private static final List<String> POST_LOAD = List.of(
+    private static final List<String> PRIMARY_KEYS = List.of(
             "ALTER TABLE things_journal ADD PRIMARY KEY (pid, sn)",
-            "CREATE INDEX things_journal_tags_idx ON things_journal USING GIN (tags)",
             "ALTER TABLE things_journal_seq ADD PRIMARY KEY (pid)",
-            "ALTER TABLE things_snaps ADD PRIMARY KEY (pid, sn, written_at)",
-            "CREATE INDEX things_snaps_lifecycle_idx ON things_snaps (lifecycle) WHERE lifecycle = 'DELETED'",
-            "ALTER TABLE things_journal SET (autovacuum_vacuum_scale_factor = 0.01)",
-            "ALTER TABLE things_journal_seq SET (autovacuum_vacuum_scale_factor = 0.01)",
-            "ALTER TABLE things_snaps SET (autovacuum_vacuum_scale_factor = 0.01)",
+            "ALTER TABLE things_snaps ADD PRIMARY KEY (pid, sn, written_at)");
+
+    private static final List<String> ANALYZE_TABLES = List.of(
             "ANALYZE things_journal",
             "ANALYZE things_journal_seq",
             "ANALYZE things_snaps");
+
+    /**
+     * The statements run after the COPY: the primary keys the tables were created without (deviation 8), then the
+     * persistence schema's own things_* index and storage-parameter statements, taken from
+     * {@link PostgresSchema#ddlStatements()} so the loaded corpus cannot drift from production, then ANALYZE. A
+     * non-empty {@code reloptionsOverride} replaces the storage parameters of things_journal and things_snaps.
+     */
+    static List<String> postLoadStatements(final String reloptionsOverride) {
+        final List<String> statements = new ArrayList<>(PRIMARY_KEYS);
+        for (final String ddl : PostgresSchema.ddlStatements()) {
+            if (ddl.startsWith("CREATE INDEX IF NOT EXISTS things_")) {
+                statements.add(ddl);
+            } else if (ddl.startsWith("ALTER TABLE things_")) {
+                statements.add(overrideReloptions(ddl, reloptionsOverride));
+            }
+        }
+        statements.addAll(ANALYZE_TABLES);
+        return List.copyOf(statements);
+    }
+
+    static String overrideReloptions(final String alter, final String reloptionsOverride) {
+        if (reloptionsOverride.isEmpty() || alter.startsWith("ALTER TABLE things_journal_seq ")) {
+            return alter;
+        }
+        final String table = alter.substring("ALTER TABLE ".length(), alter.indexOf(" SET ("));
+        return "ALTER TABLE " + table + " SET (" + reloptionsOverride + ")";
+    }
 
     @Test
     public void load() throws Exception {
@@ -150,7 +176,7 @@ public final class PgLoadBench {
 
         final long tIndex0 = System.nanoTime();
         try (Statement st = connection.createStatement()) {
-            for (final String ddl : POST_LOAD) {
+            for (final String ddl : postLoadStatements(BenchConfig.pgReloptionsOverride())) {
                 System.out.println("[bench] " + ddl);
                 st.execute(ddl);
             }
@@ -178,9 +204,13 @@ public final class PgLoadBench {
                     copySeconds, indexSeconds, (System.nanoTime() - t0) / 1e9));
             md.append(BenchProtocol.freshCorpusLine(gen));
             md.append("## Sizes\n\n").append(sizesMarkdown(connection));
-            md.append("\nEnd-state DDL is identical to PostgresSchema.ddlStatements(): tables were "
-                    + "created without PKs for the COPY, then PK/indexes/autovacuum params added "
-                    + "(design plan, deviation 8).\n");
+            md.append("\n- schema: persistence v").append(PostgresSchema.VERSION)
+                    .append("; storage parameters: ").append(PgVacuumProbe.reloptions(connection))
+                    .append(BenchConfig.pgReloptionsOverride().isEmpty() ? ""
+                            : " (things_journal/things_snaps OVERRIDDEN by bench.pg.reloptions: not production values)")
+                    .append("\n\nThe index and storage-parameter statements are PostgresSchema.ddlStatements()'s own "
+                            + "things_* statements; the tables were created without PKs for the COPY and the PKs "
+                            + "added afterwards (design plan, deviation 8).\n");
             BenchProtocol.writeEvidence(BenchProtocol.corpusEvidenceName("load-pg", gen), md.toString());
         }
         return stats;
