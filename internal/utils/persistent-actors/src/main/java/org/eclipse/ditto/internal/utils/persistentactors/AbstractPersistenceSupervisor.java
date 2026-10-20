@@ -14,10 +14,12 @@ package org.eclipse.ditto.internal.utils.persistentactors;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BiConsumer;
@@ -97,6 +99,8 @@ import com.typesafe.config.Config;
  * Sharded Supervisor of persistent actors. It:
  * <ol>
  * <li>restarts failed child actor after exponential backoff,</li>
+ * <li>answers a signal at once with the entity's "unavailable" exception when the persistence actor child terminates
+ * before answering it,</li>
  * <li>shuts down self on command, and</li>
  * <li>handles initialization errors by becoming corrupted for a time.</li>
  * </ol>
@@ -142,6 +146,9 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
 
     private final ExponentialBackOffConfig exponentialBackOffConfig;
     private final SignalTransformer signalTransformer;
+    // asks of askAnsweredOnTermination that have not completed yet; added to on the enforcement executor, read by
+    // this actor when its persistence actor child terminates
+    private final Map<CompletableFuture<Object>, PendingAsk> pendingAsks = new ConcurrentHashMap<>();
     private ExponentialBackOff backOff;
     private boolean waitingForStopBeforeRestart = false;
     private boolean inCoordinatedShutdown = false;
@@ -536,7 +543,7 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
         if (null != targetActorWithMessage) {
             final ActorRef targetActor = targetActorWithMessage.targetActor();
             if (!targetActorWithMessage.messageTimeout().isZero()) {
-                return Patterns.ask(
+                return askAnsweredOnTermination(
                                 targetActor,
                                 targetActorWithMessage.message(),
                                 targetActorWithMessage.messageTimeout()
@@ -546,7 +553,7 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
             } else {
                 // special case: no response expected
                 if (targetActor.equals(persistenceActorChild)) {
-                    return Patterns.ask(
+                    return askAnsweredOnTermination(
                                     targetActor,
                                     targetActorWithMessage.message(),
                                     determineAskTimeoutForPersistenceActorForwarding(true) // calculate timeout for ACK only
@@ -561,6 +568,64 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
         } else {
             return CompletableFuture.completedFuture(null);
         }
+    }
+
+    /**
+     * Asks the target actor like {@link Patterns#ask(ActorRef, Object, Duration)}. If the target actor is the
+     * persistence actor child and terminates before answering, {@link #answerAsksPendingAt(ActorRef)} answers the ask
+     * at once. A persistence actor stops without answering when its recovery or a journal write fails, e.g. under
+     * persistence overload. Waiting for the ask timeout instead (up to {@code timeout-during-recovery}) would keep the
+     * later twin signals of the entity stashed until after their senders gave up.
+     *
+     * @param targetActor the actor to ask.
+     * @param message the message to send.
+     * @param timeout the ask timeout.
+     * @return the answer of the target actor or, if the persistence actor child terminated before answering, the
+     * entity's "unavailable" exception as a value.
+     */
+    private CompletionStage<Object> askAnsweredOnTermination(final ActorRef targetActor, final Object message,
+            final Duration timeout) {
+
+        // the ask itself is completed in the thread of the answering actor, before that actor can terminate;
+        // stages derived from it complete later and asynchronously, so only the ask tells whether an answer arrived
+        final CompletableFuture<Object> ask = Patterns.ask(targetActor, message, timeout).toCompletableFuture();
+        final CompletableFuture<Object> answer = new CompletableFuture<>();
+        pendingAsks.put(answer, new PendingAsk(targetActor, message, ask));
+        answer.whenComplete((response, error) -> pendingAsks.remove(answer));
+        ask.whenComplete((response, error) -> {
+            if (null != error) {
+                answer.completeExceptionally(error);
+            } else {
+                answer.complete(response);
+            }
+        });
+        return answer;
+    }
+
+    /**
+     * Answers the asks still pending at the terminated persistence actor child with the entity's "unavailable"
+     * exception, as this supervisor answers signals while its persistence actor is down. An ask whose answer arrived
+     * before the termination keeps that answer. An ask sent before the termination but registered only after this
+     * method ran keeps its ask timeout, as before; an ask sent after the termination fails at once.
+     *
+     * @param terminatedPersistenceActor the persistence actor child that terminated.
+     */
+    private void answerAsksPendingAt(final ActorRef terminatedPersistenceActor) {
+        pendingAsks.forEach((answer, pendingAsk) -> {
+            if (pendingAsk.targetActor().equals(terminatedPersistenceActor) && !pendingAsk.ask().isDone()) {
+                final DittoHeaders dittoHeaders = getDittoHeaders(pendingAsk.message());
+                final DittoRuntimeException unavailable = getUnavailableExceptionBuilder(entityId)
+                        .dittoHeaders(dittoHeaders)
+                        .build();
+                if (answer.complete(unavailable)) {
+                    log.withCorrelationId(dittoHeaders)
+                            .info("Persistence actor for entity with ID <{}> terminated before answering <{}>: " +
+                                            "answering <{}> instead of waiting for the ask timeout.", entityId,
+                                    pendingAsk.message().getClass().getSimpleName(),
+                                    unavailable.getClass().getSimpleName());
+                }
+            }
+        });
     }
 
     /**
@@ -686,6 +751,7 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
 
     private void childTerminated(final Terminated message) {
         if (message.getActor().equals(persistenceActorChild)) {
+            answerAsksPendingAt(message.getActor());
             persistenceActorChild = null;
             opCounter = 0;
             sudoOpCounter = 0;
@@ -1261,6 +1327,15 @@ public abstract class AbstractPersistenceSupervisor<E extends EntityId, S extend
      * @param signal the previous message.
      */
     private record ProcessNextTwinMessage(Signal<?> signal) {}
+
+    /**
+     * An ask of {@link #askAnsweredOnTermination(ActorRef, Object, Duration)} that has not completed yet.
+     *
+     * @param targetActor the asked actor.
+     * @param message the asked message.
+     * @param ask the ask itself, completed in the thread of the answering actor.
+     */
+    private record PendingAsk(ActorRef targetActor, Object message, CompletableFuture<Object> ask) {}
 
     private record EnforcedSignalAndTargetActorResponse(@Nullable Signal<?> enforcedSignal,
                                                         @Nullable Object response) {}

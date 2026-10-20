@@ -49,7 +49,6 @@ import org.eclipse.ditto.base.model.signals.commands.CommandResponse;
 import org.eclipse.ditto.base.model.signals.commands.streaming.SubscribeForPersistedEvents;
 import org.eclipse.ditto.base.model.signals.events.Event;
 import org.eclipse.ditto.base.service.actors.ShutdownBehaviour;
-import org.eclipse.ditto.internal.utils.cacheloaders.AskWithRetry;
 import org.eclipse.ditto.internal.utils.cluster.ShardRegionProxyActorFactory;
 import org.eclipse.ditto.internal.utils.cluster.StopShardedActor;
 import org.eclipse.ditto.internal.utils.namespaces.BlockedNamespaces;
@@ -78,6 +77,7 @@ import org.eclipse.ditto.things.model.signals.commands.query.ThingQueryCommand;
 import org.eclipse.ditto.things.model.signals.events.ThingEvent;
 import org.eclipse.ditto.things.model.signals.events.ThingEventToThingConverter;
 import org.eclipse.ditto.things.service.common.config.ThingsConfig;
+import org.eclipse.ditto.things.service.enforcement.CreatedPolicyRollback;
 import org.eclipse.ditto.things.service.enforcement.ThingEnforcement;
 import org.eclipse.ditto.things.service.enforcement.ThingEnforcerActor;
 import org.eclipse.ditto.things.service.enforcement.ThingPolicyCreated;
@@ -382,20 +382,10 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
                     .putHeader(DittoHeaderDefinition.DITTO_SUDO.getKey(), "true")
                     .build();
             final DeletePolicy deletePolicy = DeletePolicy.of(policyCreatedEvent.policyId(), dittoHeaders);
-            AskWithRetry.askWithRetry(policiesShardRegion, deletePolicy,
-                    enforcementConfig.getAskWithRetryConfig(),
-                    getContext().system(), response -> {
-                        log.withCorrelationId(rollback.initialCommand())
-                                .info("Policy <{}> deleted after rolling back it's creation. " +
-                                        "Policies shard region response: <{}>", deletePolicy.getEntityId(), response);
-                        rollback.completeInitialResponse();
-                        return response;
-                    }).exceptionally(throwable -> {
-                log.withCorrelationId(rollback.initialCommand())
-                        .error(throwable, "Failed to rollback Policy Create");
-                rollback.completeInitialResponse();
-                return null;
-            });
+            // CreatedPolicyRollback logs how the rollback ended; the initial sender gets the original error either way
+            CreatedPolicyRollback.deletePolicy(policiesShardRegion, deletePolicy, policyCreatedEvent.thingId(),
+                            enforcementConfig.getCreatedPolicyRollbackConfig(), getContext().system())
+                    .whenComplete((result, error) -> rollback.completeInitialResponse());
 
         } else {
             log.withCorrelationId(rollback.initialCommand())
@@ -464,6 +454,16 @@ public final class ThingSupervisorActor extends AbstractPersistenceSupervisor<Th
         super.stopShardedActor(trigger);
         if (getOpCounter() > 0) {
             getTimers().startSingleTimer(Control.SHUTDOWN_TIMEOUT, Control.SHUTDOWN_TIMEOUT, shutdownTimeout);
+        }
+    }
+
+    @Override
+    protected void decrementOpCounter(final Signal<?> signal) {
+        super.decrementOpCounter(signal);
+        if (shouldBecomeTwinSignalProcessingAwaiting(signal)) {
+            // the twin signal which may have created a policy is answered, its rollback included: forget that policy,
+            // so that a later CreateThing which fails does not delete it
+            policyCreatedEvent = null;
         }
     }
 
