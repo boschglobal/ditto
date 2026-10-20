@@ -27,6 +27,8 @@
 #   cleanup      CleanupShapeBench  — C1 pid-stream page, C2 single-pid cleanup
 #   retention    CleanupShapeBench  — C1 with the production min age (--retention, default 3d) vs 0;
 #                load with --fresh-share first: on the backdated corpus every row qualifies
+#   payload-whatif  CleanupShapeBench — NOT PRODUCTION what-if: the C1 page with vs without the snapshot
+#                payload, PG only (--backend pg), at --retention and 0, on the `retention` stage's corpus
 #   sweep        CleanupSweepBench  — C3 full sweep (DESTRUCTIVE: empties cleanup backlog), C4 proof
 #   c3           CleanupSweepBench#c3FullSweep only (DESTRUCTIVE)
 #   wcheck       W1 single append + W2 snapshot write only (both write fixed probe pids: once per load)
@@ -65,11 +67,12 @@
 #
 # Scenario settings are environment variables read by BenchConfig (this script rejects -D options):
 #   BENCH_ITERATIONS, BENCH_WARMUPS, BENCH_SAMPLE_INTERVAL, BENCH_SWEEP_PACE, BENCH_C4_SETTLE_TIMEOUT
-#   BENCH_EVIDENCE_LABEL      suffix for the load/W1/W2/C3/C4/C5 evidence names (default: the committed names)
+#   BENCH_EVIDENCE_LABEL      suffix for the load/W1/W2/C3/C4/C5/C1-what-if evidence names (default: none)
 #   BENCH_PG_RELOPTIONS       replaces the schema's storage parameters of things_journal/things_snaps at load
 #   BENCH_C3_VACUUM_FIRST     true: VACUUM (ANALYZE) the corpus before C3/C5
 #   BENCH_C4_OFFLINE_RECLAIM  false: skip C4's VACUUM FULL / compact
 #   BENCH_SWEEP_MAX_SECONDS   bound of the window stage
+#   BENCH_C1_VACUUM_TIMEOUT   C1 stages: bound of the wait for a quiet PG server, seconds (default 3600)
 # Pass the same --count to every stage (the default is 1000000; C4 picks its pids from it).
 
 set -euo pipefail
@@ -197,7 +200,8 @@ run_bench() { # args: -Dtest spec, extra -D props...
 quick_props() {
     if [ "$QUICK" = 1 ]; then
         echo "-Dbench.iterations=5 -Dbench.write.durationSeconds=30 -Dbench.write.targetRate=100" \
-             "-Dbench.write.workers=4 -Dbench.sample.intervalSeconds=10 -Dbench.c4.settleTimeoutSeconds=120"
+             "-Dbench.write.workers=4 -Dbench.sample.intervalSeconds=10 -Dbench.c4.settleTimeoutSeconds=120" \
+             "-Dbench.c1.vacuumTimeoutSeconds=120"
     fi
 }
 
@@ -248,6 +252,14 @@ stage_retention() {
     log "C1 with retention ${BENCH_C1_RETENTION:-3d} on a corpus with fresh share ${BENCH_FRESH_SHARE:-0}"
     # shellcheck disable=SC2046
     run_bench 'CleanupShapeBench#c1PidStreamPageWithRetention' $(quick_props)
+}
+
+stage_payload_whatif() {
+    [ "$BACKEND" = pg ] || die "payload-whatif is PostgreSQL only: pass --backend pg"
+    stage_up
+    log "C1 payload what-if (NOT PRODUCTION): retention ${BENCH_C1_RETENTION:-3d} and 0"
+    # shellcheck disable=SC2046
+    run_bench 'CleanupShapeBench#c1PayloadFreeWhatIf' $(quick_props)
 }
 
 stage_sweep() {
@@ -372,6 +384,7 @@ for stage in "${STAGES[@]}"; do
         write) stage_write ;;
         cleanup) stage_cleanup ;;
         retention) stage_retention ;;
+        payload-whatif) stage_payload_whatif ;;
         sweep) stage_sweep ;;
         c3) stage_c3 ;;
         wcheck) stage_wcheck ;;

@@ -163,8 +163,16 @@ public final class BenchConfig {
     }
 
     /**
-     * Suffix for the evidence files of the load, W1/W2 and C3/C4/C5 scenarios, e.g. "cl2000-pg" writes
-     * c4-before-after-cl2000-pg.md; "" (default) keeps the committed names.
+     * Bound of the C1 scenarios' wait for a quiet server: things_journal and things_snaps vacuumed since the load
+     * and no vacuum in progress (after a 250k load the insert-triggered things_journal autovacuum runs for minutes).
+     */
+    public static int c1VacuumTimeoutSeconds() {
+        return Integer.parseInt(property("bench.c1.vacuumTimeoutSeconds", "BENCH_C1_VACUUM_TIMEOUT", "3600"));
+    }
+
+    /**
+     * Suffix for the evidence files of the load, W1/W2, C3/C4/C5 and the C1 payload what-if scenarios, e.g.
+     * "cl2000-pg" writes c4-before-after-cl2000-pg.md; "" (default) keeps the committed names.
      */
     public static String evidenceLabel() {
         final String label = property("bench.evidenceLabel", "BENCH_EVIDENCE_LABEL", "");

@@ -95,12 +95,21 @@ backlog) is §7 caveat 11.
 | W1 single append | 2.71 | 3.03 | parity |
 | W2 snapshot write (fresh / overwrite) | 2.96 / 2.33 | 4.79 / 4.25 | PG faster (one snaps index fewer since v2; see the noise caveat below) |
 | W3 sustained churn (achieved of 500/s) | 499.8/s | 499.9/s | both hold target; per-op latency: see the W3 note below |
-| C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page, sized bench-only first |
+| C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page — sized by the what-if note below; no production change |
 | C1 cleanup pid-stream page, minAge 0 | 2.87 p50 / 3.99 p95 (2026-10-02; was 8.50 p95 on 2026-07-13) | 1.02 p50 / 1.27 p95 (was 10.71) | single-backend re-run: PG 2.5–2.8× (p50) slower per page; the July "PG faster" does not reproduce (cause untested; July's Mongo C1 itself moved 42.47 → 10.71 ms in one day). Former 21× FLAG vs schema v1 stays closed (887 → 3–8.5 ms) |
 | C2 single-pid cleanup (outlier total) | 993 | 1163 | parity |
 | C3 full sweep (21.05M rows) | 797 s | 488 s | Mongo 1.6× faster (delete-batch bound); identical deletions both sides |
 | **C4 post-sweep replay before reclamation** | **16.9 (tail) / 98.5 (full-scan)** | **13.2 / 6.7** | **FLAG: PG replays walk dead space until vacuum (worst-case: unthrottled sweep, §7.5)** |
 | M1 churn under live sweep (achieved of 500/s) | 499.8/s | 499.9/s | both hold; 296,576 rows swept live on each |
+
+C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20, schema v3, the 2026-10-02
+fresh-share corpus mode; Ditto does not issue this statement): the C1 page SQL without
+`snapshot::text` takes 0.54 p50 / 0.80 p95 ms at the 3-day filter against 2.91 / 3.56 ms for the
+production page in the same run, interleaved, so the payload is 82 % (p50) / 78 % (p95) of the page
+(3 runs: 80–82 % / 77–79 %; at minAge 0: 84 % / 83 %). A page carries 588 kB of payload text on
+average. Against Mongo's 1.15 / 1.63 ms from the 2026-10-02 run (not re-run): below. Decoding and
+JSON-parsing the payloads as production does adds 2.71 ms p50 / 4.28 ms p95 on top (pgjdbc +
+ditto-json estimate; production reads through r2dbc). See caveat 12.
 
 History (schema v1, before the rewrite and the v2 index drop): C1 was 887.14 ms PG vs 42.47 ms
 Mongo p95 (242 MB temp spill per page; Seq Scan + Sort over ~40k rows) and W2 was 4.31 / 3.30 ms
@@ -159,6 +168,7 @@ steady) — budget peak, not steady state; 500k needs ≳130–150 GB free.
 | W1 append / W2 snapshot / W3 churn | `w1-single-append.md`, `w2-snapshot-write.md`, `w3-sustained-churn.md` |
 | C1 pid stream / C2 single-pid / C3 sweep / C4 proof | `c1-*.md`, `c2-*.md`, `c3-*.md`, `c4-*.md` |
 | C1 with the production age filter | `../src/test/resources/bench/results/c1-pid-stream-page-retention3d-pg.md`, `../src/test/resources/bench/results/c1-pid-stream-page-retention3d-mongo.md`, `../src/test/resources/bench/results/load-pg-fresh-share-0.3.md`, `../src/test/resources/bench/results/load-mongo-fresh-share-0.3.md` |
+| C1 payload what-if (NOT PRODUCTION) | ../src/test/resources/bench/results/c1-payload-free-what-if-retention3d-pg-run1.md, …-run2.md, …-run3.md, ../src/test/resources/bench/results/load-pg-fresh-share-0.3-payload-whatif.md |
 | M1 mixed | `m1-cleanup-under-traffic.md` |
 
 ## 6. Reproducing
@@ -211,10 +221,24 @@ benchmark/run-benchmark.sh up load retention --backend mongo --count 250000 --fr
 Pin `--fresh-base` to the same instant for both loads: at least 14 h (the depth cap in seconds)
 before the load (the loaders refuse future rows) and less than the retention before the
 `retention` run — the stage checks the age mix against the generator and fails otherwise. It writes
-`c1-pid-stream-page-retention3d[-pg|-mongo].md`. On PG, start `retention` only once the post-load
-autovacuum of `things_journal` has finished (`SELECT * FROM pg_stat_progress_vacuum` is empty;
-about 30 min at 250k): the stage itself only waits for `things_snaps` to have been vacuumed once and
-merely records vacuums in progress at timing start and end.
+`c1-pid-stream-page-retention3d[-pg|-mongo].md`. On PG, both C1 stages wait (bounded by
+`BENCH_C1_VACUUM_TIMEOUT`, default 3600 s) until `things_journal` and `things_snaps` have each been
+vacuumed since the load and no vacuum is in progress (after a 250k load the insert-triggered
+`things_journal` autovacuum runs for minutes up to half an hour), and record the vacuum state at
+timing start and end.
+
+The C1 payload what-if (`payload-whatif` stage, NOT PRODUCTION, PG only) runs on the same kind of PG
+load. It times the production page against the same SQL without `snapshot::text`, interleaved, at
+`--retention` and at 0, then the production page decoded and JSON-parsed as production's client
+does. `BENCH_EVIDENCE_LABEL` numbers the runs (`c1-payload-free-what-if-retention3d-pg-<label>.md`);
+a labelled load keeps the committed load evidence:
+
+```
+BENCH_EVIDENCE_LABEL=payload-whatif benchmark/run-benchmark.sh up load --backend pg --count 250000 \
+    --fresh-share 0.3 --fresh-base <T>
+for r in 1 2 3; do BENCH_EVIDENCE_LABEL=run$r benchmark/run-benchmark.sh payload-whatif --backend pg \
+    --count 250000 --fresh-share 0.3 --fresh-base <T> --retention 3d; done
+```
 
 ## 7. Caveats — read before quoting numbers
 
@@ -251,6 +275,11 @@ merely records vacuums in progress at timing start and end.
     backlog. Once Cleanup has run, a pid keeps about one old-enough snapshot (younger ones are
     excluded before `$limit`), so a Mongo page is ~100 pids too and per page is the equal-work
     comparison.
+12. The C1 payload what-if is not production. Ditto's `getNewestSnapshotsAbove` fetches the payload; the what-if
+    sizes what a payload-free cleanup page would save in TOAST reads, `jsonb_out`, transfer and pgjdbc row
+    handling. Production would also skip decoding and JSON-parsing the payloads; the evidence estimates that with
+    pgjdbc and ditto-json, not through r2dbc. The comparison with Mongo uses the 2026-10-02 Mongo run (not
+    re-run; one backend at a time; that PG anchor ran on schema v2, this run on v3).
 
 ## 8. Presenting this
 

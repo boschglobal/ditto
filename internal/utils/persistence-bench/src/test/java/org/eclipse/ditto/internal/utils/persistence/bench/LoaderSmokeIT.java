@@ -204,6 +204,24 @@ public final class LoaderSmokeIT {
                             .noneMatch(e -> e.pid().equals(gen.pid(fresh)));
                 }
             }
+            // NOT PRODUCTION what-if: the same pages without the payload; the decoded read; the payload size helper
+            try (PreparedStatement ps = connection.prepareStatement(
+                    CleanupShapeBench.PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION)) {
+                for (final String lb : lowerBounds) {
+                    assertThat(CleanupShapeBench.pgPage(ps, lb, Duration.ZERO, limit))
+                            .isEqualTo(oracle.pgPage(lb, false, limit));
+                    assertThat(CleanupShapeBench.pgPage(ps, lb, RETENTION, limit))
+                            .isEqualTo(oracle.pgPage(lb, true, limit));
+                }
+            }
+            try (PreparedStatement ps = connection.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE)) {
+                assertThat(CleanupShapeBench.pgPageDecoded(ps, "", RETENTION, limit))
+                        .isEqualTo(oracle.pgPage("", true, limit));
+            }
+            final long[] rowsAndBytes = CleanupShapeBench.pgPagePayloadBytes(connection, "", RETENTION, limit);
+            assertThat(rowsAndBytes[0]).isEqualTo(limit);
+            // corpus snapshots carry 2-10 KB of JSON each (CorpusGenerator targetBytes)
+            assertThat(rowsAndBytes[1]).isGreaterThan(limit * 1_024L);
         }
 
         final String mongoUri = "mongodb://" + mongo.getHost() + ":" + mongo.getMappedPort(27017);

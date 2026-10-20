@@ -147,8 +147,9 @@ public final class PersistenceShapes {
 
     /**
      * A deterministic, unique {@code _id} for a corpus snapshot whose embedded timestamp is the
-     * snapshot's write time. In production the driver generates {@code _id} at insert time, so its
-     * timestamp IS the write time, and that is what the cleanup min-age filter reads
+     * snapshot's write time. In production mongod generates {@code _id} when pekko-persistence-mongodb's
+     * snapshot upsert ({@code replaceOne(…, upsert = true)}) inserts the document, so its timestamp IS the
+     * write time, and that is what the cleanup min-age filter reads
      * ({@code MongoReadJournal}: {@code _id < ObjectId.getSmallestWithDate(now - minAge)}), not
      * {@code ts}. Layout: 4-byte epoch seconds, 4-byte pid index, 4-byte sn.
      */
