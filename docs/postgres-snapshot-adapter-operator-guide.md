@@ -274,6 +274,16 @@ full annotated example.
 
 ---
 
+## Vacuum, bloat and disk space
+
+Background cleanup deletes old events and snapshots with `DELETE`. PostgreSQL removes the deleted rows only
+when it vacuums the table, and the table files keep their size. How cleanup creates dead rows, the autovacuum
+settings the schema applies, server settings, monitoring queries and alert thresholds, the manual `VACUUM`
+after a mass prune, and reclaiming disk space (`pg_repack`, `VACUUM FULL`) are described in
+`documentation/src/main/resources/pages/ditto/installation-extending.md`, section "Operating PostgreSQL".
+
+---
+
 ## Known limitations
 
 * **Differences from the MongoDB backend and the schema self-heal** (stored JSON key order, U+0000,

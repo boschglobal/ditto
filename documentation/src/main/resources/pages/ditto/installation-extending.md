@@ -158,6 +158,8 @@ MongoDB remains the default — this is strictly opt-in.
 
 **PostgreSQL version:** PostgreSQL 16 or newer (tested: 16, 17, 18). Older versions log a warning at startup, but the service still starts; technically, persistence needs PostgreSQL ≥ 10 and search PostgreSQL ≥ 13.
 
+**Operations:** for vacuum, table bloat, monitoring and reclaiming disk space after cleanup, see [Operating PostgreSQL](#operating-postgresql).
+
 #### 1. Provide the extension JARs
 
 The extension JARs are **not** included in the default Ditto images.
@@ -247,7 +249,7 @@ Snapshot encoding switches automatically when the Postgres backend is active —
 
 Schema tables are created automatically on first boot.
 
-**Schema check at every start.** Each PostgreSQL-backed service checks its schema at start, in one transaction. When the stored schema version and checksum match the code and every table and index of the schema exists, it runs no DDL, so it takes no table lock that writes or index builds conflict with. Otherwise (first start, a schema upgrade, or a missing table or index) it runs the schema DDL, which re-creates what is missing; each statement then waits at most 500 ms for a table lock (`lock_timeout`). A start that meets a conflicting lock — for example a running `CREATE INDEX CONCURRENTLY`, a long transaction or an autovacuum of that table — fails after about half a second without changing anything and is retried at the next start, instead of stalling writes. As a consequence, a manually dropped table or index is re-created at the next start, but a table storage parameter changed by hand (for example `ALTER TABLE … RESET (autovacuum_vacuum_scale_factor)`) is not re-applied until the next schema version upgrade or a [self-heal](#schema-self-heal) that runs the DDL; set it back by hand if needed.
+**Schema check at every start.** Each PostgreSQL-backed service checks its schema at start, in one transaction. When the stored schema version and checksum match the code and every table and index of the schema exists, it runs no DDL, so it takes no table lock that writes or index builds conflict with. Otherwise (first start, a schema upgrade, or a missing table or index) it runs the schema DDL, which re-creates what is missing; each statement then waits at most 500 ms for a table lock (`lock_timeout`). A start that meets a conflicting lock — for example a running `CREATE INDEX CONCURRENTLY`, a long transaction or an autovacuum of that table — fails after about half a second without changing anything and is retried at the next start, instead of stalling writes. As a consequence, a manually dropped table or index is re-created at the next start, but a table storage parameter changed by hand (for example `ALTER TABLE … RESET (autovacuum_vacuum_scale_factor)`) is not re-applied until the next schema version upgrade or a [self-heal](#schema-self-heal) that runs the DDL; set it back by hand if needed (see [Autovacuum settings applied by the schema](#autovacuum-settings-applied-by-the-schema)).
 
 **Waiting for PostgreSQL at start.** A PostgreSQL-backed service (policies, things, connectivity, and things-search on PostgreSQL) that cannot reach PostgreSQL when it starts retries its schema check with backoff (1 s doubling to 10 s, ±20 % jitter, one WARN per attempt) for up to `ditto.postgresql.bootstrap.retry.max-duration` (`POSTGRES_BOOTSTRAP_RETRY_MAX_DURATION`, default `60s`; `0s` waits without limit). It retries only when the connection is refused, times out or is reset, the host name does not resolve yet, or the server answers that it is starting up or shutting down (SQLSTATE `57P03`, `57P01`, `57P02`) or has no free connection slot (`53300`). Everything else fails the start at once: schema drift, an incompatible schema version or an unsuitable search database, TLS and certificate errors, wrong credentials or a missing role (`28000`, `28P01`), an unknown database (`3D000`), PgBouncer's own errors (`08P01`), a DDL lock timeout (`55P03`), and an attempt that connects but does not finish within `ditto.postgresql.bootstrap.attempt-timeout` (`POSTGRES_BOOTSTRAP_ATTEMPT_TIMEOUT`, default `60s`): usually another session holds the schema advisory lock, and the error names the `pg_locks` query that shows it; behind PgBouncer a PostgreSQL that is down looks the same. When the start finally fails, the service stops (coordinated shutdown, exit code 1), so that Docker Compose (`restart`) or Kubernetes restarts it instead of leaving it running without its root actor; `ditto.postgresql.bootstrap.exit-on-failure = false` (`POSTGRES_BOOTSTRAP_EXIT_ON_FAILURE`) keeps the JVM running. A shutdown (SIGTERM) during the wait ends it at once. `ditto.postgresql.bootstrap.retry.enabled = false` (`POSTGRES_BOOTSTRAP_RETRY_ENABLED`) makes a single attempt. On Kubernetes, keep `max-duration` below the liveness budget: with the Helm chart's probes (liveness from 60 s, 6 failures 10 s apart) a pod is restarted about 110 s after its container started, and the wait only begins once the service has joined the cluster. The wait covers the start only; an outage while the service runs is handled as before.
 
@@ -304,6 +306,8 @@ Thing-search can **optionally** run its search index on PostgreSQL instead of Mo
 **PostgreSQL version:** PostgreSQL 16 or newer (tested: 16, 17, 18). Older versions log a warning at startup, but the service still starts; technically, persistence needs PostgreSQL ≥ 10 and search PostgreSQL ≥ 13 (from 13 on, `pg_trgm` is a trusted extension, see [Prerequisites](#prerequisites-migration-and-known-limitations)).
 
 **Database encoding and locale:** the search database must be UTF8-encoded, with a UTF-8-based `LC_CTYPE` (e.g. `C.UTF-8` or `en_US.UTF-8`) and the libc collation `C.utf8`. The search service checks this at every start, before it touches the schema, and refuses to start otherwise; CloudNativePG's `initdb` default `LC_CTYPE` `C` does not qualify. See [Prerequisites](#prerequisites-migration-and-known-limitations).
+
+**Operations:** for vacuum, table bloat and monitoring of the search tables, see [Operating PostgreSQL](#operating-postgresql).
 
 #### 1. Provide the extension JARs
 
@@ -542,7 +546,7 @@ Postgres-side override of any background-sync or stream setting.
 
 ### Operating PostgreSQL
 
-Runtime behaviour of the PostgreSQL backends that matters when you operate them. Provisioning, TLS, the connection budget, PgBouncer, schema upgrades and the persistence ping are described in the runbook `deployment/postgres/README.md`.
+Runtime behaviour of the PostgreSQL backends that matters when you operate them. Provisioning, TLS, the connection budget, PgBouncer, schema upgrades and the persistence ping are described in the runbook `deployment/postgres/README.md`. Vacuum, table bloat and disk space are covered from [Dead rows and autovacuum](#dead-rows-and-autovacuum) on.
 
 #### Schema self-heal
 
@@ -586,6 +590,214 @@ The PostgreSQL backends behave like the MongoDB ones except for the following po
 * **Search: MongoDB-only settings** (index hints, custom MongoDB search indexes) are ignored with a WARN, see [Prerequisites, migration and known limitations](#prerequisites-migration-and-known-limitations).
 * **Search: purged namespaces stay findable for a while**, as on MongoDB. Search queries do not filter the things a namespace purge has marked for deletion; they disappear when they are removed: on PostgreSQL by a reaper every 30 s (`ditto.postgresql.search.reaper.interval`), at most `batch-size` × `max-batches-per-tick` (50,000 by default) per run; on MongoDB by its TTL index. A deleted thing disappears at once on both backends.
 * **Search: no runtime self-heal**, see [Schema self-heal](#schema-self-heal).
+
+#### Dead rows and autovacuum
+
+PostgreSQL does not remove a deleted row at once. The row stays in the table and in its indexes as a dead row until a `VACUUM` (normally autovacuum) processes the table; the space then becomes free for new rows of the same table, but the files keep their size. Dead rows that pile up ("bloat") make tables, indexes and backups larger and reads of the affected entities slower. This and the following sections describe how Ditto's cleanup creates dead rows, which autovacuum settings the schemas apply, the server settings that decide whether autovacuum keeps up, what to monitor, and how to get disk space back after a large prune.
+
+The persistence services use the tables `<entity>_journal` (events), `<entity>_snaps` (snapshots) and `<entity>_journal_seq` (highest sequence number per entity) for the entities `things`, `policies`, `connections` and `wot`; every persistence service creates all twelve. The search service uses `search_things`, `search_flat` and `search_sync`. With the provisioning script `deployment/postgres/provisioning/01-roles-and-grants.sql` the tables are in the schema `ditto`, which is on the `search_path` of both Ditto roles. Run the statements below on the primary, in the Ditto database.
+
+#### How cleanup creates dead rows
+
+* **What is deleted.** The background cleanup of each persistence service deletes, entity by entity, the events and snapshots that are older than `history-retention-duration` and no longer needed to recover the entity (it keeps the newest snapshot older than that, and everything after it). It deletes with plain `DELETE` statements, so every deleted event or snapshot becomes a dead row.
+* **Pace.** Every `interval`, each service instance gets `credits-per-batch` credits; one credit is one `DELETE` of at most `writes-per-credit` events or snapshots of one entity. An instance therefore deletes at most `credits-per-batch × writes-per-credit / interval` rows per second:
+
+  | Service | Configuration defaults (`history-retention-duration`, `interval`, `credits-per-batch`, `writes-per-credit`) | Rows/s per instance | Helm chart values | Rows/s per instance |
+  |---|---|---|---|---|
+  | things | `3d`, `3s`, `3`, `100` | ≤ 100 | `30d`, `1s`, `5`, `100` | ≤ 500 |
+  | policies | `30d`, `10s`, `3`, `100` | ≤ 30 | `30d`, `1s`, `5`, `100` | ≤ 500 |
+  | connectivity | `30d`, `60s`, `1`, `100` | ≤ 1.7 | `30d`, `10s`, `1`, `100` | ≤ 10 |
+
+  The instances of a service share the entities between them, so the cluster deletes up to the sum over its instances. The pace is a ceiling: a credit spent on snapshots, or on the last events of an entity, deletes fewer rows. The credits are the only throttle: the pace does not adapt to the database load (the `timer-threshold` setting does not currently lower it). The environment variables are `CLEANUP_HISTORY_RETENTION_DURATION`, `CLEANUP_INTERVAL`, `CLEANUP_CREDITS_PER_BATCH` and `CLEANUP_WRITES_PER_CREDIT`; the Helm chart sets the values under `<service>.config.cleanup`. The counters `cleanup_delete_events` and `cleanup_delete_snapshots` show what cleanup actually deletes.
+* **At the paced rate, autovacuum keeps up.** With the schema's scale factor of 1 % (see [Autovacuum settings applied by the schema](#autovacuum-settings-applied-by-the-schema)), autovacuum starts on a journal of 35 million rows after about 350,000 dead rows: at 100 rows/s, about once an hour. In the persistence benchmark, two hours of cleanup at the things default pace deleted 56 rows/s on average; autovacuum started on `things_journal` after about 1 hour 45 minutes, and one short run brought its dead rows back down.
+* **Search tables.** Every thing change replaces the thing's `search_things` row and its changed `search_flat` rows, so the search tables collect dead rows from normal updates, without any cleanup. The same monitoring applies.
+* **A mass prune is an operator-induced worst case.** The following delete far faster than the paced cleanup:
+  * raising the pace, in the configuration or at runtime with the DevOps command that [modifies the background cleanup configuration](installation-operating.html#modify-background-cleanup-coordinator-configuration) (it applies until the next restart);
+  * shortening `history-retention-duration`, or enabling cleanup for the first time, on a database with a large backlog;
+  * the [cleanup command for single entities](installation-operating.html#cleanup-events-and-snapshots-of-an-entity) sent for many entities, and [erasing the data of a namespace](installation-operating.html#erase-all-data-in-a-namespace-from-the-persistence), which deletes all of its rows at once.
+
+  In the persistence benchmark (250,000 things with 35 million events, PostgreSQL 16 with default vacuum settings), an unthrottled sweep deleted 22 million events and 36,000 snapshots in about 14 minutes (about 26,000 rows/s; at the things default pace it would take more than four days). With the schema's settings, autovacuum ran on `things_journal` again and again during the sweep and had finished within a minute after it; with the scale factor alone and PostgreSQL's default vacuum speed, it took about 50 minutes. Neither made the files smaller: `things_journal` kept its size of about 38 GB for the 13 million events left. Evidence: `internal/utils/persistence-bench/benchmark/README.md`, section 5. What to do after a mass prune: [After a mass prune](#after-a-mass-prune).
+
+#### Autovacuum settings applied by the schema
+
+The schema bootstrap sets these storage parameters on the tables Ditto deletes from or updates heavily:
+
+| Tables | `autovacuum_vacuum_scale_factor` | `autovacuum_vacuum_cost_limit` |
+|---|---|---|
+| `<entity>_journal`, `<entity>_snaps` for `things`, `policies`, `connections`, `wot` | `0.01` | `2000` |
+| `<entity>_journal_seq` for the same entities | `0.01` | not set |
+| `search_things` (its TOAST table, which holds the thing documents, inherits the value), `search_flat` | `0.01` | not set |
+| `search_sync` | not set | not set |
+| Not set means the server's setting; PostgreSQL's defaults: | `0.2` | `-1`, which means `vacuum_cost_limit` (`200`) |
+
+* **Scale factor.** Autovacuum processes a table once its dead rows exceed `autovacuum_vacuum_threshold` (default 50) plus the scale factor times its rows, so after 1 % instead of 20 %. (PostgreSQL 18 also caps that number at `autovacuum_vacuum_max_threshold`, 100 million by default.)
+* **Cost limit.** Autovacuum sleeps for `autovacuum_vacuum_cost_delay` (default `2ms`) each time it has used up its cost limit; reading a page from disk costs 2 and dirtying a page 20. With `2000` instead of the default `200`, a vacuum of a journal or snapshot table may read and write ten times as much per second, up to about 390 MiB of dirtied pages per second instead of about 39 MiB, so it finishes these large tables soon after a prune (see the benchmark numbers above). A table with its own cost limit is left out of the sharing of the server's budget between autovacuum workers: every worker on such a table uses the whole `2000`, so with the default three workers up to three times that at once. While such a vacuum runs, it competes with Ditto's statements for I/O: watch the storage latency and the duration of Ditto's PostgreSQL statements (`ditto_persistence_command_duration`) while these tables are vacuumed, and slow the vacuums down if the storage cannot take it (see "Changing them" below).
+* Every other autovacuum setting, including the memory, comes from the server, see [Server settings for vacuum](#server-settings-for-vacuum).
+* To see the parameters a table has:
+
+  ```sql
+  SELECT c.relname AS table_name, c.reloptions
+  FROM pg_class c
+  WHERE c.relkind = 'r'
+    AND (c.relname ~ '^(things|policies|connections|wot)_(journal|journal_seq|snaps)$'
+         OR c.relname IN ('search_things', 'search_flat', 'search_sync'))
+  ORDER BY c.relname;
+  ```
+
+* **Changing them.** No Ditto configuration overrides these values: they are part of the schema DDL, whose checksum each service compares at start (see **Schema check at every start** in [PostgreSQL persistence backend](#postgresql-persistence-backend)). The checksum covers the DDL text, not the tables' current parameters, so a change made with `ALTER TABLE` is neither detected nor a reason to refuse a start. What happens to such a change:
+  * A start that runs no DDL (the normal case: same schema version, every table and index present) keeps it.
+  * A start that runs the schema DDL (a schema upgrade, a missing table or index), and a persistence [self-heal](#schema-self-heal) that runs it, set every parameter of the table above back to the schema's value. Parameters the schema does not set, such as `autovacuum_vacuum_cost_delay` or `autovacuum_vacuum_threshold`, stay: `ALTER TABLE … SET` only changes the parameters it names.
+
+  So prefer the server settings. To change a single table, use a parameter the schema does not set: for example, to slow down the vacuums of a journal, raise its `autovacuum_vacuum_cost_delay` (`4` milliseconds about halves its budget) rather than lowering its cost limit, which the next DDL run would set back to `2000`. Run the statement as the owner of the table (the DDL role, e.g. `ditto_ddl`), and check the parameters again after each Ditto upgrade. Changing an autovacuum parameter does not rewrite the table and does not block reads or writes. It waits for a running manual `VACUUM` of that table, while a running autovacuum of it is interrupted (unless it runs to prevent transaction ID wraparound):
+
+  ```sql
+  ALTER TABLE things_journal SET (autovacuum_vacuum_cost_delay = 4);
+  ALTER TABLE things_journal RESET (autovacuum_vacuum_cost_delay);
+  ```
+
+#### Server settings for vacuum
+
+Server settings apply to all tables of the PostgreSQL server. Set them in `postgresql.conf`, with `ALTER SYSTEM`, or, on a managed service such as Amazon RDS, Azure Database for PostgreSQL or Google Cloud SQL, in its server parameters.
+
+* **Memory for dead rows: `autovacuum_work_mem` and `maintenance_work_mem`.** A vacuum collects the ids of a table's dead rows in memory; each time that memory is full, and once at the end, it cleans every index of the table. On PostgreSQL 16 one dead row takes 6 bytes, so the default (`autovacuum_work_mem = -1`, which means `maintenance_work_mem`, `64MB`) holds about 11.2 million dead rows, and a table with more makes the vacuum read all of its indexes more than once. In the benchmark sweep above, the vacuum with the scale factor alone met about 15 million dead rows in `things_journal` and cleaned its indexes twice. Set `autovacuum_work_mem` to at least the largest number of dead rows you expect in one table times 6 bytes, with room to spare: `256MB` holds about 44 million, twice the sweep above. PostgreSQL 16 uses at most `1GB` (about 179 million dead rows) per vacuum, whatever the setting. Every autovacuum worker may use that much at the same time (three workers with `256MB`: 768 MB). PostgreSQL 17 and later store dead row ids more compactly and have no 1GB limit. `maintenance_work_mem` is also used by manual `VACUUM` and by index builds such as the per-path search indexes, so set `autovacuum_work_mem` on its own rather than raising `maintenance_work_mem` for everything.
+* **Workers: `autovacuum_max_workers`** (default 3). A worker vacuums one table at a time; after a mass prune, the vacuum of a large journal keeps one worker busy for its whole duration while the others go on with the remaining tables. Keep the default unless the monitoring below shows tables waiting: several tables above their `autovacuum_starts_at` while every worker is busy. Each further worker adds memory (`autovacuum_work_mem`) and, on the journal and snapshot tables, I/O (their own `2000`). Changing it needs a server restart on PostgreSQL 16 and 17; PostgreSQL 18 applies it on reload, up to `autovacuum_worker_slots`.
+* **Speed of the other tables: `autovacuum_vacuum_cost_limit` and `autovacuum_vacuum_cost_delay`.** Tables without their own cost limit (the `<entity>_journal_seq` tables, the search tables and every other table of the server) share the server's budget: `autovacuum_vacuum_cost_limit` (default `-1`, which means `vacuum_cost_limit`, `200`) per `autovacuum_vacuum_cost_delay` (default `2ms`). That limits their workers together to about 50,000 pages read from disk (about 390 MiB) or 5,000 pages dirtied (about 39 MiB) per second; more workers do not vacuum them faster. If autovacuum falls behind on such a table and its worker mostly waits in `VacuumDelay` (see [Monitoring vacuum and table growth](#monitoring-vacuum-and-table-growth)) while the storage has headroom, raise `autovacuum_vacuum_cost_limit` in steps and watch the storage latency and Ditto's statement durations. If it mostly waits for I/O instead, a higher limit does not help. The journal and snapshot tables keep their `2000` whatever the server's cost limit, but they use the server's `autovacuum_vacuum_cost_delay`.
+
+  ```sql
+  ALTER SYSTEM SET autovacuum_work_mem = '256MB';
+  SELECT pg_reload_conf();
+  SELECT name, setting, unit, context, pending_restart
+  FROM pg_settings
+  WHERE name IN ('autovacuum_work_mem', 'maintenance_work_mem', 'autovacuum_max_workers',
+                 'autovacuum_vacuum_cost_limit', 'autovacuum_vacuum_cost_delay', 'vacuum_cost_limit');
+  ```
+
+  The value is an example. A setting whose `context` is `postmaster` takes effect only after a restart (`pending_restart` shows a change that waits for one).
+
+#### Monitoring vacuum and table growth
+
+Ditto does not export per-table database metrics. Read them from PostgreSQL's statistics views, with your PostgreSQL monitoring (for example the Prometheus `postgres_exporter`) or with the queries below. Run them on the primary as a role with the privileges of `pg_monitor`, or as a superuser: other roles do not see the details of other users' sessions.
+
+**Per table:** dead rows, the number of dead rows at which autovacuum starts, the last vacuums, and the sizes:
+
+```sql
+SELECT s.relname                                          AS table_name,
+       s.n_live_tup,
+       s.n_dead_tup,
+       round(100.0 * s.n_dead_tup / nullif(s.n_live_tup + s.n_dead_tup, 0), 1) AS dead_pct,
+       ceil(coalesce(o.threshold, current_setting('autovacuum_vacuum_threshold')::float8)
+            + coalesce(o.scale_factor, current_setting('autovacuum_vacuum_scale_factor')::float8)
+              * greatest(c.reltuples, 0))                 AS autovacuum_starts_at,
+       s.last_autovacuum,
+       s.last_vacuum,
+       s.autovacuum_count,
+       pg_size_pretty(pg_table_size(s.relid))             AS table_size,
+       pg_size_pretty(pg_indexes_size(s.relid))           AS index_size
+FROM pg_stat_user_tables s
+JOIN pg_class c ON c.oid = s.relid
+CROSS JOIN LATERAL (
+    SELECT max(option_value) FILTER (WHERE option_name = 'autovacuum_vacuum_scale_factor')::float8 AS scale_factor,
+           max(option_value) FILTER (WHERE option_name = 'autovacuum_vacuum_threshold')::float8    AS threshold
+    FROM pg_options_to_table(c.reloptions)) o
+WHERE s.relname ~ '^(things|policies|connections|wot)_(journal|journal_seq|snaps)$'
+   OR s.relname IN ('search_things', 'search_flat', 'search_sync')
+ORDER BY s.n_dead_tup DESC;
+```
+
+* `n_dead_tup` well above `autovacuum_starts_at` for a long time means that autovacuum does not keep up, or cannot remove the dead rows (see below).
+* The counters are estimates. They start again from zero after a crash or a statistics reset.
+
+**Running vacuums**, with their progress and what they wait for:
+
+```sql
+SELECT p.pid,
+       p.relid::regclass    AS table_name,
+       a.backend_type,
+       p.phase,
+       p.heap_blks_scanned,
+       p.heap_blks_total,
+       p.index_vacuum_count,
+       now() - a.xact_start AS running_for,
+       a.wait_event_type,
+       a.wait_event
+FROM pg_stat_progress_vacuum p
+JOIN pg_stat_activity a USING (pid);
+```
+
+* `wait_event` `VacuumDelay`: the vacuum sleeps because of its cost limit; the cost settings limit its speed.
+* I/O wait events such as `DataFileRead`: the storage limits its speed.
+* `index_vacuum_count` above 1 on PostgreSQL 16: the dead row ids did not fit into `autovacuum_work_mem` (`maintenance_work_mem` for a manual `VACUUM`), and every further pass reads all indexes of the table again.
+* A poll of this view misses short runs. To have the server log every autovacuum run with its duration, index passes and removed rows, lower `log_autovacuum_min_duration` (PostgreSQL 15 and later log only runs longer than 10 minutes by default):
+
+  ```sql
+  ALTER SYSTEM SET log_autovacuum_min_duration = '10s';
+  SELECT pg_reload_conf();
+  ```
+
+**Dead rows that vacuum cannot remove.** A vacuum removes only rows that were deleted before the oldest snapshot still in use. A long-running or forgotten transaction, a replication slot that nobody reads any more (or a standby with `hot_standby_feedback`), or an abandoned prepared transaction keeps every newer dead row of the database in place; `VACUUM VERBOSE` then reports them as "dead but not yet removable". To find the cause:
+
+```sql
+SELECT pid, usename, backend_type, state,
+       now() - xact_start AS transaction_age,
+       age(backend_xmin)  AS xmin_age,
+       left(query, 80)    AS query
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+ORDER BY age(backend_xmin) DESC
+LIMIT 5;
+
+SELECT slot_name, active, xmin, catalog_xmin FROM pg_replication_slots;
+
+SELECT gid, prepared, owner FROM pg_prepared_xacts;
+```
+
+**Example alert thresholds** (starting points; tune them to your load):
+
+| Condition | Example threshold | What it indicates |
+|---|---|---|
+| `n_dead_tup` above 5 × `autovacuum_starts_at` | for more than 1 hour | autovacuum does not keep up, or cannot remove the rows |
+| `dead_pct` of a journal or snapshot table above 20 | for more than 1 hour | bloat is building up |
+| `last_autovacuum` older than 24 hours while `n_dead_tup` is above `autovacuum_starts_at` | — | autovacuum does not get to the table (workers busy, lock conflicts) |
+| a row in `pg_stat_progress_vacuum` | running for more than 6 hours, or `index_vacuum_count` of 2 or more on PostgreSQL 16 | vacuum too slow, or too little memory |
+| oldest `transaction_age` | more than 1 hour | a transaction holds back the removal of dead rows in the whole database |
+| table plus index size | grows by more than 20 % a week while `n_live_tup` does not | bloat; plan [reclaiming disk space](#reclaiming-disk-space) |
+| free disk | less than the size of the largest table plus its indexes | no room left to rewrite a table |
+
+#### After a mass prune
+
+After a mass prune, vacuum and analyze the pruned tables by hand rather than waiting for autovacuum. If autovacuum has already caught up (with the schema's settings it usually does soon, in the benchmark above within a minute), this takes little time; otherwise it finishes the work at once. It also brings the planner statistics up to date, and its output shows whether something holds back the removal of dead rows. For example, after shortening the retention of things:
+
+```sql
+SET maintenance_work_mem = '1GB';
+VACUUM (VERBOSE, ANALYZE) things_journal;
+VACUUM (VERBOSE, ANALYZE) things_snaps;
+```
+
+* Run it as the owner of the tables (the DDL role, e.g. `ditto_ddl`) or as a superuser; on PostgreSQL 17 and later also as a role with the privileges of `pg_maintain`. The runtime role (`ditto_app`) may not vacuum the tables: PostgreSQL skips them with a warning. `VACUUM` cannot run inside a transaction, and the role should have no `statement_timeout` (the provisioning script sets none for the DDL role).
+* It does not block reads and writes. For as long as it runs, it blocks another vacuum of the same table, a Ditto start that has to run schema DDL (that start fails after 500 ms and is retried at the next start, so do not vacuum by hand during an upgrade that changes the schema), and `CREATE INDEX CONCURRENTLY` on that table, for example a per-path search index build on `search_flat`.
+* A manual `VACUUM` is not throttled by default (`vacuum_cost_delay = 0`). On a busy database, throttle it with `SET vacuum_cost_delay = '2ms';` (it then uses `vacuum_cost_limit`, `200` by default, per 2 ms).
+* In the `VERBOSE` output, `index scans:` above 1 on PostgreSQL 16 means that `maintenance_work_mem` was too small, and "N are dead but not yet removable" with N above 0 means that something holds back the removal (see the queries above).
+* Do not use `VACUUM FULL` for this: it locks the table exclusively, see the next section. A plain `VACUUM` makes the space reusable for new rows; the files keep their size, except for empty pages at their end.
+
+#### Reclaiming disk space
+
+Usually there is no need: once cleanup has caught up and the tables are vacuumed regularly, new rows reuse the freed space and the tables stop growing. Reclaim space when you need the disk back, for example after a one-time reduction of the retention. In the benchmark, `things_journal` (table and indexes) still took 38,319 MB after the sweep; rewriting it brought it down to 14,362 MB (its indexes from 2,047 to 761 MB), and `things_snaps` from 294 to 59 MB.
+
+Two ways to rewrite a table:
+
+* **`pg_repack` (online).** The [pg_repack](https://reorg.github.io/pg_repack/) extension rebuilds a table and its indexes into a new copy while Ditto keeps reading and writing; it takes an exclusive lock only briefly, at the start and at the end. It needs the extension in the database (`CREATE EXTENSION pg_repack;`), the `pg_repack` client of the same version, run as a superuser (managed services that offer pg_repack describe how to run it with their admin role), a primary key on the table (every Ditto table has one), and free disk for a full copy of the table and its indexes plus the changes made meanwhile. For example (with your connection options):
+
+  ```shell
+  pg_repack --dbname=ditto --table=ditto.things_journal
+  ```
+
+* **`VACUUM FULL` (offline).** Built into PostgreSQL. It rewrites the table and its indexes under an exclusive lock: every read and write of the table waits until it is done, so writes and recoveries of the entities in that table stall and time out meanwhile (for `things_journal`: every change of a thing). Plan a maintenance window. It needs the same free disk as `pg_repack`.
+
+  ```sql
+  VACUUM (FULL, VERBOSE, ANALYZE) things_journal;
+  ```
+
+Both keep the table's storage parameters. Do not run either during a Ditto upgrade that changes the schema. The search index can also be rebuilt from scratch instead: point the search service at a new, empty database and let it re-index, see [Prerequisites, migration and known limitations](#prerequisites-migration-and-known-limitations).
 
 ## Further reading
 

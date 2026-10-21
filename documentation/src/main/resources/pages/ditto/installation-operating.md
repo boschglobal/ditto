@@ -1833,8 +1833,12 @@ cleanup {
 }
 ```
 
-By default, background cleanup is enabled for all entities and the retention duration is configured to `0d` (0 days), 
-meaning that no history will be kept for a longer time.
+By default, background cleanup is enabled for all entities. The retention duration (`history-retention-duration`)
+is `3d` (3 days) for things and `30d` (30 days) for policies and connectivity; the Helm chart sets `30d` for all
+three (`<service>.config.cleanup.history.retentionDuration`).
+
+On PostgreSQL, deleted events and snapshots take disk space until the tables are vacuumed, see
+[Operating PostgreSQL](installation-extending.html#dead-rows-and-autovacuum).
 
 In order to use Ditto's [history capabilities](basic-history.html), the configuration has to be adjusted accordingly.
 

@@ -21,6 +21,12 @@ backend; `thingsearch` can use the separate PostgreSQL search backend
 shares the client and pool settings and counts toward the same
 [connection budget](#connection-budget).
 
+Vacuum, table bloat and disk space (how cleanup creates dead rows, the autovacuum
+settings of the schemas, server settings, monitoring queries and alert thresholds,
+`VACUUM` after a mass prune, `pg_repack` and `VACUUM FULL`) are described in
+`documentation/src/main/resources/pages/ditto/installation-extending.md`, section
+"Operating PostgreSQL".
+
 Contents:
 
 - `provisioning/01-roles-and-grants.sql` — two-role provisioning (run once as
@@ -511,7 +517,9 @@ next one through.
 
 Consequence of the same-version rule: a manually dropped table or index is re-created at the next start, but a
 manually changed or reset reloption (e.g. `autovacuum_vacuum_scale_factor`) is not re-applied until the next
-schema version bump or a self-heal that runs the DDL.
+schema version bump or a self-heal that runs the DDL. Which storage parameters the schemas set, and which manual
+changes a DDL run sets back: "Autovacuum settings applied by the schema" in the section "Operating PostgreSQL" of
+`installation-extending.md`.
 
 A row written before the `min_compatible_version` column existed has it `NULL`, which counts as
 `min_compatible_version = version`. The first boot of an image with this check adds the column and
