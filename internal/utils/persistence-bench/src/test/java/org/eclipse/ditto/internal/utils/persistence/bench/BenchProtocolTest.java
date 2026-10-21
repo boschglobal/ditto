@@ -15,11 +15,13 @@ package org.eclipse.ditto.internal.utils.persistence.bench;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.bson.Document;
 import org.junit.Test;
 
 public final class BenchProtocolTest {
@@ -183,5 +185,65 @@ public final class BenchProtocolTest {
     public void inlineLiteralsThrowsOnPlaceholderArgCountMismatch() {
         assertThatThrownBy(() -> BenchProtocol.inlineLiterals("SELECT ? , ?", "only-one"))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    public void inlineLiteralsRendersNullAsSqlNull() {
+        assertThat(BenchProtocol.inlineLiterals("INSERT INTO t VALUES (?, ?, ?)", "x", null, 7L))
+                .isEqualTo("INSERT INTO t VALUES ('x', NULL, 7)");
+    }
+
+    @Test
+    public void containersLineQuotesTheScriptOrSaysItIsMissing() {
+        assertThat(BenchProtocol.containersLine(""))
+                .isEqualTo("- containers: not recorded (not started through benchmark/run-benchmark.sh)\n");
+        assertThat(BenchProtocol.containersLine("ditto-persistence-bench-pg: cpus=4, memory=8 GiB, postgres -c x"))
+                .isEqualTo("- containers: ditto-persistence-bench-pg: cpus=4, memory=8 GiB, postgres -c x\n");
+    }
+
+    @Test
+    public void evidenceGoesToTheResultsFolderAndKeepsNestedNames() {
+        assertThat(Paths.get(BenchProtocol.DEFAULT_RESULTS_DIR))
+                .isEqualTo(Paths.get("src", "test", "resources", "bench", "results"));
+        assertThat(BenchProtocol.evidencePath("/tmp/x", "w3-latency/a.md"))
+                .isEqualTo(Paths.get("/tmp/x", "w3-latency", "a.md"));
+    }
+
+    @Test
+    public void deleteExplainCommandIsDeleteManyAsOneStatementWithLimitZero() {
+        final Document filter = new Document("pid", "p").append("to", new Document("$gte", 1L).append("$lte", 100L));
+        final Document command = BenchProtocol.deleteExplainCommand("things_journal", filter);
+        assertThat(command.getString("delete")).isEqualTo("things_journal");
+        final Document statement = command.getList("deletes", Document.class).get(0);
+        assertThat(statement.get("q")).isEqualTo(filter);
+        assertThat(statement.getInteger("limit")).isZero();          // 0 = every match, like deleteMany
+    }
+
+    @Test
+    public void updateExplainCommandIsReplaceOneWithUpsert() {
+        final Document filter = new Document("pid", "p").append("sn", 1L).append("ts", 5L);
+        final Document replacement = new Document("pid", "p").append("sn", 1L);
+        final Document statement = BenchProtocol.updateExplainCommand("things_snaps", filter, replacement)
+                .getList("updates", Document.class).get(0);
+        assertThat(statement.get("q")).isEqualTo(filter);
+        assertThat(statement.get("u")).isEqualTo(replacement);
+        assertThat(statement.getBoolean("upsert")).isTrue();
+        assertThat(statement.getBoolean("multi")).isFalse();
+    }
+
+    @Test
+    public void notExplainableNamesTheOperationInsideAFence() {
+        assertThat(BenchProtocol.mongoNotExplainable("insertOne"))
+                .startsWith("```\n").contains("not explainable: insertOne").endsWith("```\n");
+    }
+
+    @Test
+    public void writeCountersOfTheTopStageJoinTheSummary() {
+        final Document stats = new Document("executionStages",
+                new Document("stage", "DELETE").append("nWouldDelete", 99).append("inputStage", new Document()));
+        assertThat(BenchProtocol.writeCounters(stats)).isEqualTo(new Document("nWouldDelete", 99));
+        assertThat(BenchProtocol.writeCounters(new Document("executionStages", new Document("stage", "FETCH"))))
+                .isEmpty();
+        assertThat(BenchProtocol.writeCounters(new Document())).isEmpty();
     }
 }

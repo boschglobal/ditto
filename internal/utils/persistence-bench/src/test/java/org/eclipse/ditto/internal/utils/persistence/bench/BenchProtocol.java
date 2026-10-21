@@ -37,6 +37,8 @@ import com.mongodb.client.MongoDatabase;
  */
 public final class BenchProtocol {
 
+    static final String DEFAULT_RESULTS_DIR = "src/test/resources/bench/results";
+
     private BenchProtocol() {
     }
 
@@ -151,11 +153,17 @@ public final class BenchProtocol {
                 + "- generated: " + Instant.now() + "\n"
                 + "- corpus: count=" + BenchConfig.count() + " seed=" + BenchConfig.seed() + freshCorpusSuffix() + "\n"
                 + "- backend(s): " + BenchConfig.backend() + "\n"
+                + containersLine(BenchConfig.containerLimits())
                 + "- protocol: " + BenchConfig.warmups() + " warmup + " + BenchConfig.iterations()
                 + " timed executions, nearest-rank percentiles, pgjdbc prepareThreshold=0\n"
                 + "- cleanup defaults: reads-per-query=100, writes-per-credit=100 (DefaultCleanupConfig)\n"
                 + (label.isEmpty() ? "" : "- evidence label: " + label + "\n")
                 + "\n";
+    }
+
+    static String containersLine(final String limits) {
+        return "- containers: "
+                + (limits.isBlank() ? "not recorded (not started through benchmark/run-benchmark.sh)" : limits) + "\n";
     }
 
     /** Empty for the backdated corpus, so evidence headers of share-0 runs keep their format. */
@@ -215,22 +223,27 @@ public final class BenchProtocol {
     }
 
     public static void writeEvidence(final String fileName, final String content) {
-        final Path dir = Paths.get("src", "test", "resources", "bench", "results");
+        final Path file = evidencePath(BenchConfig.resultsDir(), fileName);
         try {
-            Files.createDirectories(dir.resolve(fileName).getParent());
-            Files.writeString(dir.resolve(fileName), content, StandardCharsets.UTF_8);
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, content, StandardCharsets.UTF_8);
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }
-        System.out.println("[bench] evidence written: " + dir.resolve(fileName));
+        System.out.println("[bench] evidence written: " + file);
+    }
+
+    /** {@code <dir>/<fileName>}; a name may contain a sub-folder (e.g. w3-latency/x.md). */
+    static Path evidencePath(final String dir, final String fileName) {
+        return Paths.get(dir).resolve(fileName);
     }
 
     /**
      * Renders a JDBC "?"-placeholder SQL template (e.g. a {@code PersistenceShapes} constant) with
      * positional literals substituted in, for {@link #pgExplain(Connection, String)} which requires
      * literals already inlined (EXPLAIN cannot bind parameters). Numbers ({@link Number} instances)
-     * render as plain text; everything else (String, OffsetDateTime, ...) is single-quoted with
-     * embedded single quotes doubled, e.g. "O'Brien" becomes 'O''Brien'. These SQL templates contain
+     * render as plain text; {@code null} renders as SQL NULL; everything else (String, OffsetDateTime, ...) is
+     * single-quoted with embedded single quotes doubled, e.g. "O'Brien" becomes 'O''Brien'. These SQL templates contain
      * no string literals with '?' in them, so counting '?' occurrences is an exact placeholder count.
      *
      * @throws IllegalArgumentException if the number of '?' placeholders differs from args.length
@@ -256,6 +269,9 @@ public final class BenchProtocol {
     }
 
     private static String renderLiteral(final Object arg) {
+        if (arg == null) {
+            return "NULL";
+        }
         if (arg instanceof Number) {
             return String.valueOf(arg);
         }
@@ -274,6 +290,33 @@ public final class BenchProtocol {
             sb.append("EXPLAIN failed: ").append(e.getMessage()).append('\n');
         }
         return sb.append("```\n").toString();
+    }
+
+    /**
+     * EXPLAIN (ANALYZE, BUFFERS) of one or more write statements inside ONE transaction that is always rolled back.
+     * ANALYZE executes the statements, so this shows a write's real plan on the bench corpus without changing it: the
+     * rollback discards the rows; what any aborted transaction leaves (a dead tuple per inserted row, a consumed
+     * identity value) stays. The plan shows the executor's work, not the commit's WAL flush. Pass SQL with literals
+     * inlined. A failing statement shows up as "EXPLAIN failed" (see pgExplain); the statements after it then report
+     * the aborted transaction. The connection's autocommit mode is restored.
+     */
+    public static String pgExplainRolledBack(final Connection connection, final String... sqlWithLiterals) {
+        final StringBuilder sb = new StringBuilder();
+        try {
+            final boolean autoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+            try {
+                for (final String sql : sqlWithLiterals) {
+                    sb.append(pgExplain(connection, sql));
+                }
+            } finally {
+                connection.rollback();
+                connection.setAutoCommit(autoCommit);
+            }
+        } catch (final SQLException e) {
+            throw new IllegalStateException("rolled-back EXPLAIN could not manage its transaction", e);
+        }
+        return sb.toString();
     }
 
     public static String mongoExplainFind(final MongoDatabase db, final String collection,
@@ -303,6 +346,47 @@ public final class BenchProtocol {
         return runExplain(db, aggregate);
     }
 
+    /** deleteMany(filter) as the explain command runs it; explain deletes nothing. */
+    public static String mongoExplainDelete(final MongoDatabase db, final String collection, final Document filter) {
+        return runExplain(db, deleteExplainCommand(collection, filter));
+    }
+
+    /** replaceOne(filter, replacement, upsert=true) as the explain command runs it; explain writes nothing. */
+    public static String mongoExplainReplaceUpsert(final MongoDatabase db, final String collection,
+            final Document filter, final Document replacement) {
+        return runExplain(db, updateExplainCommand(collection, filter, replacement));
+    }
+
+    /** For the write shapes MongoDB's explain command has no form for (insert, compact). */
+    public static String mongoNotExplainable(final String operation) {
+        return "```\nnot explainable: " + operation
+                + " (MongoDB's explain command has no insert or compact form) — timed only\n```\n";
+    }
+
+    static Document deleteExplainCommand(final String collection, final Document filter) {
+        return new Document("delete", collection)
+                .append("deletes", List.of(new Document("q", filter).append("limit", 0)));
+    }
+
+    static Document updateExplainCommand(final String collection, final Document filter, final Document replacement) {
+        return new Document("update", collection)
+                .append("updates", List.of(new Document("q", filter).append("u", replacement)
+                        .append("upsert", true).append("multi", false)));
+    }
+
+    /** nWouldDelete / nWouldModify / nWouldUpsert of a write explain's top stage; empty for reads. */
+    static Document writeCounters(final Document executionStats) {
+        final Document counters = new Document();
+        if (executionStats.get("executionStages") instanceof Document stages) {
+            for (final String key : List.of("nWouldDelete", "nWouldModify", "nWouldUpsert")) {
+                if (stages.containsKey(key)) {
+                    counters.append(key, stages.get(key));
+                }
+            }
+        }
+        return counters;
+    }
+
     private static String runExplain(final MongoDatabase db, final Document innerCommand) {
         try {
             final Document result = db.runCommand(
@@ -322,6 +406,7 @@ public final class BenchProtocol {
                         summary.append(key, executionStats.get(key));
                     }
                 }
+                summary.putAll(writeCounters(executionStats));
                 sb.append("// executionStats (summary)\n").append(summary.toJson(pretty)).append('\n');
             }
             if (queryPlanner == null && executionStats == null) {

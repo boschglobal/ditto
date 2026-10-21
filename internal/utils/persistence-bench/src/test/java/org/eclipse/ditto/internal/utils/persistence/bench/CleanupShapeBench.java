@@ -130,7 +130,7 @@ public final class CleanupShapeBench {
                                         PersistenceShapes.READS_PER_QUERY)));
             }
         }
-        BenchProtocol.writeEvidence("c1-pid-stream-page.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("c1-pid-stream-page"),
                 BenchProtocol.runHeader("C1 — cleanup pid-stream page (getNewestSnapshotsAbove, batch 100)")
                         + RecoveryBench.resultTable(List.of(
                                 RecoveryBench.sideBySide("one page, varying lower bound", pgT, mongoT)))
@@ -226,7 +226,7 @@ public final class CleanupShapeBench {
         }
 
         final String backendSuffix = "both".equals(BenchConfig.backend()) ? "" : "-" + BenchConfig.backend();
-        BenchProtocol.writeEvidence("c1-pid-stream-page-retention" + spec + backendSuffix + ".md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("c1-pid-stream-page-retention" + spec + backendSuffix),
                 BenchProtocol.runHeader("C1 — cleanup pid-stream page with the production min age (retention "
                         + spec + " vs 0, batch 100)")
                         + BenchProtocol.freshCorpusLine(gen)
@@ -658,6 +658,7 @@ public final class CleanupShapeBench {
 
         final List<List<String>> rows = new ArrayList<>();
         final StringBuilder notes = new StringBuilder();
+        final StringBuilder plans = new StringBuilder();
         for (final Object[] entry : List.of(new Object[]{"P99", p99}, new Object[]{"OUTLIER", outlier})) {
             final String label = (String) entry[0];
             @SuppressWarnings("unchecked") final List<Long> found = (List<Long>) entry[1];
@@ -669,14 +670,39 @@ public final class CleanupShapeBench {
 
             CleanupResultPair pgR = null;
             CleanupResultPair mongoR = null;
+            // one plan per class and backend: on the first warm-up pid before its (untimed) cleanup; without a warm-up
+            // pid (tiny corpora) after the loop on the last pid, whose backlog is gone by then
+            final boolean planBefore = warm > 0;
+            final long planIdx = found.isEmpty() ? -1L : (planBefore ? found.get(0) : found.get(found.size() - 1));
+            final String planWhen = planBefore ? "first warm-up pid, before its cleanup"
+                    : "last pid, after its cleanup (no warm-up pid at this scale)";
             if (BenchConfig.runPg()) {
                 try (Connection c = BenchConfig.openPg()) {
+                    String plan = planIdx >= 0 && planBefore
+                            ? ScenarioPlans.pgCleanupPid(c, gen.pid(planIdx), gen.latestSnapshotSn(planIdx)) : null;
                     pgR = pgCleanupClass(c, gen, found, warm);
+                    if (planIdx >= 0 && !planBefore) {
+                        plan = ScenarioPlans.pgCleanupPid(c, gen.pid(planIdx), gen.latestSnapshotSn(planIdx));
+                    }
+                    if (plan != null) {
+                        plans.append("### PG plan (").append(label).append(", ").append(planWhen)
+                                .append("; deletes rolled back)\n\n").append(plan).append('\n');
+                    }
                 }
             }
             if (BenchConfig.runMongo()) {
                 try (MongoClient client = BenchConfig.openMongo()) {
-                    mongoR = mongoCleanupClass(client.getDatabase(BenchConfig.mongoDbName()), gen, found, warm);
+                    final MongoDatabase db = client.getDatabase(BenchConfig.mongoDbName());
+                    String plan = planIdx >= 0 && planBefore
+                            ? ScenarioPlans.mongoCleanupPid(db, gen.pid(planIdx), gen.latestSnapshotSn(planIdx)) : null;
+                    mongoR = mongoCleanupClass(db, gen, found, warm);
+                    if (planIdx >= 0 && !planBefore) {
+                        plan = ScenarioPlans.mongoCleanupPid(db, gen.pid(planIdx), gen.latestSnapshotSn(planIdx));
+                    }
+                    if (plan != null) {
+                        plans.append("### Mongo plan (").append(label).append(", ").append(planWhen)
+                                .append("; explain deletes nothing)\n\n").append(plan).append('\n');
+                    }
                 }
             }
             rows.add(RecoveryBench.sideBySide(label + " total per-pid",
@@ -684,14 +710,15 @@ public final class CleanupShapeBench {
             rows.add(RecoveryBench.sideBySide(label + " per delete batch (100 rows)",
                     pgR == null ? null : pgR.batches(), mongoR == null ? null : mongoR.batches()));
         }
-        BenchProtocol.writeEvidence("c2-single-pid-cleanup.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("c2-single-pid-cleanup"),
                 BenchProtocol.runHeader("C2 — single-pid cleanup (batched deletes, batch size 100)")
                         + RecoveryBench.resultTable(rows) + "\n" + notes
                         + "\nSequence per pid (Cleanup.java 1:1): min event sn -> event ranges tiling to "
                         + "snapshotSn-1 -> min snapshot sn -> snapshot ranges keeping the latest. "
                         + "No journal_seq.deleted_to update — the real cleanup path does not touch it "
-                        + "(plan deviation 2). Mongo deleteMany has no executionStats — timings only. "
-                        + "C2 consumes these pids' cleanup backlog; rerun 'load' for a pristine corpus.\n");
+                        + "(plan deviation 2). "
+                        + "C2 consumes these pids' cleanup backlog; rerun 'load' for a pristine corpus.\n"
+                        + "\n" + plans);
     }
 
     record CleanupResultPair(BenchProtocol.Timing totals, BenchProtocol.Timing batches) {}

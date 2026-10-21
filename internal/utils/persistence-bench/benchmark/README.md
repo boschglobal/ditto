@@ -12,20 +12,34 @@ naming, and evidence rules). Design: `docs/superpowers/specs/2026-07-10-postgres
 | Bench harness (Java, JUnit-based) | `internal/utils/persistence-bench/src/test/java/org/eclipse/ditto/internal/utils/persistence/bench/` |
 | Committed evidence (results, plans) | `internal/utils/persistence-bench/src/test/resources/bench/results/` |
 | Superseded schema-v1 evidence (C1, W2) | `internal/utils/persistence-bench/src/test/resources/bench/results/history/2026-07-13-schema-v1/` |
+| Container-limited full run (2026-10-21), one store at a time | `internal/utils/persistence-bench/src/test/resources/bench/results/*-limits-pg.md`, `*-limits-mongo.md` |
 | W3 per-op latency profile (50k corpus, 2026-10-06) | `internal/utils/persistence-bench/src/test/resources/bench/results/w3-latency/` (start with its `README.md`) |
 | Reproduction script | `internal/utils/persistence-bench/benchmark/run-benchmark.sh` |
 | Design the bench validates | `docs/superpowers/specs/2026-07-10-postgres-persistence-bench-design.md` |
 | Plan deviations cited by the evidence ("plan deviation N") | `internal/utils/persistence-bench/benchmark/PLAN-DEVIATIONS.md` (extracted from the implementation plan, which is not committed) |
 
-Each run overwrites its evidence file — `git diff` shows run-to-run movement.
+An unlabelled run overwrites its evidence file (`git diff` shows run-to-run movement); `BENCH_EVIDENCE_LABEL=<label>` writes `<name>-<label>.md` next to it.
 
 ## 2. Environment and fairness pins
 
-- `postgres:16`, laptop-class settings from the start: `shared_buffers=4GB, effective_cache_size=12GB,
-  work_mem=64MB` (host port 55433).
-- `mongo:7.0` (the tag Ditto's `deployment/docker/docker-compose.yml` pins), `--storageEngine
-  wiredTiger --noscripting --wiredTigerCacheSizeGB 4` for memory symmetry (host port 57017). No
-  replica set — Ditto's compose runs standalone; consequently no oplog (WAL column is PG-only).
+- **Container limits, the same for both backends.** `run-benchmark.sh --cpus N --memory G`, default
+  `--cpus 4 --memory 8`, i.e. `docker run --cpus 4 --memory 8g --memory-swap 8g`; `0` = no limit. The memory limit is
+  the container's cgroup limit: it covers the server's buffer pool or cache, its processes and the page cache its file
+  reads leave, so each store works within its own 8 GiB instead of sharing the VM's page cache; with `--memory-swap`
+  equal to it the container cannot swap. Disk I/O is not limited (both use the same VM disk). Every evidence header has
+  a `- containers:` line with what `docker inspect` reported for the running bench containers. A stage refuses a
+  container that was created with other limits or server arguments; `relimit` recreates it with the requested ones on
+  its data volumes, so a loaded corpus survives.
+- `postgres:16`: `shared_buffers=4GB`, `effective_cache_size` = ¾ of the memory limit (`6144MB` at 8 GiB: shared buffers
+  plus the file cache the limit leaves; `12GB` without a limit), `work_mem=64MB` (host port 55433). All other settings
+  are the image defaults (vacuum: `maintenance_work_mem` 64 MB, `autovacuum_vacuum_cost_limit` -1, 3 workers).
+- `mongo:7.0` (the tag Ditto's `deployment/docker/docker-compose.yml` pins), `--storageEngine wiredTiger --noscripting
+  --wiredTigerCacheSizeGB 4`: the same 4 GB as PG's `shared_buffers` (host port 57017). No replica set — Ditto's
+  compose runs standalone; consequently no oplog (WAL column is PG-only).
+- Evidence written before the limits — the unlabelled 2026-07-13/14 files (both containers side by side), the
+  2026-10-02 C1 retention files, the 2026-10-20 C1 what-if and the 2026-10-21 C3/C4/C5 files (one container at a
+  time) — pinned only the buffer/cache sizes: no `--cpus`/`--memory`, `effective_cache_size=12GB`, and the containers
+  shared the VM's page cache.
 - pgjdbc with `prepareThreshold=0` (every execution custom-planned — the search bench's
   generic-plan-flip finding, adopted as protocol).
 - Mongo writes use WriteConcern JOURNALED (the plugin's `journal-write-concern = Journaled`);
@@ -62,10 +76,10 @@ of a fresh-share corpus goes to `load-*-fresh-share-S.md`.
 
 ## 4. Method
 
-Per scenario: 3 warmup + 20 timed executions with varying-but-deterministic binds; p50/p95/max
-(nearest-rank); one representative plan — `EXPLAIN (ANALYZE, BUFFERS)` on PG,
-`explain(executionStats)` on Mongo. Mongo `deleteMany` has no executionStats — delete scenarios are
-timed only (disclosed per file). Sustained scenarios (W3/C3/M1) sample 30 s windows. Cleanup
+Per scenario: 3 warmup + N timed executions with varying-but-deterministic binds; p50/p95/max (nearest-rank);
+N = 20 by default (`BENCH_ITERATIONS`). The container-limited run times N = 50 except R1–R3 (N = 20: at
+`--count 250000` only 26 OUTLIER-class pids exist and R1–R3 cycle their picks, so 50 would read most OUTLIER pids twice).
+Sustained scenarios (W3/C3/M1) sample 30 s windows. Cleanup
 scenarios pin `DefaultCleanupConfig`: reads-per-query 100, writes-per-credit 100,
 history-retention 0d, delete-final-deleted-snapshot false. The C3 sweep runs unthrottled by default
 — Ditto's credit gate (3×100-row batches per 3 s ⇒ ≤100 rows/s) is structurally replicated but
@@ -75,74 +89,94 @@ for `BENCH_SWEEP_MAX_SECONDS`).
 The 2026-10-21 C3/C4/C5 runs time 50 executions (`BENCH_ITERATIONS=50`) on distinct pids: C4 never re-reads a pid, so a
 row's n (in its label) can be below 50.
 
+Plans: one representative plan per statement shape, captured outside the timed loops.
+
+- PostgreSQL: `EXPLAIN (ANALYZE, BUFFERS)` for every scenario. ANALYZE executes the statement, so writes run inside a
+  transaction that is rolled back: the rows are discarded; what an aborted transaction leaves (a dead tuple per
+  inserted row, a consumed `seq` value) stays. A rolled-back plan shows the executor's work, not the commit's WAL
+  flush. `COPY` (load), `VACUUM` and `ANALYZE` have no plan.
+- MongoDB: `explain` with `executionStats` for finds and aggregates, and — through the `explain` command — for the
+  cleanup `deleteMany` (as a `delete` command) and the snapshot `replaceOne` upsert (as an `update` command); explain
+  of a write applies nothing and reports `nWouldDelete` / `nWouldModify` / `nWouldUpsert`. The command has no `insert`
+  or `compact` form: the appends (journal `bulkWrite`, the realtime insert) and `compact` are timed only.
+
+| scenario | PostgreSQL plan(s) | MongoDB plan(s) |
+|---|---|---|
+| R1 / R2 / R3 | latest snapshot (P99 pid) / OUTLIER full replay / highest sn | find |
+| W1 | append transaction (event INSERT + `journal_seq` upsert) at the W1 pid's next sn, rolled back | none (insert) |
+| W2 | snapshot upsert, fresh and overwrite, rolled back | `update` explain, fresh and overwrite |
+| W3 | append transaction on a churn pid after the run, rolled back | none (insert) |
+| C1 | page at the mid-corpus lower bound | aggregate |
+| C2 | per class, on the first warm-up pid before its cleanup: both min-sn reads and the first delete batch per table (rolled back) | min finds, `delete` explains |
+| C3 | first page of the pid stream and the first pid's cleanup, before the sweep (deletes rolled back) | aggregate, finds, `delete` explains |
+| C4 | post-sweep full replay of an untimed P99 pid | find |
+| M1, M1b | page at the stream start, cleanup of the first snapshotted pid (rolled back), churn append (rolled back), before the run | aggregate, finds, `delete` explains; none for the append |
+
+M1 (`mixed-sweep`) runs where C3 ran in the 2026-07 pipeline: on a load that has had `recovery`, `write` and `cleanup`
+(C2 consumed its 46 pids' backlog), after C3's settling `VACUUM (ANALYZE)`, one unthrottled sweep pass over the whole
+remaining backlog (exactly C3's sweep, 21,054,465 events at `--count 250000`) starts, W3-shaped churn (8 workers × 100
+pids, 500/s, 600 s) starts right after it, and the pass runs to its end. No `VACUUM FULL` or `compact` runs before it.
+C3 and C4 get a fresh load of their own: C2 cleans 23 of the 26 OUTLIER-class pids that C4 replays, so on a shared load
+C4's OUTLIER rows would time pids cleaned long before the sweep. M1b is the 2026-07 M1 (`mixed`): concentrated churn
+after C4's offline reclamation, while a sweeper cycles over the churn's own debris.
+
 ## 5. Headline results
 
-From the committed full-scale evidence, re-run 2026-07-13/14 at `--count 250000` (35,070,304 [`35070304` in the evidence files]
-journal rows loaded per backend, ~15 GB PG / ~14 GB Mongo steady per backend; 250k chosen for this machine's disk —
-see the sweep-bloat note below) on the loose-index-scan query rewrite + schema v2 (snaps DESC
-index dropped). Verdict rule (design §7): flag any scenario where PG p95 > 2× Mongo p95. All
-values are p95 ms unless noted; full tables + plans live in the evidence files. C1's former 21×
-flag was closed by the loose-index-scan rewrite, but a per-page 2× flag against Mongo is open (rows below)
+From the committed full-scale evidence of 2026-10-21 at `--count 250000` (35,070,304 journal rows loaded per
+backend), schema v3 with its shipped storage parameters, with the §2 container limits (4 CPUs, 8 GiB per container),
+one store at a time, evidence files `<scenario>-limits-pg.md` / `<scenario>-limits-mongo.md`. Two loads per backend:
+R1–R3, W1–W3, C1, C2 and then M1 ran on a corpus loaded before the limits were applied (the same deterministic data;
+the containers were recreated with the limits on their volumes), in the 2026-07 order with M1 in C3's place; C3 and C4
+ran on a fresh load under the limits, so C4 replays pids the sweep cleaned (C2 cleans 23 of the 26 OUTLIER pids).
+Verdict rule (design §7): flag any scenario where PG p95 > 2× Mongo p95. Values are p50 / p95 ms (n)
+unless noted; full tables and plans live in the evidence files. Host-memory reliability: every measured stage of both
+backends (recovery, wcheck, w3, c1, c2, mixed-sweep on load 1; c3, c4 on load 2) passed the host-memory gate on its
+first call and had 0 pages swapped out between its before and after samples, with ≥ 72 % of memory free in both; no
+stage was repeated and every number below is reliable. These numbers come from a different
+environment than every earlier run (limits; one store at a time), so movements against the History values are not
+attributable to either change alone. C1's former 21× flag was closed by the loose-index-scan rewrite; under the limits
+the PG page is flagged again, 15× Mongo's (row below)
 (see `docs/superpowers/specs/2026-07-13-cleanup-loose-index-scan-design.md`).
 
-The two C1 rows of 2026-10-02 come from a single-backend run, one container at a time (disk), on a
-fresh-share corpus. They are not directly comparable with the other rows, which come from the
-co-resident July run. The per-pid view on that corpus (Mongo pages of ~22 pids on a never-cleaned
-backlog) is §7 caveat 11.
-
-The C3, C4 and C5 rows of 2026-10-21 come from single-backend runs (one container at a time) on schema v3: 50 timed
-executions on distinct pids, a manual `VACUUM (ANALYZE)` before the sweep, offline reclamation skipped, and the
-`postgres:16` image's vacuum defaults (`autovacuum_vacuum_cost_limit` -1, i.e. 200 per 2 ms; `maintenance_work_mem`
-64 MB; 3 workers). Their July values are in the History paragraph. Host-memory reliability: on every PostgreSQL run
-macOS swapped out 12–19k pages (16 KiB) during the sweep's first minutes while ≥ 81 % of memory stayed free, so each
-PG C3 stage, and with it each PG configuration run, is marked unreliable (a repeat showed the same); the 2 h C5 window
-lost 36,995 pages in two bursts, about 3 and 57 minutes in, and is marked unreliable as well; the C4 stage of
-the shipped configuration and the whole MongoDB run had no swap-outs. Treat the PG C3/C4 numbers as indicative. Across
-the two loads of each configuration the post-sweep autovacuum finished 17 / 52 s (cost limit 2000), 722 / 403 s (800)
-and 2,936 / 2,952 s (v2 storage parameters) after the sweep; the evidence files are the second loads'.
-
-| scenario | PG p95 | Mongo p95 | verdict |
+| scenario | PG p50 / p95 | Mongo p50 / p95 | verdict |
 |---|---|---|---|
-| R1 latest snapshot (worst class) | 1.14 | 1.33 | parity |
-| R2a tail replay (worst class) | 10.90 | 10.86 | parity |
-| R2b full replay, outlier 40-50k events | 522 | 531 | parity; absolute < 2 s bar MET |
-| R3 highest sn | 0.84 | 1.34 | PG faster |
-| W1 single append | 2.71 | 3.03 | parity |
-| W2 snapshot write (fresh / overwrite) | 2.96 / 2.33 | 4.79 / 4.25 | PG faster (one snaps index fewer since v2; see the noise caveat below) |
-| W3 sustained churn (achieved of 500/s) | 499.8/s | 499.9/s | both hold target; per-op latency: see the W3 note below |
-| C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page — sized by the what-if note below; no production change |
-| C1 cleanup pid-stream page, minAge 0 | 2.87 p50 / 3.99 p95 (2026-10-02; was 8.50 p95 on 2026-07-13) | 1.02 p50 / 1.27 p95 (was 10.71) | single-backend re-run: PG 2.5–2.8× (p50) slower per page; the July "PG faster" does not reproduce (cause untested; July's Mongo C1 itself moved 42.47 → 10.71 ms in one day). Former 21× FLAG vs schema v1 stays closed (887 → 3–8.5 ms) |
-| C2 single-pid cleanup (outlier total) | 993 | 1163 | parity |
-| C3 full sweep (22.13M rows; schema v3, single-backend 2026-10-21) | 778 s | 292 s | Mongo 2.7× faster (delete-batch bound); identical deletions both sides; PG run unreliable (host memory, above) |
-| **C4 post-sweep replay, schema v3** (distinct pids; the autovacuum after the sweep finished 52 s after it with the shipped storage parameters — 52 s with cost limit 2000, 2,952 s with v2's, 403 s with 800; July: not within 900 s) | tail P99 4.74 p50 / 7.23 p95 (n=50); full-scan OUTLIER 1.23 / 1.94 (n=23); full-scan P99 1.22 / 1.60 (n=50) | tail P99 3.16 p50 / 5.09 p95 (n=50); full-scan OUTLIER 1.56 / 2.00 (n=23); full-scan P99 1.47 / 1.98 (n=50) | FLAG closed: PG ≤ 2× (1.0× / 0.8×); PG run unreliable (host memory, above) |
-| C5 credit-paced cleanup window (2 h at ≤ 100 rows/s, production order, shipped storage parameters) | 405,515 rows deleted (56 rows/s); dead tuples peak 348,401 (60 s samples) vs the 0.01 trigger 350,737; one autovacuum, 1 h 45 min into the window, cleared them; replay of swept pids as left 1.64 / 3.50 vs after VACUUM 1.57 / 3.18 (n=50), but both halves are pids that autovacuum had already cleaned (sweep positions 6–105 of 184; caveat 5) | — (MongoDB removes index keys in the delete itself) | replay slowdown of pids swept since the last autovacuum not measured (the 1.1× ratio is not a test of it); at credit pace ≈ 1 % of the journal turned dead before one autovacuum cleared it; run unreliable (host memory, above) |
-| M1 churn under live sweep (achieved of 500/s) | 499.8/s | 499.9/s | both hold; 296,576 rows swept live on each |
-
-C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20, schema v3, the 2026-10-02
-fresh-share corpus mode; Ditto does not issue this statement): the C1 page SQL without
-`snapshot::text` takes 0.54 p50 / 0.80 p95 ms at the 3-day filter against 2.91 / 3.56 ms for the
-production page in the same run, interleaved, so the payload is 82 % (p50) / 78 % (p95) of the page
-(3 runs: 80–82 % / 77–79 %; at minAge 0: 84 % / 83 %). A page carries 588 kB of payload text on
-average. Against Mongo's 1.15 / 1.63 ms from the 2026-10-02 run (not re-run): below. Decoding and
-JSON-parsing the payloads as production does adds 2.71 ms p50 / 4.28 ms p95 on top (pgjdbc +
-ditto-json estimate; production reads through r2dbc). See caveat 12.
+| R1 latest snapshot (worst class) | P99 0.63 / 1.01 (n=20) | P99 0.73 / 0.80 (n=20) | Mongo faster (1.3×) |
+| R2a tail replay (worst class) | OUTLIER 4.74 / 6.48 (n=20) | OUTLIER 5.22 / 7.65 (n=20) | parity |
+| R2b full replay, outlier 40–50k events | 238.57 / 258.61 (n=20) | 227.84 / 272.50 (n=20) | parity; absolute < 2 s bar MET |
+| R3 highest sn | 0.53 / 0.82 (n=20) | 0.33 / 0.64 (n=20) | Mongo faster (1.3×) |
+| W1 single append | 2.37 / 2.90 (n=50) | 1.35 / 2.30 (n=50) | Mongo faster (1.3×) |
+| W2 snapshot write (fresh / overwrite) | 1.72 / 2.33; 1.34 / 1.89 (n=50) | 1.78 / 3.00; 1.35 / 1.54 (n=50) | PG faster (1.3×) / parity |
+| W3 sustained churn (achieved of 500/s) | 499.8/s; per-op window p50 4.11–4.93, p95 6.63–9.02 | 499.8/s; per-op window p50 1.85–2.80, p95 3.30–8.32 | both hold; per-op latency: see the W3 note below |
+| C1 cleanup pid-stream page, minAge 0 | 16.95 / 25.47 (n=50) | 1.06 / 1.66 (n=50) | FLAG: PG 15.3× slower (July: PG faster; the 2026-10-02 single-backend re-run: PG 2.5–2.8× slower at p50). The page's EXPLAIN ran 1.37 ms in the server on shared-buffer hits; the rest of PG's time was not isolated (the timed page also returns the 100 snapshot payloads, see the what-if below) |
+| C2 single-pid cleanup (OUTLIER total per pid) | 987.45 / 1820.02 (n=20) | 502.13 / 632.84 (n=20) | FLAG: PG 2.9× slower (p50 2.0×; July: parity) |
+| C3 full sweep (22.13M rows, clean load) | 837.5 s (26,461 rows/s) | 297.6 s (74,460 rows/s) | Mongo 2.8× faster (durations); identical deletions both sides; the 2026-10-21 run without limits: 778 s / 292 s |
+| C4 post-sweep replay (tail P99 / full-scan OUTLIER / full-scan P99) | 4.33 / 8.56 (n=50); 1.25 / 1.92 (n=23); 1.27 / 1.62 (n=50); the post-sweep autovacuum of `things_journal` ended 36 s after the sweep | 2.87 / 4.62 (n=50); 1.65 / 2.00 (n=23); 1.62 / 1.99 (n=50) | parity on full-scan OUTLIER (1.0×) and full-scan P99 (0.8×) |
+| **M1 churn during the mass sweep** (21.05M rows, after recovery/write/cleanup on its load; achieved of 500/s over the windows that ended while the sweep was deleting) | 500.0/s over 20 of 20 windows; window p50 2.57–4.66, p95 12.30–36.72; mass sweep 21,054,465 event + 33,643 snapshot rows in 890.2 s (23,690 rows/s) | 500.3/s over 13 of 20 windows; window p50 1.92–3.30, p95 5.01–20.89; mass sweep the same rows in 404.1 s (52,188 rows/s) | both hold; window p95 vs the same backend's W3: PG 12.30–36.72 vs 6.63–9.02, Mongo 5.01–20.89 vs 3.30–8.32 |
+| M1b churn under the light post-reclamation sweep (2026-07-13, before the limits; `m1-cleanup-under-traffic.md`) | 499.8/s | 499.9/s | both hold; 296,576 rows swept live on each (the churn's own debris) |
 
 History (schema v1, before the rewrite and the v2 index drop): C1 was 887.14 ms PG vs 42.47 ms
 Mongo p95 (242 MB temp spill per page; Seq Scan + Sort over ~40k rows) and W2 was 4.31 / 3.30 ms
 PG vs 6.25 / 3.35 ms Mongo. Those runs are kept verbatim, with provenance headers, in
 `../src/test/resources/bench/results/history/2026-07-13-schema-v1/` (`c1-pid-stream-page.md`,
 `w2-snapshot-write.md`); they are superseded by the current files above.
+The 2026-07-13/14 values of the rows the container-limited run replaced (co-resident, no limits, the unlabelled
+files; p95 ms PG / Mongo): R1 1.14 / 1.33, R2a 10.90 / 10.86, R2b 522 / 531, R3 0.84 / 1.34, W1 2.71 / 3.03, W2
+2.96 / 2.33 vs 4.79 / 4.25 (fresh / overwrite), W3 499.8/s / 499.9/s, C1 minAge 0 8.50 / 10.71 (and the 2026-10-02
+single-backend re-run 2.87 p50 / 3.99 p95 vs 1.02 / 1.27), C2 993 / 1163.
 The July C3/C4 runs (schema v2, co-resident, 20 iterations; `c3-full-sweep.md`, `c4-before-after.md`): C3 797 s PG /
 488 s Mongo; C4 16.9 (tail) / 98.5 (full-scan; the 2nd-highest of 20 samples, max 366.7) ms PG vs 13.2 / 6.7 ms Mongo,
-the settle loop timing out at 900 s with dead tuples flat at 11.3M. The 2026-10-21 rows above supersede them.
+the settle loop timing out at 900 s with dead tuples flat at 11.3M. The 2026-10-21 rows (runs without limits, below
+the table) supersede them.
 
 W2 noise caveat: the v1 -> v2 W2 gain (4.31 -> 2.96 and 3.30 -> 2.33 ms, about 30 %) compares two
 separate runs, and the unchanged Mongo numbers moved between them as well (fresh 6.25 -> 4.79 ms,
 overwrite 3.35 -> 4.25 ms), by about the size of the claimed gain. Treat "PG faster since v2" as
 directional, not as a measured 30 % improvement.
 
-W3 note (per-op latency): in the committed W3 run PG's per-op p50 is 6.53–7.40 ms (p95 9.99–12.43)
-against MongoDB's 1.79–3.20 ms (p95 2.85–14.13), although both hold the rate. A profiling re-run on a
+W3 note (per-op latency): in the 2026-07-13 W3 run PG's per-op p50 is 6.53–7.40 ms (p95 9.99–12.43)
+against MongoDB's 1.79–3.20 ms (p95 2.85–14.13), although both hold the rate. In the container-limited run
+(`w3-sustained-churn-limits-pg.md`, `w3-sustained-churn-limits-mongo.md`) PG's per-op window p50 is 4.11–4.93 ms
+(p95 6.63–9.02) against MongoDB's 1.85–2.80 ms (p95 3.30–8.32), with the same lock-step pacing. A profiling re-run on a
 50k corpus (`../src/test/resources/bench/results/w3-latency/README.md`) found the gap to be mostly a
 bench artefact, not the append path:
 - W3's eight workers start their 16 ms pacing schedules when their connections are ready, which
@@ -174,7 +208,11 @@ Quote W3 latency with this note. A representative W3 protocol would need randomi
 lock-step and even arrivals as bounds, on a settled corpus (autovacuum finished).
 
 Cross-backend determinism: C3 deleted identical 21,054,465 event + 33,613 snapshot rows on both
-backends; M1 swept identical 296,576. Credit-pace projection for C3: ~105 h (the real Ditto pace —
+backends; M1 swept identical 296,576. In the container-limited run C3 (clean load) deleted identical 8,581 pids /
+22,126,919 event + 35,690 snapshot rows on both backends (the same counts as the 2026-10-21 runs without limits), and
+M1's mass sweep identical 8,582 pids / 21,054,465 event + 33,643 snapshot rows: July's C3 event count; the 30 more
+snapshot rows come from W2's probe pid, which wrote 53 snapshots at N = 50 against 23 at N = 20.
+Credit-pace projection for C3: ~105 h (the real Ditto pace —
 "days", as designed). Disk note for full runs: during the sweep the corpus bloats by roughly the
 deleted-row volume until C4's offline reclamation (observed peak ~80 GB total at 250k vs ~30 GB
 steady) — budget peak, not steady state; 500k needs ≳130–150 GB free.
@@ -190,24 +228,67 @@ steady) — budget peak, not steady state; 500k needs ≳130–150 GB free.
 | C1 payload what-if (NOT PRODUCTION) | ../src/test/resources/bench/results/c1-payload-free-what-if-retention3d-pg-run1.md, …-run2.md, …-run3.md, ../src/test/resources/bench/results/load-pg-fresh-share-0.3-payload-whatif.md |
 | C3 / W1 / W2 / C4 on schema v3 (2026-10-21; PG runs unreliable, §5) | `c3-full-sweep-<label>.md`, `w1-single-append-<label>.md`, `w2-snapshot-write-<label>.md`, `c4-before-after-<label>.md`, `load-pg-<label>.md` for `cl2000-pg` (cost limit 2000), `cldefault-pg` (v2 storage parameters), `cl800-pg` (800); `load-mongo-mongo-ref.md`, `c3-full-sweep-mongo-ref.md`, `c4-before-after-mongo-ref.md` |
 | C5 credit-paced window | `c5-credit-paced-window-credits-pg.md`, `load-pg-credits-pg.md` |
-| M1 mixed | `m1-cleanup-under-traffic.md` |
+| Container-limited run (all scenarios) | `<scenario>-limits-pg.md`, `<scenario>-limits-mongo.md`, `load-pg-limits-pg.md`, `load-mongo-limits-mongo.md` |
+| M1 during the mass sweep | `m1-cleanup-during-mass-sweep-limits-pg.md`, `m1-cleanup-during-mass-sweep-limits-mongo.md` |
+| M1b mixed (2026-07) | `m1-cleanup-under-traffic.md` |
+
+### Runs without container limits that this run does not repeat
+
+The C1 retention row of 2026-10-02 comes from a single-backend run, one container at a time (disk), on a fresh-share
+corpus, without container limits. It is not directly comparable with the container-limited table above. The per-pid
+view on that corpus (Mongo pages of ~22 pids on a never-cleaned backlog) is §7 caveat 11.
+
+The C3, C4 and C5 rows of 2026-10-21 come from single-backend runs (one container at a time) on schema v3: 50 timed
+executions on distinct pids, a manual `VACUUM (ANALYZE)` before the sweep, offline reclamation skipped, and the
+`postgres:16` image's vacuum defaults (`autovacuum_vacuum_cost_limit` -1, i.e. 200 per 2 ms; `maintenance_work_mem`
+64 MB; 3 workers). Their July values are in the History paragraph. Host-memory reliability: on every PostgreSQL run
+macOS swapped out 12–19k pages (16 KiB) during the sweep's first minutes while ≥ 81 % of memory stayed free, so each
+PG C3 stage, and with it each PG configuration run, is marked unreliable (a repeat showed the same); the 2 h C5 window
+lost 36,995 pages in two bursts, about 3 and 57 minutes in, and is marked unreliable as well; the C4 stage of
+the shipped configuration and the whole MongoDB run had no swap-outs. Treat the PG C3/C4 numbers as indicative. Across
+the two loads of each configuration the post-sweep autovacuum finished 17 / 52 s (cost limit 2000), 722 / 403 s (800)
+and 2,936 / 2,952 s (v2 storage parameters) after the sweep; the evidence files are the second loads'. C4's
+cost-limit decision rests on these runs.
+
+| scenario | PG p95 | Mongo p95 | verdict |
+|---|---|---|---|
+| C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page — sized by the what-if note below; no production change |
+| C3 full sweep (22.13M rows; schema v3, single-backend 2026-10-21) | 778 s | 292 s | Mongo 2.7× faster (delete-batch bound); identical deletions both sides; PG run unreliable (host memory, above) |
+| **C4 post-sweep replay, schema v3** (distinct pids; the autovacuum after the sweep finished 52 s after it with the shipped storage parameters — 52 s with cost limit 2000, 2,952 s with v2's, 403 s with 800; July: not within 900 s) | tail P99 4.74 p50 / 7.23 p95 (n=50); full-scan OUTLIER 1.23 / 1.94 (n=23); full-scan P99 1.22 / 1.60 (n=50) | tail P99 3.16 p50 / 5.09 p95 (n=50); full-scan OUTLIER 1.56 / 2.00 (n=23); full-scan P99 1.47 / 1.98 (n=50) | FLAG closed: PG ≤ 2× (1.0× / 0.8×); PG run unreliable (host memory, above) |
+| C5 credit-paced cleanup window (2 h at ≤ 100 rows/s, production order, shipped storage parameters) | 405,515 rows deleted (56 rows/s); dead tuples peak 348,401 (60 s samples) vs the 0.01 trigger 350,737; one autovacuum, 1 h 45 min into the window, cleared them; replay of swept pids as left 1.64 / 3.50 vs after VACUUM 1.57 / 3.18 (n=50), but both halves are pids that autovacuum had already cleaned (sweep positions 6–105 of 184; caveat 5) | — (MongoDB removes index keys in the delete itself) | replay slowdown of pids swept since the last autovacuum not measured (the 1.1× ratio is not a test of it); at credit pace ≈ 1 % of the journal turned dead before one autovacuum cleared it; run unreliable (host memory, above) |
+
+C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20, schema v3, the 2026-10-02
+fresh-share corpus mode; Ditto does not issue this statement): the C1 page SQL without
+`snapshot::text` takes 0.54 p50 / 0.80 p95 ms at the 3-day filter against 2.91 / 3.56 ms for the
+production page in the same run, interleaved, so the payload is 82 % (p50) / 78 % (p95) of the page
+(3 runs: 80–82 % / 77–79 %; at minAge 0: 84 % / 83 %). A page carries 588 kB of payload text on
+average. Against Mongo's 1.15 / 1.63 ms from the 2026-10-02 run (not re-run): below. Decoding and
+JSON-parsing the payloads as production does adds 2.71 ms p50 / 4.28 ms p95 on top (pgjdbc +
+ditto-json estimate; production reads through r2dbc). See caveat 12.
 
 ## 6. Reproducing
 
 ```
-benchmark/run-benchmark.sh up build load          # containers + corpus (hours at full scale)
-benchmark/run-benchmark.sh recovery write cleanup # non-destructive scenario groups
-benchmark/run-benchmark.sh sweep mixed            # C3 destroys the cleanup backlog by design
-benchmark/run-benchmark.sh status                 # corpus / container / results state
-benchmark/run-benchmark.sh all --quick --yes      # ~20-min demo pipeline (numbers not comparable)
-benchmark/run-benchmark.sh down --purge           # remove containers + volumes
+benchmark/run-benchmark.sh config                       # the docker run lines the options resolve to; starts nothing
+benchmark/run-benchmark.sh up build load settle         # containers + corpus; settle waits for PG's post-load autovacuum
+benchmark/run-benchmark.sh recovery write cleanup       # R1-R3, W1-W3, C1, C2 (C2 consumes its own 46 pids)
+benchmark/run-benchmark.sh mixed-sweep                  # M1 during the mass sweep (destroys the cleanup backlog)
+benchmark/run-benchmark.sh load settle                  # a fresh backlog for C3/C4
+benchmark/run-benchmark.sh sweep mixed                  # C3, C4 (ends with VACUUM FULL / compact), then M1b
+benchmark/run-benchmark.sh status                       # corpus / container / limits / results state
+benchmark/run-benchmark.sh all --quick --yes            # demo pipeline (numbers not comparable)
+benchmark/run-benchmark.sh down --purge                 # remove containers + volumes (--backend pg|mongo: one store)
 ```
 
 Re-run `load` after `sweep` for a pristine corpus — and before re-running `write` or `mixed`:
 W1/W3/M1 write fixed, deterministic probe pids with plain inserts, so a second run against the
 first run's leftover rows fails on duplicate keys.
 
-`--backend pg|mongo` restricts any stage.
+`--backend pg|mongo` restricts any stage, `down` included. Pass the same `--count` (and `--cpus`/`--memory`, if not the
+defaults) to every stage. `relimit` recreates loaded containers with new limits or server arguments on their data
+volumes. `mixed-sweep` refuses a corpus whose backlog is gone (fewer than 90 % of the generated snapshot rows).
+`BENCH_PROBE_SUFFIX=<s>` lets `wcheck` run again on one load, `BENCH_W3_PID_PREFIX` the same for `w3`;
+`BENCH_RESULTS_DIR=<absolute path>` sends evidence elsewhere (trial runs).
 
 W3 profiling knobs (opt-in Maven `-D` properties for `AppendBench#w3SustainedChurn`; the defaults
 reproduce the committed W3 run): `bench.w3.stagger=true` (spread the worker schedules evenly),
@@ -219,7 +300,7 @@ sampler), `bench.w3.pidPrefix=<unique per run>` (repeat W3 without a reload) and
 records per-step timings, per-window WAL flush counts, the heap placement of its rows and server
 counter deltas, all outside the timed path: per 30 s window the sampler connection reads a few
 `pg_stat_*` views (the `pg_stat_checkpointer` read fails on PostgreSQL 16, is skipped and shows up
-in the server log), and after the run it pauses 2 s and runs one placement query. M1 shares this
+in the server log), and after the run it pauses 2 s and runs one placement query. M1 and M1b share this
 churn engine, so its concurrent sweep keeps running for those extra ≥ 2 s before it is stopped
 (slightly more rows deleted than before), its churn connections are tagged
 `application_name=w3-churn`, and a dead churn worker now aborts the run instead of being ignored.
@@ -286,12 +367,32 @@ BENCH_EVIDENCE_LABEL=credits-pg BENCH_SWEEP_MAX_SECONDS=7200 BENCH_SAMPLE_INTERV
 Between stages the runs waited until two host-memory samples 2 minutes apart showed no swapping (≤ 1,000 pages
 swapped out, ≥ 50 % free), and every measured stage had such a sample right before and after it.
 
+The container-limited run (`*-limits-pg.md`, `*-limits-mongo.md`): one store at a time, the other container stopped or
+removed, and for every stage
+
+```
+export BENCH_ITERATIONS=50 BENCH_C4_SETTLE_TIMEOUT=3600 BENCH_C3_VACUUM_FIRST=true BENCH_C4_OFFLINE_RECLAIM=false
+export BENCH_EVIDENCE_LABEL=limits-pg                     # limits-mongo for --backend mongo
+benchmark/run-benchmark.sh relimit --backend pg --count 250000     # load 1: the loaded corpus, recreated with the limits
+benchmark/run-benchmark.sh settle --backend pg --count 250000
+BENCH_ITERATIONS=20 benchmark/run-benchmark.sh recovery --backend pg --count 250000
+benchmark/run-benchmark.sh wcheck --backend pg --count 250000      # then w3, c1, c2 and mixed-sweep the same way
+benchmark/run-benchmark.sh down --purge --backend pg
+benchmark/run-benchmark.sh load --backend pg --count 250000        # load 2
+benchmark/run-benchmark.sh settle --backend pg --count 250000
+benchmark/run-benchmark.sh c3 --backend pg --count 250000          # then c4
+benchmark/run-benchmark.sh down --purge --backend pg
+```
+
+Every measured stage was preceded by the host-memory gate of the 2026-10-21 runs (above) and had a sample right before
+and after it; no stage was repeated: every gate passed on its first call and no measured stage swapped out a page.
+
 ## 7. Caveats — read before quoting numbers
 
 1. Laptop-scale Docker; 10-minute windows — trends, not plateau claims.
 2. Driver-level, not actor-level: no Pekko/serialization overhead on either side. The comparison
    is symmetric and fair; absolute service-level latency is higher.
-3. Mongo delete timings have no plan-level evidence (`deleteMany` lacks executionStats).
+3. MongoDB has no explain for inserts (the W1/W3/M1 appends) or `compact`: those are timed only. Its deletes and the snapshot upsert are explained through the explain command, which applies no write.
 4. Synthetic corpus; payload knobs approximate no specific customer data set.
 5. C3 pace is unthrottled by default (§4); Ditto's production pace is far slower and
    gentler — the dead-tuple/autovacuum observations under unthrottled load are worst-case. C5 runs a 2 h
@@ -308,10 +409,10 @@ swapped out, ≥ 50 % free), and every measured stage had such a sample right be
    30d, so production cleanup runs with the filter on. The C1 retention row in §5 measures that
    shape on a fresh-share corpus; on the backdated corpus every row would qualify and the filter
    would cost only its evaluation.
-8. M1 concentrates its churn (the `mixed` stage passes `pidsPerWorker=1`): a churn pid only
+8. M1b concentrates its churn (the `mixed` stage passes `pidsPerWorker=1`): a churn pid only
    becomes sweepable after crossing the 500-event snapshot threshold, which requires
    `ops/(workers×pidsPerWorker) ≥ 500` — unreachable at the default spread even at full scale.
-   Consequently M1's per-pid contention differs from W3's; compare their latency windows
+   Consequently M1b's per-pid contention differs from W3's; compare their latency windows
    directionally, not 1:1.
 9. At `--quick` scale the corpus has only ~6 OUTLIER-class pids, so class-scan disjointness
    between scenarios is not guaranteed (C2 cleans the same outlier pids R2 measured — reload
@@ -336,6 +437,14 @@ swapped out, ≥ 50 % free), and every measured stage had such a sample right be
     have n = 23 (26 minus 3 warm-ups) and the full-scan P99 row carries the 50-sample view of the same dead-space walk.
     C3/C5 sample tables have an `autovacuum in progress` column; C4 records the settle timeline with vacuum progress
     and autovacuum wait events.
+14. M1 is measured during a mass sweep: one unthrottled pass over the whole remaining backlog of its load (after
+    recovery, write and cleanup, as July's C3), at the same time as W3-shaped churn. Its headline uses the churn windows that ended while that pass was still deleting;
+    a window that straddles the end counts as "after", and if the pass outlasts the churn every window is "during".
+    The same backend's W3 run (same churn shape, no sweep) is its control. The churn keeps W3's lock-step pacing (eight
+    workers fire together every 16 ms), so its per-window latency carries the same artefact as W3's (see the W3 note
+    in §5): quote M1 for throughput and its latency directionally. The sweep runs unthrottled (worst case; Ditto's
+    credit pace is ≤ 100 rows/s). M1b is the 2026-07 M1, kept as a separately named row: it ran after C4's offline
+    reclamation, so its sweep found only the churn's own debris (296,576 rows).
 
 ## 8. Presenting this
 

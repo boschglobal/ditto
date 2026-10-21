@@ -37,13 +37,14 @@ public final class AppendBench {
         BenchProtocol.Timing pgT = null;
         BenchProtocol.Timing mongoT = null;
         String pgVacuum = "";
+        String pgPlan = "";
         if (BenchConfig.runPg()) {
             try (Connection c = BenchConfig.openPg(); Connection vacuumProbe = BenchConfig.openPg()) {
                 final String vacuumAtStart = PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe));
                 c.setAutoCommit(false);
                 try (PreparedStatement insert = c.prepareStatement(PersistenceShapes.PG_INSERT_EVENT);
                         PreparedStatement upsert = c.prepareStatement(PersistenceShapes.PG_UPSERT_SEQ)) {
-                    final String pid = "thing:bench.w1:pg";
+                    final String pid = "thing:bench.w1:pg" + BenchConfig.probeSuffix();
                     pgT = BenchProtocol.measure(iteration -> {
                         final long sn = iteration + 1L;
                         insert.setString(1, pid);
@@ -57,6 +58,9 @@ public final class AppendBench {
                         upsert.executeUpdate();
                         c.commit();
                     });
+                    final long nextSn = ScenarioPlans.pgNextSn(c, pid);
+                    pgPlan = "### PG plan (append transaction of " + pid + " at its next sn " + nextSn
+                            + ", after the timed loop; rolled back)\n\n" + ScenarioPlans.pgAppend(c, pid, nextSn);
                 }
                 pgVacuum = "\n- PG autovacuum in progress at start: " + vacuumAtStart + "; at end: "
                         + PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe)) + "\n";
@@ -78,7 +82,7 @@ public final class AppendBench {
                             return t;
                         });
                 try {
-                    final String pid = "thing:bench.w1:mongo";
+                    final String pid = "thing:bench.w1:mongo" + BenchConfig.probeSuffix();
                     mongoT = BenchProtocol.measure(iteration -> {
                         final long sn = iteration + 1L;
                         final Document atom = PersistenceShapes.journalAtom(pid, sn,
@@ -93,6 +97,8 @@ public final class AppendBench {
                 }
             }
         }
+        final String mongoPlan = BenchConfig.runMongo()
+                ? "\n### Mongo plan (append)\n\n" + ScenarioPlans.mongoAppend() : "";
         BenchProtocol.writeEvidence(BenchProtocol.evidenceName("w1-single-append"),
                 BenchProtocol.runHeader("W1 — single append txn")
                         + RecoveryBench.resultTable(List.of(
@@ -100,8 +106,8 @@ public final class AppendBench {
                         + "\nPG: event INSERT + journal_seq upsert, one transaction (synchronous_commit=on). "
                         + "Mongo: ordered 1-doc bulkWrite, WriteConcern JOURNALED; the plugin's async "
                         + "realtime-collection insert runs fire-and-forget outside the timed path exactly "
-                        + "as in ScalaDriverPersistenceJournaller.batchAppend (plan deviation 4). "
-                        + "Mongo deleteMany/insert plans are not explainable — timings only.\n" + pgVacuum);
+                        + "as in ScalaDriverPersistenceJournaller.batchAppend (plan deviation 4).\n" + pgVacuum
+                        + "\n" + pgPlan + mongoPlan);
     }
 
     @Test
@@ -130,6 +136,15 @@ public final class AppendBench {
                             r.totalOps(), r.totalSnapshots(), r.achievedRate()))
                     .append(ChurnEngine.samplesMarkdown(r)).append('\n')
                     .append(r.profile()).append('\n');
+            try (Connection c = BenchConfig.openPg()) {
+                final String pid = ChurnEngine.churnPid(pidPrefix, 0, 0);
+                final long sn = ScenarioPlans.pgNextSn(c, pid);
+                md.append("### PG plan (append transaction of churn pid ").append(pid).append(" at its next sn ")
+                        .append(sn).append(", after the run")
+                        .append(pgShape == PgAppendShape.TXN ? "" : "; the plugin's statements, this run timed "
+                                + pgShape.label())
+                        .append("; rolled back)\n\n").append(ScenarioPlans.pgAppend(c, pid, sn)).append('\n');
+            }
         }
         if (BenchConfig.runMongo()) {
             final ChurnEngine.ChurnResult r = ChurnEngine.runMongo(pidPrefix, duration, rate, workers,
@@ -139,6 +154,7 @@ public final class AppendBench {
                             r.totalOps(), r.totalSnapshots(), r.achievedRate()))
                     .append(ChurnEngine.samplesMarkdown(r)).append('\n')
                     .append(r.profile()).append('\n');
+            md.append("### Mongo plan (append)\n\n").append(ScenarioPlans.mongoAppend()).append('\n');
         }
         md.append("\nNote: standalone mongod has no oplog — WAL-delta column applies to PG only; "
                 + "Mongo growth is tracked via collStats storage+index size (plan deviation list).\n");

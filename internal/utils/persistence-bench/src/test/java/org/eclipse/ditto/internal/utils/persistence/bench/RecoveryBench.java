@@ -123,7 +123,7 @@ public final class RecoveryBench {
                     PersistenceShapes.snapshotLoadFilter(pid, Long.MAX_VALUE, Long.MAX_VALUE),
                     new Document("sn", -1).append("ts", -1), null, 1));
         }
-        BenchProtocol.writeEvidence("r1-latest-snapshot.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("r1-latest-snapshot"),
                 BenchProtocol.runHeader("R1 — latest-snapshot fetch")
                         + resultTable(rows) + "\n" + plans);
     }
@@ -162,7 +162,7 @@ public final class RecoveryBench {
                             PersistenceShapes.replayFilter(pid, 1L, Long.MAX_VALUE),
                             new Document("to", 1), new Document("events", 1), null));
         }
-        BenchProtocol.writeEvidence("r2-replay.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("r2-replay"),
                 BenchProtocol.runHeader("R2 — event replay (a: from latest snapshot, b: from sn 1)")
                         + resultTable(rows) + "\n" + plans
                         + "\nBar mapping (design section 7): the 'outlier 50k events < 2 s' bar applies to "
@@ -264,7 +264,7 @@ public final class RecoveryBench {
                     PersistenceShapes.JOURNAL, new Document("pid", pid),
                     PersistenceShapes.highestSnSort(), new Document("to", 1), 1));
         }
-        BenchProtocol.writeEvidence("r3-highest-sn.md",
+        BenchProtocol.writeEvidence(BenchProtocol.evidenceName("r3-highest-sn"),
                 BenchProtocol.runHeader("R3 — highest sequence number")
                         + resultTable(List.of(sideBySide("mixed classes", pgT, mongoT))) + "\n" + plans);
     }

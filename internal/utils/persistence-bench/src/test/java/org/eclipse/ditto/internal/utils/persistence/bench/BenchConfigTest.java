@@ -76,4 +76,14 @@ public final class BenchConfigTest {
                 "autovacuum_vacuum_cost_limit = 800); DROP TABLE things_journal; --"))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    public void labelsAndProbeSuffixesAcceptLowerCaseLettersDigitsAndDashesOnly() {
+        assertThat(BenchConfig.checkLabel("probe suffix", "-r2")).isEqualTo("-r2");
+        assertThat(BenchConfig.checkLabel("probe suffix", "")).isEmpty();
+        assertThatThrownBy(() -> BenchConfig.checkLabel("probe suffix", "R2"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("probe suffix");
+        assertThatThrownBy(() -> BenchConfig.checkLabel("evidence label", "a b"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("evidence label");
+    }
 }

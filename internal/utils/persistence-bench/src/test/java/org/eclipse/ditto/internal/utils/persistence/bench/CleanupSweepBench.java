@@ -39,6 +39,8 @@ public final class CleanupSweepBench {
 
     @Test
     public void c3FullSweep() throws Exception {
+        final CorpusGenerator gen = BenchConfig.corpus();
+        final long firstIdx = ScenarioPlans.firstSnapshottedPidIndex(gen);
         final boolean credits = "credits".equals(BenchConfig.sweepPace());
         final StringBuilder md = new StringBuilder(BenchProtocol.runHeader("C3 — full cleanup sweep"))
                 .append("- pace: ").append(credits ? "credits (3 batches / 3 s — Ditto's default gate)"
@@ -47,15 +49,25 @@ public final class CleanupSweepBench {
         if (BenchConfig.runPg()) {
             try (Connection c = BenchConfig.openPg()) {
                 md.append(pgPreamble(c));
+                final String plans = "### PG plan (first page of the pid stream, before the sweep)\n\n"
+                        + ScenarioPlans.pgPage(c, "")
+                        + "\n### PG plan (cleanup of the first snapshotted corpus pid, before the sweep; deletes "
+                        + "rolled back)\n\n"
+                        + ScenarioPlans.pgCleanupPid(c, gen.pid(firstIdx), gen.latestSnapshotSn(firstIdx));
                 final SweepEngine.SweepResult r = SweepEngine.sweepPg(c, credits, new AtomicBoolean(false));
-                md.append(sweepSection("PostgreSQL", r));
+                md.append(sweepSection("PostgreSQL", r)).append(plans).append('\n');
             }
         }
         if (BenchConfig.runMongo()) {
             try (MongoClient client = BenchConfig.openMongo()) {
-                final SweepEngine.SweepResult r = SweepEngine.sweepMongo(
-                        client.getDatabase(BenchConfig.mongoDbName()), credits, new AtomicBoolean(false));
-                md.append(sweepSection("MongoDB", r));
+                final MongoDatabase db = client.getDatabase(BenchConfig.mongoDbName());
+                final String plans = "### Mongo plan (first page of the pid stream, before the sweep)\n\n"
+                        + ScenarioPlans.mongoPage(db, "")
+                        + "\n### Mongo plan (cleanup of the first snapshotted corpus pid, before the sweep; explain "
+                        + "deletes nothing)\n\n"
+                        + ScenarioPlans.mongoCleanupPid(db, gen.pid(firstIdx), gen.latestSnapshotSn(firstIdx));
+                final SweepEngine.SweepResult r = SweepEngine.sweepMongo(db, credits, new AtomicBoolean(false));
+                md.append(sweepSection("MongoDB", r)).append(plans).append('\n');
             }
         }
         md.append("\nAt Ditto's default credit pace (3 batches x 100 rows / 3 s = 100 rows/s max) the "
@@ -72,7 +84,7 @@ public final class CleanupSweepBench {
     }
 
     /** {@link #settingsLines}, then the optional settle VACUUM (bench.c3.vacuumFirst) with its duration. */
-    private static String pgPreamble(final Connection c) throws Exception {
+    static String pgPreamble(final Connection c) throws Exception {
         final StringBuilder sb = new StringBuilder(settingsLines(c));
         if (BenchConfig.c3VacuumFirst()) {
             final long t0 = System.nanoTime();
@@ -111,6 +123,13 @@ public final class CleanupSweepBench {
         final List<Long> median = RecoveryBench.pickDistinctPids(gen, CorpusGenerator.PidClass.MEDIAN, n, 0);
         final List<Long> p99 = RecoveryBench.pickDistinctPids(gen, CorpusGenerator.PidClass.P99, n, 0);
         final List<Long> outlier = RecoveryBench.pickDistinctPids(gen, CorpusGenerator.PidClass.OUTLIER, n, 0);
+        // the plan pid is a P99 pid no timed row reads, so its replay plan is a first read after the sweep (a second
+        // read of a swept pid skips the dead index entries the first one marked)
+        final List<Long> p99WithSpare = RecoveryBench.pickDistinctPids(gen, CorpusGenerator.PidClass.P99, n + 1, 0);
+        final boolean untimedPlanPid = p99WithSpare.size() > n;
+        final long planIdx = untimedPlanPid ? p99WithSpare.get(n) : p99.get(0);
+        final String planWhen = untimedPlanPid ? "an untimed P99 pid, its first read after the sweep"
+                : "the first timed P99 pid, a second read (no untimed P99 pid at this scale)";
         final StringBuilder md = new StringBuilder(BenchProtocol.runHeader(
                 "C4 — before/after proof (compare against the committed pre-sweep r2-replay.md / load-*.md)"));
 
@@ -133,6 +152,8 @@ public final class CleanupSweepBench {
                                 fullOutlier), fullOutlier, null),
                         RecoveryBench.sideBySide(withN("R2b full-scan P99 (post-sweep: only the tail remains)",
                                 fullP99), fullP99, null))));
+                md.append("\n### PG plan (R2b full-scan replay of ").append(planWhen).append(")\n\n")
+                        .append(ScenarioPlans.pgReplay(c, gen.pid(planIdx), 1L));
                 md.append("\n### Natural sizes (files do NOT shrink after deletes — see note)\n\n")
                         .append(PgLoadBench.sizesMarkdown(c));
                 if (BenchConfig.c4OfflineReclaim()) {
@@ -166,6 +187,8 @@ public final class CleanupSweepBench {
                         RecoveryBench.sideBySide(withN("R2b full-scan OUTLIER (post-sweep)", fullOutlier), null,
                                 fullOutlier),
                         RecoveryBench.sideBySide(withN("R2b full-scan P99 (post-sweep)", fullP99), null, fullP99))));
+                md.append("\n### Mongo plan (R2b full-scan replay of ").append(planWhen).append(")\n\n")
+                        .append(ScenarioPlans.mongoReplay(db, gen.pid(planIdx), 1L));
                 md.append("\n### Natural sizes\n\n").append(MongoLoadBench.sizesMarkdown(db));
                 if (BenchConfig.c4OfflineReclaim()) {
                     md.append("\n### OFFLINE reclamation (compact — blocks, standalone-only convenience)\n\n");

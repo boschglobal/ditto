@@ -148,9 +148,10 @@ public final class BenchConfig {
         return Boolean.parseBoolean(property("bench.w3.stagger", "BENCH_W3_STAGGER", "false"));
     }
 
-    /** W3 evidence file, relative to the results folder (default the canonical w3-sustained-churn.md). */
+    /** W3 evidence file, relative to the results folder (default w3-sustained-churn[-label].md). */
     public static String w3EvidenceFile() {
-        return property("bench.w3.evidenceFile", "BENCH_W3_EVIDENCE_FILE", "w3-sustained-churn.md");
+        return property("bench.w3.evidenceFile", "BENCH_W3_EVIDENCE_FILE",
+                BenchProtocol.evidenceName("w3-sustained-churn"));
     }
 
     /** unthrottled | credits — see design deviation 3. */
@@ -171,16 +172,36 @@ public final class BenchConfig {
     }
 
     /**
-     * Suffix for the evidence files of the load, W1/W2, C3/C4/C5 and the C1 payload what-if scenarios, e.g.
-     * "cl2000-pg" writes c4-before-after-cl2000-pg.md; "" (default) keeps the committed names.
+     * Suffix for every evidence file name, e.g. "limits-pg" writes r1-latest-snapshot-limits-pg.md; "" (default) keeps
+     * the committed names.
      */
     public static String evidenceLabel() {
-        final String label = property("bench.evidenceLabel", "BENCH_EVIDENCE_LABEL", "");
-        if (!LABEL.matcher(label).matches()) {
-            throw new IllegalArgumentException(
-                    "evidence label: lower-case letters, digits and '-' only: '" + label + "'");
+        return checkLabel("evidence label", property("bench.evidenceLabel", "BENCH_EVIDENCE_LABEL", ""));
+    }
+
+    /** Appended to the W1/W2 probe pids, so W1/W2 can run again on one load (W1 inserts, W2 upserts those pids). */
+    public static String probeSuffix() {
+        return checkLabel("probe suffix", property("bench.probeSuffix", "BENCH_PROBE_SUFFIX", ""));
+    }
+
+    static String checkLabel(final String what, final String value) {
+        if (!LABEL.matcher(value).matches()) {
+            throw new IllegalArgumentException(what + ": lower-case letters, digits and '-' only: '" + value + "'");
         }
-        return label;
+        return value;
+    }
+
+    /**
+     * Limits and server arguments of the running bench containers, as run-benchmark.sh read them with docker inspect
+     * right before this Maven call; empty when the bench runs without the script.
+     */
+    public static String containerLimits() {
+        return property("bench.containerLimits", "BENCH_CONTAINER_LIMITS", "");
+    }
+
+    /** Evidence folder; default the committed results folder, relative to the module directory. */
+    public static String resultsDir() {
+        return property("bench.resultsDir", "BENCH_RESULTS_DIR", BenchProtocol.DEFAULT_RESULTS_DIR);
     }
 
     /**

@@ -24,6 +24,7 @@ import org.junit.Test;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.ReplaceOptions;
 
 /**
@@ -41,12 +42,14 @@ public final class SnapshotBench {
         BenchProtocol.Timing mongoOverwrite = null;
 
         String pgVacuum = "";
+        String pgPlans = "";
+        String mongoPlans = "";
         if (BenchConfig.runPg()) {
             try (Connection c = BenchConfig.openPg(); Connection vacuumProbe = BenchConfig.openPg()) {
                 final String vacuumAtStart = PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe));
                 c.setAutoCommit(true);
                 try (PreparedStatement ps = c.prepareStatement(PersistenceShapes.PG_SAVE_SNAPSHOT)) {
-                    final String pid = "thing:bench.w2:pg";
+                    final String pid = "thing:bench.w2:pg" + BenchConfig.probeSuffix();
                     pgFresh = BenchProtocol.measure(iteration -> {
                         ps.setString(1, pid);
                         ps.setLong(2, iteration + 1L);
@@ -65,6 +68,13 @@ public final class SnapshotBench {
                                 .atOffset(ZoneOffset.UTC));
                         ps.executeUpdate();
                     });
+                    final int n = BenchConfig.warmups() + BenchConfig.iterations();   // fresh wrote sn 1..n
+                    pgPlans = "### PG plan (fresh insert at sn " + (n + 1) + "; rolled back)\n\n"
+                            + ScenarioPlans.pgSnapshotWrite(c, pid, n + 1L,
+                                    Instant.ofEpochMilli(CorpusGenerator.BASE_TIMESTAMP_MILLIS + n * 1000L))
+                            + "\n### PG plan (overwrite of the sn 1 key; rolled back)\n\n"
+                            + ScenarioPlans.pgSnapshotWrite(c, pid, 1L,
+                                    Instant.ofEpochMilli(CorpusGenerator.BASE_TIMESTAMP_MILLIS));
                 }
                 pgVacuum = "\n- PG autovacuum in progress at start: " + vacuumAtStart + "; at end: "
                         + PgVacuumProbe.formatProgress(PgVacuumProbe.progress(vacuumProbe)) + "\n";
@@ -72,9 +82,10 @@ public final class SnapshotBench {
         }
         if (BenchConfig.runMongo()) {
             try (MongoClient client = BenchConfig.openMongo()) {
-                final MongoCollection<Document> snaps = client.getDatabase(BenchConfig.mongoDbName())
-                        .getCollection(PersistenceShapes.SNAPS).withWriteConcern(WriteConcern.JOURNALED);
-                final String pid = "thing:bench.w2:mongo";
+                final MongoDatabase db = client.getDatabase(BenchConfig.mongoDbName());
+                final MongoCollection<Document> snaps =
+                        db.getCollection(PersistenceShapes.SNAPS).withWriteConcern(WriteConcern.JOURNALED);
+                final String pid = "thing:bench.w2:mongo" + BenchConfig.probeSuffix();
                 mongoFresh = BenchProtocol.measure(iteration -> {
                     final long sn = iteration + 1L;
                     final long ts = CorpusGenerator.BASE_TIMESTAMP_MILLIS + iteration * 1000L;
@@ -90,6 +101,12 @@ public final class SnapshotBench {
                                     Document.parse(ChurnEngine.churnSnapshotJson(pid, 1L))),
                             new ReplaceOptions().upsert(true));
                 });
+                final int n = BenchConfig.warmups() + BenchConfig.iterations();
+                mongoPlans = "\n### Mongo plan (fresh upsert at sn " + (n + 1) + "; explain writes nothing)\n\n"
+                        + ScenarioPlans.mongoSnapshotWrite(db, pid, n + 1L,
+                                CorpusGenerator.BASE_TIMESTAMP_MILLIS + n * 1000L)
+                        + "\n### Mongo plan (overwrite of the sn 1 key; explain writes nothing)\n\n"
+                        + ScenarioPlans.mongoSnapshotWrite(db, pid, 1L, CorpusGenerator.BASE_TIMESTAMP_MILLIS);
             }
         }
         BenchProtocol.writeEvidence(BenchProtocol.evidenceName("w2-snapshot-write"),
@@ -99,6 +116,7 @@ public final class SnapshotBench {
                                 RecoveryBench.sideBySide("overwrite (same pid/sn/ts key)", pgOverwrite, mongoOverwrite)))
                         + "\nPG: INSERT ... ON CONFLICT (pid, sn, written_at) DO UPDATE. "
                         + "Mongo: replaceOne({pid,sn,ts}, upsert=true), WriteConcern JOURNALED "
-                        + "(ScalaDriverPersistenceSnapshotter.saveSnapshot).\n" + pgVacuum);
+                        + "(ScalaDriverPersistenceSnapshotter.saveSnapshot).\n" + pgVacuum
+                        + "\n" + pgPlans + mongoPlans);
     }
 }
