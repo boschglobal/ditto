@@ -43,8 +43,9 @@ namespaces Zipf over 50; journal depth piecewise log-uniform with median 20, p99
 backend; `--count 500000` matches the design's ~40 GB-per-backend budget); things-shaped event JSON
 300 B–1 KB; snapshots every 500 events (things default `snapshot.threshold`), 2–10 KB, carried by
 the ~3.4% of pids with depth ≥ 500; PG additionally gets one `things_journal_seq` row per pid.
-No journal tags and no DELETED-lifecycle snapshots (all corpus entities live) — tag indexes and the
-lifecycle partial index are still created for schema fidelity.
+No journal tags and no DELETED-lifecycle snapshots (all corpus entities live) — the PG loader still builds
+exactly the persistence schema's `things_*` indexes and storage parameters (taken from
+`PostgresSchema.ddlStatements()`; schema v3 has no lifecycle index).
 
 Row timestamps: every row is written at 2026-01-01 + sn seconds, months older than any cleanup
 retention. `--fresh-share S` (`-Dbench.freshShare`) instead writes ALL rows of a share S of the pids
@@ -69,7 +70,10 @@ scenarios pin `DefaultCleanupConfig`: reads-per-query 100, writes-per-credit 100
 history-retention 0d, delete-final-deleted-snapshot false. The C3 sweep runs unthrottled by default
 — Ditto's credit gate (3×100-row batches per 3 s ⇒ ≤100 rows/s) is structurally replicated but
 would need days for this corpus; evidence quotes the computed default-pace duration
-(`-Dbench.sweep.pace=credits` enables the real pace).
+(`BENCH_SWEEP_PACE=credits` enables the real pace; the `window` stage (scenario C5) always runs at the credit pace,
+for `BENCH_SWEEP_MAX_SECONDS`).
+The 2026-10-21 C3/C4/C5 runs time 50 executions (`BENCH_ITERATIONS=50`) on distinct pids: C4 never re-reads a pid, so a
+row's n (in its label) can be below 50.
 
 ## 5. Headline results
 
@@ -86,6 +90,17 @@ fresh-share corpus. They are not directly comparable with the other rows, which 
 co-resident July run. The per-pid view on that corpus (Mongo pages of ~22 pids on a never-cleaned
 backlog) is §7 caveat 11.
 
+The C3, C4 and C5 rows of 2026-10-21 come from single-backend runs (one container at a time) on schema v3: 50 timed
+executions on distinct pids, a manual `VACUUM (ANALYZE)` before the sweep, offline reclamation skipped, and the
+`postgres:16` image's vacuum defaults (`autovacuum_vacuum_cost_limit` -1, i.e. 200 per 2 ms; `maintenance_work_mem`
+64 MB; 3 workers). Their July values are in the History paragraph. Host-memory reliability: on every PostgreSQL run
+macOS swapped out 12–19k pages (16 KiB) during the sweep's first minutes while ≥ 81 % of memory stayed free, so each
+PG C3 stage, and with it each PG configuration run, is marked unreliable (a repeat showed the same); the 2 h C5 window
+lost 36,995 pages in two bursts, about 3 and 57 minutes in, and is marked unreliable as well; the C4 stage of
+the shipped configuration and the whole MongoDB run had no swap-outs. Treat the PG C3/C4 numbers as indicative. Across
+the two loads of each configuration the post-sweep autovacuum finished 17 / 52 s (cost limit 2000), 722 / 403 s (800)
+and 2,936 / 2,952 s (v2 storage parameters) after the sweep; the evidence files are the second loads'.
+
 | scenario | PG p95 | Mongo p95 | verdict |
 |---|---|---|---|
 | R1 latest snapshot (worst class) | 1.14 | 1.33 | parity |
@@ -98,8 +113,9 @@ backlog) is §7 caveat 11.
 | C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page — sized by the what-if note below; no production change |
 | C1 cleanup pid-stream page, minAge 0 | 2.87 p50 / 3.99 p95 (2026-10-02; was 8.50 p95 on 2026-07-13) | 1.02 p50 / 1.27 p95 (was 10.71) | single-backend re-run: PG 2.5–2.8× (p50) slower per page; the July "PG faster" does not reproduce (cause untested; July's Mongo C1 itself moved 42.47 → 10.71 ms in one day). Former 21× FLAG vs schema v1 stays closed (887 → 3–8.5 ms) |
 | C2 single-pid cleanup (outlier total) | 993 | 1163 | parity |
-| C3 full sweep (21.05M rows) | 797 s | 488 s | Mongo 1.6× faster (delete-batch bound); identical deletions both sides |
-| **C4 post-sweep replay before reclamation** | **16.9 (tail) / 98.5 (full-scan)** | **13.2 / 6.7** | **FLAG: PG replays walk dead space until vacuum (worst-case: unthrottled sweep, §7.5)** |
+| C3 full sweep (22.13M rows; schema v3, single-backend 2026-10-21) | 778 s | 292 s | Mongo 2.7× faster (delete-batch bound); identical deletions both sides; PG run unreliable (host memory, above) |
+| **C4 post-sweep replay, schema v3** (distinct pids; the autovacuum after the sweep finished 52 s after it with the shipped storage parameters — 52 s with cost limit 2000, 2,952 s with v2's, 403 s with 800; July: not within 900 s) | tail P99 4.74 p50 / 7.23 p95 (n=50); full-scan OUTLIER 1.23 / 1.94 (n=23); full-scan P99 1.22 / 1.60 (n=50) | tail P99 3.16 p50 / 5.09 p95 (n=50); full-scan OUTLIER 1.56 / 2.00 (n=23); full-scan P99 1.47 / 1.98 (n=50) | FLAG closed: PG ≤ 2× (1.0× / 0.8×); PG run unreliable (host memory, above) |
+| C5 credit-paced cleanup window (2 h at ≤ 100 rows/s, production order, shipped storage parameters) | 405,515 rows deleted (56 rows/s); dead tuples peak 348,401 (60 s samples) vs the 0.01 trigger 350,737; one autovacuum, 1 h 45 min into the window, cleared them; replay of swept pids as left 1.64 / 3.50 vs after VACUUM 1.57 / 3.18 (n=50), but both halves are pids that autovacuum had already cleaned (sweep positions 6–105 of 184; caveat 5) | — (MongoDB removes index keys in the delete itself) | replay slowdown of pids swept since the last autovacuum not measured (the 1.1× ratio is not a test of it); at credit pace ≈ 1 % of the journal turned dead before one autovacuum cleared it; run unreliable (host memory, above) |
 | M1 churn under live sweep (achieved of 500/s) | 499.8/s | 499.9/s | both hold; 296,576 rows swept live on each |
 
 C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20, schema v3, the 2026-10-02
@@ -116,6 +132,9 @@ Mongo p95 (242 MB temp spill per page; Seq Scan + Sort over ~40k rows) and W2 wa
 PG vs 6.25 / 3.35 ms Mongo. Those runs are kept verbatim, with provenance headers, in
 `../src/test/resources/bench/results/history/2026-07-13-schema-v1/` (`c1-pid-stream-page.md`,
 `w2-snapshot-write.md`); they are superseded by the current files above.
+The July C3/C4 runs (schema v2, co-resident, 20 iterations; `c3-full-sweep.md`, `c4-before-after.md`): C3 797 s PG /
+488 s Mongo; C4 16.9 (tail) / 98.5 (full-scan; the 2nd-highest of 20 samples, max 366.7) ms PG vs 13.2 / 6.7 ms Mongo,
+the settle loop timing out at 900 s with dead tuples flat at 11.3M. The 2026-10-21 rows above supersede them.
 
 W2 noise caveat: the v1 -> v2 W2 gain (4.31 -> 2.96 and 3.30 -> 2.33 ms, about 30 %) compares two
 separate runs, and the unchanged Mongo numbers moved between them as well (fresh 6.25 -> 4.79 ms,
@@ -169,6 +188,8 @@ steady) — budget peak, not steady state; 500k needs ≳130–150 GB free.
 | C1 pid stream / C2 single-pid / C3 sweep / C4 proof | `c1-*.md`, `c2-*.md`, `c3-*.md`, `c4-*.md` |
 | C1 with the production age filter | `../src/test/resources/bench/results/c1-pid-stream-page-retention3d-pg.md`, `../src/test/resources/bench/results/c1-pid-stream-page-retention3d-mongo.md`, `../src/test/resources/bench/results/load-pg-fresh-share-0.3.md`, `../src/test/resources/bench/results/load-mongo-fresh-share-0.3.md` |
 | C1 payload what-if (NOT PRODUCTION) | ../src/test/resources/bench/results/c1-payload-free-what-if-retention3d-pg-run1.md, …-run2.md, …-run3.md, ../src/test/resources/bench/results/load-pg-fresh-share-0.3-payload-whatif.md |
+| C3 / W1 / W2 / C4 on schema v3 (2026-10-21; PG runs unreliable, §5) | `c3-full-sweep-<label>.md`, `w1-single-append-<label>.md`, `w2-snapshot-write-<label>.md`, `c4-before-after-<label>.md`, `load-pg-<label>.md` for `cl2000-pg` (cost limit 2000), `cldefault-pg` (v2 storage parameters), `cl800-pg` (800); `load-mongo-mongo-ref.md`, `c3-full-sweep-mongo-ref.md`, `c4-before-after-mongo-ref.md` |
+| C5 credit-paced window | `c5-credit-paced-window-credits-pg.md`, `load-pg-credits-pg.md` |
 | M1 mixed | `m1-cleanup-under-traffic.md` |
 
 ## 6. Reproducing
@@ -240,6 +261,31 @@ for r in 1 2 3; do BENCH_EVIDENCE_LABEL=run$r benchmark/run-benchmark.sh payload
     --count 250000 --fresh-share 0.3 --fresh-base <T> --retention 3d; done
 ```
 
+The C3/C4/C5 rows of 2026-10-21 (schema v3): one backend at a time, `down --purge` between loads, and
+for every stage
+
+```
+export BENCH_ITERATIONS=50 BENCH_C4_SETTLE_TIMEOUT=3600 BENCH_C3_VACUUM_FIRST=true BENCH_C4_OFFLINE_RECLAIM=false
+export BENCH_EVIDENCE_LABEL=cl2000-pg    # cldefault-pg: also BENCH_PG_RELOPTIONS='autovacuum_vacuum_scale_factor = 0.01'
+                                         # cl800-pg: also BENCH_PG_RELOPTIONS='autovacuum_vacuum_scale_factor = 0.01,
+                                         #   autovacuum_vacuum_cost_limit = 800'
+benchmark/run-benchmark.sh build up load --backend pg --count 250000
+benchmark/run-benchmark.sh c3 --backend pg --count 250000
+benchmark/run-benchmark.sh wcheck --backend pg --count 250000
+benchmark/run-benchmark.sh c4 --backend pg --count 250000
+benchmark/run-benchmark.sh down --purge
+BENCH_EVIDENCE_LABEL=mongo-ref benchmark/run-benchmark.sh build up load --backend mongo --count 250000
+BENCH_EVIDENCE_LABEL=mongo-ref benchmark/run-benchmark.sh c3 --backend mongo --count 250000
+BENCH_EVIDENCE_LABEL=mongo-ref benchmark/run-benchmark.sh c4 --backend mongo --count 250000
+benchmark/run-benchmark.sh down --purge
+BENCH_EVIDENCE_LABEL=credits-pg benchmark/run-benchmark.sh build up load --backend pg --count 250000
+BENCH_EVIDENCE_LABEL=credits-pg BENCH_SWEEP_MAX_SECONDS=7200 BENCH_SAMPLE_INTERVAL=60 \
+    benchmark/run-benchmark.sh window --backend pg --count 250000
+```
+
+Between stages the runs waited until two host-memory samples 2 minutes apart showed no swapping (≤ 1,000 pages
+swapped out, ≥ 50 % free), and every measured stage had such a sample right before and after it.
+
 ## 7. Caveats — read before quoting numbers
 
 1. Laptop-scale Docker; 10-minute windows — trends, not plateau claims.
@@ -247,8 +293,14 @@ for r in 1 2 3; do BENCH_EVIDENCE_LABEL=run$r benchmark/run-benchmark.sh payload
    is symmetric and fair; absolute service-level latency is higher.
 3. Mongo delete timings have no plan-level evidence (`deleteMany` lacks executionStats).
 4. Synthetic corpus; payload knobs approximate no specific customer data set.
-5. C3 pace is unthrottled by default (deviation 3); Ditto's production pace is far slower and
-   gentler — the dead-tuple/autovacuum observations under unthrottled load are worst-case.
+5. C3 pace is unthrottled by default (§4); Ditto's production pace is far slower and
+   gentler — the dead-tuple/autovacuum observations under unthrottled load are worst-case. C5 runs a 2 h
+   credit-paced window: dead tuples grew to about 348k (≈ 1 % of the journal) until the 0.01 trigger after about
+   1 h 45 min, and one autovacuum of `things_journal` cleared them (`n_dead_tup`). C5's replay does not show whether
+   pids swept since the last autovacuum replay slower: it times the pids swept first (sweep positions 6–105 of 184),
+   which that autovacuum had already cleaned, so both halves (p95 3.50 ms as left vs 3.18 ms after a manual VACUUM,
+   n=50) are clean pids. That replay cost is not measured; it needs the as-left pids picked from those swept after the
+   window's last autovacuum.
 6. C2/C3 do not update `journal_seq.deleted_to` — neither does Ditto's real cleanup path.
 7. Corpus rows carry historic timestamps (2026-01-01 base), and the scenarios pin
    `history-retention-duration=0d`, which disables the cleanup age filter. That is the code
@@ -280,6 +332,10 @@ for r in 1 2 3; do BENCH_EVIDENCE_LABEL=run$r benchmark/run-benchmark.sh payload
     handling. Production would also skip decoding and JSON-parsing the payloads; the evidence estimates that with
     pgjdbc and ditto-json, not through r2dbc. The comparison with Mongo uses the 2026-10-02 Mongo run (not
     re-run; one backend at a time; that PG anchor ran on schema v2, this run on v3).
+13. The 2026-10-21 C4 never re-reads a pid: at `--count 250000` only 26 OUTLIER-class pids exist, so its OUTLIER rows
+    have n = 23 (26 minus 3 warm-ups) and the full-scan P99 row carries the 50-sample view of the same dead-space walk.
+    C3/C5 sample tables have an `autovacuum in progress` column; C4 records the settle timeline with vacuum progress
+    and autovacuum wait events.
 
 ## 8. Presenting this
 
