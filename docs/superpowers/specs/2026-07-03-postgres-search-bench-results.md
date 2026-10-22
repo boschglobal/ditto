@@ -16,6 +16,10 @@ as such and kept separate from measured facts.
 > tuned memory) that do not ship. §10 "Production-config baseline" measures the shipped schema, translator and read
 > persistence on the same corpus; at 1M things only the low-cardinality `ilike` shape meets the 200 ms p95 gate
 > there.
+>
+> **Final re-run (2026-10-22):** §11 supersedes §10's numbers for the current code (8 of 20 variants pass the 200 ms
+> gate: 3-low, the counter-examples `ce-a`, `ce-a-sudo`, `ce-b` and four lone ranges; shapes 1 and 5 fall to 267 /
+> 205 ms p95 and miss only on their first round).
 
 ## 1. Corpus and load (Task 0.1)
 
@@ -346,10 +350,12 @@ as an open risk, not resolved**: the full 10M run is the only way to actually an
   `environment.md`, `load.md`, `cold.md`, `corpus-bias.md`, `shape-*.md`, `warm.json`, `cold.json`;
   `attempt-1-interleaved/` and `attempt-2-contiguous-3-warmups/` = superseded runs, kept for the protocol
   comparison)
+- `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/final-2026-10-22/` (§11: the final
+  re-run; `lone-range/`, `path-index/`, `invariance/`, `vs-baseline.md`, `byte-identity.md`, `host-memory.md`)
 
 ## 10. Production-config baseline (shipped schema + translator), 2026-09-30
 
-**These are the read numbers that describe the shipped system.**
+**These read numbers described the shipped system on 2026-09-30; §11 supersedes them for the current code.**
 
 - Harness: `ProductionConfigLoadBench` + `ProductionConfigReadBench` (commit `75c1cf138f`). Runbook:
   `src/test/resources/bench/README.md`, "Production-config mode".
@@ -488,3 +494,78 @@ Findings (each read off the committed plans / per-iteration tables):
 9. **Environment caveat:** the OrbStack VM's page cache varies (0.3–10 GB cached before the cold drops, `cold.md`),
    and memory is returned to macOS. Beyond the 128MB `shared_buffers`, "warm" means "read recently enough to still
    be cached somewhere", and the cold samples carry an unknown host-cache state.
+
+## 11. Final production-config re-run on the shipped code, 2026-10-22
+
+**These are the read numbers that describe the shipped system.** The same harness, corpus generator and seed, server
+settings and protocol as §10, on the code at `f543fa47df` with shipped defaults (selective range legs on, no per-path
+index): `pc-read` → `pc-cold` → `pc-bias` with `--results-dir …/final-2026-10-22` on a loaded corpus (2026-10-22,
+1,000,000 things, 68,513,542 flat rows, 29 GB, catalog check against the production DDL true, no writes since the
+load). Every run whose numbers are used was reliable on the host-memory rule (0 swap-outs, ≥ 50 % free before and
+after). Reading rule against §10: a difference counts as a code effect only where the iteration-0 SQL **and** plan
+changed (shapes 1, 5 and the five shape-4 pages); the isolated effect is in that change's own A/B folder. Shapes 2,
+3-low and 3-high render §10's SQL, so their differences are drift between loads and days. Evidence:
+`internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/final-2026-10-22/`.
+
+| Variant (1M things) | baseline 2026-09-30 warm p50 / p95 | **final warm p50 / p95 (all rounds)** | p95 per round | settled? | cold 1st exec (3 samples) | 200 ms gate | SQL / plan vs baseline |
+|---|---:|---:|---|---|---|:---:|---|
+| 1: city `eq` AND temperature range | 895 / 1,365 | **124 / 267** | 296 · 134 · 129 | no (129%) | 2,107 · 250 · 232 | MISS | changed / changed |
+| 2: `gt` on one feature property | 120 / 399 | **110 / 423** | 437 · 116 · 110 | no (298%) | 191 · 252 · 209 | MISS | same / same |
+| 3-low: `ilike` low-card attribute | 47 / 50 | **42 / 53** | 55 · 44 · 44 | no (26%) | 800 · 74 · 72 | pass | same / same |
+| 3-high: `ilike` `features/*` property | 199 / 392 | **208 / 357** | 358 · 338 · 333 | yes | 3,131 · 488 · 458 | MISS | same / changed |
+| 4: sort, page 1 | 578 / 600 | **314 / 558** | 353 · 575 · 338 | no (70%) | 650 · 606 · 744 | MISS | changed / changed |
+| 4: sort, page 100 via OFFSET | 611 / 653 | **325 / 447** | 385 · 469 · 332 | no (41%) | 609 · 605 · 608 | MISS | changed / changed |
+| 4: sort, page 100 via cursor (keyset) | 735 / 773 | **658 / 720** | 678 · 707 · 763 | no (12%) | 4,725 · 997 · 994 | MISS | changed / changed |
+| 4: sort, page 201 via OFFSET | 622 / 648 | **347 / 375** | 361 · 363 · 376 | yes | 617 · 622 · 615 | MISS | changed / changed |
+| 4: sort, page 201 via cursor (keyset) | 286 / 300 | **258 / 462** | 536 · 258 · 462 | no (108%) | 450 · 386 · 367 | MISS | changed / changed |
+| 5: count, shape 1's filter | 988 / 1,641 | **138 / 205** | 215 · 160 · 167 | no (34%) | 224 · 234 · 231 | MISS | changed / changed |
+| `ce-a`: rare zip `eq` + wide temperature range | — | **1.6 / 1.7** | 1.7 · 1.7 · 1.7 | yes | 6.0 · 5.4 · 5.5 | pass | — |
+| `ce-a-sudo`: the same, sudo | — | **1.3 / 1.5** | 1.5 · 1.6 · 1.5 | yes | 8.9 · 4.9 · 7.2 | pass | — |
+| `ce-b`: city `eq` + 0.09-wide temperature range | — | **17 / 42** | 28 · 17 · 48 | no (188%) | 36 · 40 · 37 | pass | — |
+| `ce-c`: lone two-sided temperature range | — | **126 / 314** | 358 · 136 · 127 | no (182%) | 247 · 206 · 208 | MISS | — |
+| `lone-wide`: lone range 0..100 (~62 % of the things) | — | **114 / 130** | 122 · 131 · 118 | no (12%) | 182 · 212 · 185 | pass | — |
+| `lone-wide-sudo`: the same, sudo | — | **1.1 / 1.2** | 1.2 · 1.2 · 1.1 | yes | 11 · 4.4 · 4.5 | pass | — |
+| `lone-wide-count`: count, lone range 0..100 | — | **72 / 108** | 115 · 79 · 66 | no (74%) | 171 · 212 · 202 | pass | — |
+| `lone-wide-sudo-count`: sudo count, lone range 0..100 | — | **5,404 / 6,076** | 6,076 · 5,688 · 6,001 | yes | 56,502 · 13,554 · 9,900 | MISS | — |
+| `lone-mid`: lone range of ~40,000 things | — | **130 / 491** | 544 · 142 · 132 | no (312%) | 2,464 · 226 · 231 | MISS | — |
+| `lone-mid-sudo`: the same, sudo | — | **4.4 / 6.0** | 6.0 · 6.1 · 6.0 | yes | 113 · 27 · 17 | pass | — |
+
+- **Gate: 8 of 20 variants pass** (all-rounds warm p95): 3-low, `ce-a`, `ce-a-sudo`, `ce-b`, `lone-wide`,
+  `lone-wide-sudo`, `lone-wide-count`, `lone-mid-sudo`.
+- **Same code, same load, earlier that day** (`range-legs-quiet-host/after/`, 13 shared variants, byte-identical SQL and
+  binds): shapes 1, 2, 5, `ce-b`, `ce-c` and `lone-wide` were slower beyond the noise band in this run (shape 1 267 vs
+  160–165 ms, shape 5 205 vs 132–135 ms), the others within it. The difference sits in single rounds, mostly the first,
+  or spreads over a whole run (shape 5): run-to-run spread, not code.
+- **Lone two-sided ranges, `off` vs `auto`** (ABBA, `lone-range/`): the same statement and binds in both modes in all
+  four runs, no selective-leg CTE. Mean of two runs per arm, ms: `lone-wide` 195 → 205, `lone-wide-sudo` 2.7 → 3.05,
+  `lone-wide-count` 277 → 158, `lone-wide-sudo-count` 5,411 → 8,028, `lone-mid` 367 → 435, `lone-mid-sudo` 6.3 → 9.0.
+  The three outside the band are drift of an identical statement (slow first rounds; one `auto` run of the sudo count
+  at ~9 s per execution while other processes loaded the host's CPU). A lone range is never materialised.
+- **Per-path trigram index** (operator option, `path-index/`, ABBA): 3-high 298 → 120 ms p95 with
+  `sf_path_trgm_ca5f5cd692cb58e9` (the `PathIndex.createStatement()` definition, built in 43 s, 51 MB); the B plans use
+  it and neither `sf_exists` nor `BitmapAnd`; 3-low, the control, does not use it.
+- **Invariance** (`invariance/invariance.md`): `pc-invariance` with its default set, 18:10 min: **Differences: 0**
+  (51 requests executed in both modes, 36 identical lone-range statements not executed).
+- **Caveats:** as in §10 (laptop OrbStack VM, postgres:16 defaults, fresh load, corpus bias — `corpus-bias.md` gives
+  the same counts —, cold samples with an unknown host-cache state: no cold-vs-warm ratio). The host-memory rule judges
+  swap-outs and free memory, not CPU; single slow rounds and iterations make the all-rounds p95 of unsettled variants
+  the conservative figure, and the per-round p95s are given next to it.
+
+How the final run changes §10's findings:
+
+- Finding 1 — Final re-run (2026-10-22): the grouped pick takes shapes 1 and 5 from 1,365 / 1,641 ms to 267 / 205 ms
+  all-rounds p95 (rounds 2–3: 134 · 129 and 160 · 167 ms). Both still miss the gate on the all-rounds figure because of
+  their first round (shape 1: iterations 3 and 10–12 at 267–330 ms).
+- Finding 2 — Final re-run (2026-10-22): shape 2 renders the same statement; round 1 again sets its p95 (437 ms;
+  iterations 7–22, which meet their subject pair for the first time, 213–480 ms), rounds 2–3 116 · 110 ms.
+- Finding 3 — Final re-run (2026-10-22): 3-high settled at 357 ms. On this load `*234*` also gets
+  `BitmapAnd(sf_trgm, sf_exists)` (the iteration-0 plan changed, the SQL did not). A per-path trigram index on the
+  property removes the `sf_exists` probe: 298 → 120 ms.
+- Finding 4 — Final re-run (2026-10-22): with the path-bound sort lateral, page 1, the OFFSET pages and the page-201
+  cursor run at a floor of ~0.25–0.35 s (all-rounds p95 375–558 ms), the page-100 cursor at 658 / 720 ms; single slow
+  iterations (up to 683 ms on page 1) left four of the five pages unsettled. All five still miss the gate.
+- Finding 6 — Final re-run (2026-10-22): the first round still decides the verdict of the unsettled variants (shapes 1,
+  2 and 5, `ce-c`, `lone-mid`).
+- Finding 9 — Final re-run (2026-10-22): a sudo count over ~62 % of the things (`lone-wide-sudo-count`, ~5.4 s warm)
+  took 56.5 s on its first cold execution, and the harness's untimed count of it exceeded the shipped 60 s statement
+  timeout twice on a cold VM page cache (both runs were repeated; the timeout was not raised).

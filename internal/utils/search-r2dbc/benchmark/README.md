@@ -23,6 +23,12 @@ windows; the full 10M / ≥1h bloat-plateau run is a scheduled follow-up, not ye
 > (production DDL, the production RQL→SQL translator and read persistence, `force_custom_plan`) are in
 > [§5 "Production-config baseline"](#production-config-baseline-shipped-schema--translator): at 1M
 > things only the low-cardinality `ilike` shape meets the 200 ms p95 gate there.
+>
+> **Final re-run (2026-10-22):** the same harness and protocol on the current code, in
+> [§5 "Final re-run on the shipped code"](#final-re-run-on-the-shipped-code-2026-10-22), supersede those baseline
+> numbers: 8 of 20 variants pass the gate (3-low, the counter-examples `ce-a`, `ce-a-sudo`, `ce-b` and four lone
+> ranges). Shapes 1 and 5 fall from 1.4–1.6 s to 267 / 205 ms p95; they stay below 200 ms in rounds 2–3 but miss the
+> gate on the all-rounds p95.
 
 ---
 
@@ -158,10 +164,11 @@ do (it serves one predicate field per query).
 
 ### Production-config baseline (shipped schema + translator)
 
-**These are the numbers that describe the shipped system.** Everything above in §5 was measured
-with hand-written SQL (a simplified auth recheck) and, for the ladder, bench-only extras. The
-production-config mode (runbook: `src/test/resources/bench/README.md`, "Production-config mode";
-one command: `run-benchmark.sh production-config`) measures instead:
+**These numbers described the shipped system on 2026-09-30; the
+[final re-run](#final-re-run-on-the-shipped-code-2026-10-22) below supersedes them for the current code.** Everything
+above in §5 was measured with hand-written SQL (a simplified auth recheck) and, for the ladder, bench-only extras. The
+production-config mode (runbook: `src/test/resources/bench/README.md`, "Production-config mode"; one command:
+`run-benchmark.sh production-config`) measures instead:
 
 - **Schema:** only `PostgresSearchSchema.ddlStatements()`. A catalog check compares every index definition,
   column, constraint, reloption, statistics target and extended statistics object with a reference built from
@@ -342,6 +349,75 @@ Reading the table (all from the committed plans and per-iteration tables):
   and memory is handed back to macOS. Beyond PostgreSQL's 128MB `shared_buffers`, "warm" means "read recently
   enough to still be cached somewhere", and cold numbers carry an unknown host-cache state.
 
+### Final re-run on the shipped code (2026-10-22)
+
+**These are the read numbers that describe the shipped system.** Same harness, corpus generator and seed, server
+settings and protocol as the baseline above, on the code at `f543fa47df` with shipped defaults (selective range legs
+on, no per-path index), on a loaded corpus: `pc-read` → `pc-cold` → `pc-bias` with `--results-dir
+…/final-2026-10-22`. Every run whose numbers are used was reliable on the host-memory rule (0 swap-outs); two
+lone-range first tries failed on the statement timeout and were repeated. Evidence:
+`results/production-config/final-2026-10-22/` (`summary.md`, `vs-baseline.md`, `README.md`).
+
+| Variant (1M things) | baseline 2026-09-30 warm p50 / p95 | **final warm p50 / p95 (all rounds)** | p95 per round | settled? | cold 1st exec (3 samples) | 200 ms gate | SQL / plan vs baseline |
+|---|---:|---:|---|---|---|:---:|---|
+| 1: city `eq` AND temperature range | 895 / 1,365 | **124 / 267** | 296 · 134 · 129 | no (129%) | 2,107 · 250 · 232 | MISS | changed / changed |
+| 2: `gt` on one feature property | 120 / 399 | **110 / 423** | 437 · 116 · 110 | no (298%) | 191 · 252 · 209 | MISS | same / same |
+| 3-low: `ilike` low-card attribute | 47 / 50 | **42 / 53** | 55 · 44 · 44 | no (26%) | 800 · 74 · 72 | pass | same / same |
+| 3-high: `ilike` `features/*` property | 199 / 392 | **208 / 357** | 358 · 338 · 333 | yes | 3,131 · 488 · 458 | MISS | same / changed |
+| 4: sort, page 1 | 578 / 600 | **314 / 558** | 353 · 575 · 338 | no (70%) | 650 · 606 · 744 | MISS | changed / changed |
+| 4: sort, page 100 via OFFSET | 611 / 653 | **325 / 447** | 385 · 469 · 332 | no (41%) | 609 · 605 · 608 | MISS | changed / changed |
+| 4: sort, page 100 via cursor (keyset) | 735 / 773 | **658 / 720** | 678 · 707 · 763 | no (12%) | 4,725 · 997 · 994 | MISS | changed / changed |
+| 4: sort, page 201 via OFFSET | 622 / 648 | **347 / 375** | 361 · 363 · 376 | yes | 617 · 622 · 615 | MISS | changed / changed |
+| 4: sort, page 201 via cursor (keyset) | 286 / 300 | **258 / 462** | 536 · 258 · 462 | no (108%) | 450 · 386 · 367 | MISS | changed / changed |
+| 5: count, shape 1's filter | 988 / 1,641 | **138 / 205** | 215 · 160 · 167 | no (34%) | 224 · 234 · 231 | MISS | changed / changed |
+| `ce-a`: rare zip `eq` + wide temperature range | — | **1.6 / 1.7** | 1.7 · 1.7 · 1.7 | yes | 6.0 · 5.4 · 5.5 | pass | — |
+| `ce-a-sudo`: the same, sudo | — | **1.3 / 1.5** | 1.5 · 1.6 · 1.5 | yes | 8.9 · 4.9 · 7.2 | pass | — |
+| `ce-b`: city `eq` + 0.09-wide temperature range | — | **17 / 42** | 28 · 17 · 48 | no (188%) | 36 · 40 · 37 | pass | — |
+| `ce-c`: lone two-sided temperature range | — | **126 / 314** | 358 · 136 · 127 | no (182%) | 247 · 206 · 208 | MISS | — |
+| `lone-wide`: lone range 0..100 (~62 % of the things) | — | **114 / 130** | 122 · 131 · 118 | no (12%) | 182 · 212 · 185 | pass | — |
+| `lone-wide-sudo`: the same, sudo | — | **1.1 / 1.2** | 1.2 · 1.2 · 1.1 | yes | 11 · 4.4 · 4.5 | pass | — |
+| `lone-wide-count`: count, lone range 0..100 | — | **72 / 108** | 115 · 79 · 66 | no (74%) | 171 · 212 · 202 | pass | — |
+| `lone-wide-sudo-count`: sudo count, lone range 0..100 | — | **5,404 / 6,076** | 6,076 · 5,688 · 6,001 | yes | 56,502 · 13,554 · 9,900 | MISS | — |
+| `lone-mid`: lone range of ~40,000 things | — | **130 / 491** | 544 · 142 · 132 | no (312%) | 2,464 · 226 · 231 | MISS | — |
+| `lone-mid-sudo`: the same, sudo | — | **4.4 / 6.0** | 6.0 · 6.1 · 6.0 | yes | 113 · 27 · 17 | pass | — |
+
+- **Gate: 8 of 20 pass** (3-low, `ce-a`, `ce-a-sudo`, `ce-b`, `lone-wide`, `lone-wide-sudo`, `lone-wide-count`,
+  `lone-mid-sudo`).
+  - Shapes 1 and 5 miss on their first round: rounds 2–3 p95 134 · 129 ms and 160 · 167 ms, all rounds 267 / 205 ms.
+    The same code on the same load measured 160–165 ms and 132–135 ms earlier that day (`range-legs-quiet-host/after/`)
+    with byte-identical statements, so the difference is run-to-run spread, mostly the first round.
+  - Shape 2, `ce-c`, `lone-mid`: the first round only (437 / 358 / 544 ms p95), in which the iterations past the
+    filter rotation meet their subject pair for the first time; rounds 2–3 110–142 ms.
+  - 3-high (357 ms, settled), the five sort pages (375–720 ms) and `lone-wide-sudo-count` (a sudo count over 622,807
+    things, ~5.4 s).
+- **What changed since the baseline:** shapes 1/5 — selective range legs with a grouped pick
+  (`range-legs-quiet-host/`); 4-* — the path-bound sort lateral (`sort-path-bound/`). 2, 3-low and 3-high render the
+  baseline's SQL: their differences are drift between loads. 3-high's iteration-0 plan changed with the new `ANALYZE`
+  sample (`*234*` now gets `BitmapAnd(sf_trgm, sf_exists)`, the plan the baseline showed for `*890*`).
+- **Lone two-sided ranges** (`off` vs `auto`, ABBA, `final-2026-10-22/lone-range/`), all-rounds warm p95 in ms, mean
+  of two runs per arm:
+
+  | variant | `off` | `auto` | band | verdict |
+  |---|---:|---:|---:|---|
+  | `lone-wide` | 195 | 205 | 19 | within band |
+  | `lone-wide-sudo` | 2.7 | 3.05 | 10 | within band |
+  | `lone-wide-count` | 277 | 158 | 28 | identical statement ¹ |
+  | `lone-wide-sudo-count` | 5,411 | 8,028 | 541 | identical statement ¹ |
+  | `lone-mid` | 367 | 435 | 37 | identical statement ¹ |
+  | `lone-mid-sudo` | 6.3 | 9.0 | 10 | within band |
+
+  The same statement and binds in both modes in all four runs: a lone range is never materialised. ¹ Outside the
+  band, so run-to-run drift of an identical statement: slow first rounds, and one `auto` run of the sudo count at
+  ~9 s per execution while other processes loaded the host's CPU.
+- **Per-path trigram index** (operator option, `final-2026-10-22/path-index/`): infix `ilike` on
+  `features/*/properties/prop0` (3-high) 298 → 120 ms p95 (ABBA means; built in 43 s, 51 MB); 3-low, the control, does
+  not use it.
+- **Invariance:** `pc-invariance`, default set, **Differences: 0** (`final-2026-10-22/invariance/`, 18:10 min).
+- **Statement timeout:** the sudo count over ~62 % of the things takes ~5.4 s warm and 56.5 s on its first cold
+  execution; twice the harness's untimed count of it exceeded the shipped 60 s statement timeout on a cold page cache
+  (`final-2026-10-22/README.md`).
+- Caveats as for the baseline (environment, fresh load, corpus bias, cold definition).
+
 ### Write path (10-minute sustained run, 16 workers, target 200 upd/s)
 
 Workload: full re-flatten of a 500-leaf thing per update — doc-row upsert + blanket
@@ -378,9 +454,9 @@ Stages can be run individually (they build on each other in this order):
 | `fixround` | Optional evidence-fix methods + the two cold-start probes (container restart before each) | ~10 min |
 | `write` | Write fan-out Part 0 (drop E3 indexes) → Part 1 (10 min sustained) → Part 2 (2×5 min blanket vs anti-join) | ~25 min |
 | `down` | Remove the container (`--purge` also deletes the data volume) | seconds |
-| `production-config` | `pc-up pc-load pc-read pc-cold pc-bias`: the shipped-schema + shipped-translator baseline (§5), own container `ditto-search-bench-pc` (port 55433, volume `ditto-search-bench-pc-data`) | ~25 min at 1M (load 678 s; warm 551 s, cold 161 s, bias 11 s) |
+| `production-config` | `pc-up pc-load pc-read pc-cold pc-bias`: the shipped-schema + shipped-translator baseline (§5), own container `ditto-search-bench-pc` (port 55433, volume `ditto-search-bench-pc-data`) | ~25 min at 1M (load 678 s; warm 551 s, cold 161 s, bias 11 s); final re-run 2026-10-22 on the loaded corpus (20 variants): warm 847 s, cold 338 s, bias 21 s |
 | `pc-load` / `pc-read` / `pc-cold` / `pc-bias` | the stages individually, in this order (`--rounds N`, `--cold-samples N`, `--results-dir DIR`); `pc-bias` only after `pc-cold` (it reads the pages the first cold samples need); `pc-status`, `pc-down [--purge]` | see above |
-| `pc-invariance` | the selective-leg requests (`--variants`, default: every variant with a two-sided range: shapes 1/5, the counter-examples `ce-*`, the `lone-*` ranges; plus three `attributes/region` array filters) with point legs only and with range legs: same request results and same full ordered sudo match lists (`invariance.md`, written after every request), fails on a difference. An equality + range request must render the pick with its multi-valued branch; a lone range must render the identical statement in both modes, so it is recorded as identical and not executed. The full sudo match list is computed once per filter | hours at 1M (each iteration runs the request and, once per filter, the full sudo match list in both modes, ~1.7 min per shape-1 iteration) |
+| `pc-invariance` | the selective-leg requests (`--variants`, default: every variant with a two-sided range: shapes 1/5, the counter-examples `ce-*`, the `lone-*` ranges; plus three `attributes/region` array filters) with point legs only and with range legs: same request results and same full ordered sudo match lists (`invariance.md`, written after every request), fails on a difference. An equality + range request must render the pick with its multi-valued branch; a lone range must render the identical statement in both modes, so it is recorded as identical and not executed. The full sudo match list is computed once per filter | ~19 min at 1M on a quiet host (default set: 51 requests executed in both modes, 36 identical lone-range statements not executed; 2026-10-22: 18:10) |
 | `soak-up` / `soak-load` / `soak-run` | production write-path soak (`WriteSoakBench`): own container `ditto-search-bench-soak` (127.0.0.1:55434, volume `ditto-search-bench-soak-data`); load the text-heavy soak twin with the production DDL (`--count N`, resumable with `--load-from N`), then a warm-up + gated soak through the shipped `PostgresSearchUpdaterFlow` with per-window throughput, latency, WAL, dead tuples, sizes and autovacuum activity, and the throughput-gate / bloat-plateau verdicts; `soak-status`, `soak-down [--purge]` | load ~minutes per 100k things on a laptop; soak = warm-up + `--soak-seconds` |
 
 Production-config knobs: `--range-legs auto|off` (selective range legs as the service uses them while the system
