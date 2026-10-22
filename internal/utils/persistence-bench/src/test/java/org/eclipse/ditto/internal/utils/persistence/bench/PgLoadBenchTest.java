@@ -14,6 +14,7 @@ package org.eclipse.ditto.internal.utils.persistence.bench;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -47,5 +48,27 @@ public final class PgLoadBenchTest {
                         "ALTER TABLE things_snaps SET (autovacuum_vacuum_scale_factor = 0.01)",
                         "ALTER TABLE things_journal_seq SET (autovacuum_vacuum_scale_factor = 0.01)")
                 .noneMatch(s -> s.contains("cost_limit"));
+    }
+
+    @Test
+    public void aJournalRowCarriesTheGivenTagsLiteralInItsFourthColumn() {
+        final CorpusGenerator gen = new CorpusGenerator(42L, 10L);
+        final CorpusGenerator.EventRow e = gen.events(3).next();
+        assertThat(PgLoadBench.appendJournalRow(new StringBuilder(), e, "{}").toString().split("\t")[3])
+                .isEqualTo("{}");
+        assertThat(PgLoadBench.appendJournalRow(new StringBuilder(), e, "{always-alive,priority-4}").toString()
+                .split("\t")).hasSize(6).satisfies(cells -> {
+                    assertThat(cells[0]).isEqualTo(e.pid());
+                    assertThat(cells[3]).isEqualTo("{always-alive,priority-4}");
+                    assertThat(cells[5]).isEqualTo(Instant.ofEpochMilli(e.timestampMillis()) + "\n");
+                });
+    }
+
+    @Test
+    public void aTaggedLoadWritesItsOwnLoadEvidence() {
+        final CorpusGenerator gen = new CorpusGenerator(42L, 1_000L);
+        assertThat(PgLoadBench.evidenceBase(null)).isEqualTo("load-pg");
+        assertThat(BenchProtocol.corpusEvidenceName(PgLoadBench.evidenceBase(PingTagMix.of(gen)), gen, "250k"))
+                .isEqualTo("load-pg-partly-tagged-250k.md");
     }
 }

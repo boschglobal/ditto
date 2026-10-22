@@ -197,6 +197,16 @@ public final class CorpusGenerator {
         return freshShare > 0.0 && uniform(pidIndex, 5L) < freshShare;
     }
 
+    /** Group draw of the persistence-ping tag mix ({@link PingTagMix}): stream 6, independent of all other draws. */
+    double pingTagDraw(final long pidIndex) {
+        return uniform(pidIndex, 6L);
+    }
+
+    /** {@code priority-<n>} draw of the persistence-ping tag mix ({@link PingTagMix}): stream 7. */
+    double pingPriorityDraw(final long pidIndex) {
+        return uniform(pidIndex, 7L);
+    }
+
     /** The timestamp of row {@code sn} of this pid (event and snapshot alike). */
     public long timestampMillis(final long pidIndex, final long sn) {
         return (isFreshOnly(pidIndex) ? freshBaseMillis : BASE_TIMESTAMP_MILLIS) + sn * 1000L;

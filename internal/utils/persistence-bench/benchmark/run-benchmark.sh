@@ -27,7 +27,7 @@
 #   load         PgLoadBench + MongoLoadBench — generate + bulk-load the corpus, build indexes
 #   settle       PostgreSQL: wait until things_journal and things_snaps were vacuumed since the load and no vacuum
 #                runs (BENCH_SETTLE_TIMEOUT, default 3600 s); MongoDB: nothing to wait for
-#   smoke        LoaderSmokeIT + PlanCaptureIT on Testcontainers (independent of the bench DBs)
+#   smoke        LoaderSmokeIT + PlanCaptureIT + PersistencePingIT on Testcontainers (independent of the bench DBs)
 #   recovery     RecoveryBench      — R1 latest snapshot, R2 replay (tail+full), R3 highest sn
 #   write        AppendBench W1, SnapshotBench W2, AppendBench W3 sustained churn
 #   wcheck       W1 single append + W2 snapshot write only (fixed probe pids: once per load, or a new BENCH_PROBE_SUFFIX)
@@ -44,6 +44,13 @@
 #   c4           CleanupSweepBench#c4BeforeAfterProof only (run after c3)
 #   window       CleanupSweepBench#c5CreditPacedWindow: credit-paced sweep bounded by BENCH_SWEEP_MAX_SECONDS
 #                (DESTRUCTIVE for the pids it reaches; --backend pg)
+#   ping         PersistencePingBench#walks: read-journal walks over a corpus loaded with BENCH_PING_TAG_MIX=true
+#                (ID order, any and newest event; priority order), EXPLAINs, a same-run 1M x 2-events control
+#                (--backend pg)
+#   ping-recovery  PersistencePingBench#recovery: one ID-order walk, broken by pg_terminate_backend and by a
+#                restart of the PostgreSQL container (--backend pg)
+#   ping-actor   PersistencePingBench#actor: PersistencePingActor with the policies ping settings (rate raised),
+#                four walks, one injected failure; takes about 4 x BENCH_PING_ACTOR_INTERVAL_SECONDS (--backend pg)
 #   mixed-sweep  MixedChurnBench    — M1: W3-shaped churn during one unthrottled sweep pass over the whole backlog
 #                (DESTRUCTIVE like c3: needs the loaded backlog, i.e. no sweep since the load; no VACUUM FULL before it)
 #   mixed        MixedChurnBench    — M1b: concentrated churn while a sweeper cycles (post-sweep corpus)
@@ -94,6 +101,9 @@
 #   BENCH_SETTLE_TIMEOUT      bound of the settle stage, seconds (default 3600)
 #   BENCH_PROBE_SUFFIX        appended to the W1/W2 probe pids, so wcheck can run again on one load (default: none)
 #   BENCH_RESULTS_DIR         evidence folder (default: the committed results folder); point trial runs elsewhere
+#   BENCH_PING_TAG_MIX        true: the PG load tags a known mix of pids always-alive (PingTagMix); needed by the ping
+#                             stages; default false (every row's tags stay {})
+#   BENCH_PING_ACTOR_INTERVAL_SECONDS, BENCH_PING_ACTOR_RATE  ping-actor: interval (default 600) and pings/s (1000)
 # Pass the same --count to every stage (the default is 1000000; C4 picks its pids from it).
 
 set -euo pipefail
@@ -156,6 +166,7 @@ export BENCH_MONGO_DB="bench"
 export BENCH_COUNT="$COUNT"
 export BENCH_SEED="$SEED"
 export BENCH_BACKEND="$BACKEND"
+export BENCH_PG_CONTAINER="$PG_CONTAINER"
 
 log() { echo "[bench] $*"; }
 die() { echo "[bench] ERROR: $*" >&2; exit 1; }
@@ -317,6 +328,9 @@ stage_build() {
 }
 
 stage_load() {
+    if [ "${BENCH_PING_TAG_MIX:-false}" = true ] && [ "$BACKEND" != pg ]; then
+        die "BENCH_PING_TAG_MIX is PostgreSQL-only: load with --backend pg"
+    fi
     stage_up
     log "loading corpus: count=${COUNT} seed=${SEED} backend=${BACKEND} (drops + recreates tables/collections)"
     [ "$BACKEND" = mongo ] || run_bench PgLoadBench
@@ -326,7 +340,7 @@ stage_load() {
 stage_smoke() {
     log "Testcontainers smoke test (independent of the bench DBs; self-skips without Docker)"
     (cd "$ROOT" && "$MVN" -pl "$MODULE" verify \
-        -Dit.test=LoaderSmokeIT,PlanCaptureIT -Dtest=CorpusGeneratorTest -DfailIfNoTests=false)
+        -Dit.test=LoaderSmokeIT,PlanCaptureIT,PersistencePingIT -Dtest=CorpusGeneratorTest -DfailIfNoTests=false)
 }
 
 stage_recovery() {
@@ -456,6 +470,30 @@ stage_window() {
     run_bench 'CleanupSweepBench#c5CreditPacedWindow' $(quick_props)
 }
 
+ping_preconditions() {
+    [ "$BACKEND" = pg ] || die "the ping stages are PostgreSQL-only: pass --backend pg"
+    [ "${BENCH_PING_TAG_MIX:-false}" = true ] || die "the ping stages need BENCH_PING_TAG_MIX=true (the load's tag mix)"
+}
+
+stage_ping() {
+    ping_preconditions
+    stage_up
+    run_bench 'PersistencePingBench#walks'
+}
+
+stage_ping_recovery() {
+    ping_preconditions
+    stage_up
+    log "ping recovery: terminates the walking backend, then restarts ${PG_CONTAINER} during the walk"
+    run_bench 'PersistencePingBench#recovery'
+}
+
+stage_ping_actor() {
+    ping_preconditions
+    stage_up
+    run_bench 'PersistencePingBench#actor'
+}
+
 stage_mixed() {
     stage_up
     # M1-only churn concentration: with the default pid spread no churn pid can reach the
@@ -562,6 +600,9 @@ for stage in "${STAGES[@]}"; do
         window) stage_window ;;
         mixed-sweep) stage_mixed_sweep ;;
         mixed) stage_mixed ;;
+        ping) stage_ping ;;
+        ping-recovery) stage_ping_recovery ;;
+        ping-actor) stage_ping_actor ;;
         all) confirm_full_run; stage_up; stage_load; stage_settle; stage_recovery; stage_write; stage_cleanup; stage_mixed_sweep; stage_load; stage_settle; stage_sweep; stage_mixed ;;
         status) stage_status ;;
         down) stage_down ;;

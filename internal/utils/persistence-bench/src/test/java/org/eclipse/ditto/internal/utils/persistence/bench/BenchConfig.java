@@ -179,6 +179,35 @@ public final class BenchConfig {
         return checkLabel("evidence label", property("bench.evidenceLabel", "BENCH_EVIDENCE_LABEL", ""));
     }
 
+    /** Opt-in journal tag mix of the PostgreSQL loader ({@link PingTagMix}); off: {@code {}} on every row. */
+    public static boolean pingTagMix() {
+        return Boolean.parseBoolean(property("bench.pingTagMix", "BENCH_PING_TAG_MIX", "false"));
+    }
+
+    /** The PostgreSQL bench container (run-benchmark.sh exports it), restarted by the ping-recovery stage. */
+    public static String pgContainer() {
+        return property("bench.pg.container", "BENCH_PG_CONTAINER", "ditto-persistence-bench-pg");
+    }
+
+    /** Ping interval of the ping-actor stage in seconds; default 600, the shipped {@code 10m}. */
+    public static long pingActorIntervalSeconds() {
+        return checkPositive("ping actor interval", Long.parseLong(
+                property("bench.ping.actorIntervalSeconds", "BENCH_PING_ACTOR_INTERVAL_SECONDS", "600")));
+    }
+
+    /** Pings per second of the ping-actor stage (the shipped rate is 1). */
+    public static long pingActorRate() {
+        return checkPositive("ping actor rate",
+                Long.parseLong(property("bench.ping.actorRate", "BENCH_PING_ACTOR_RATE", "1000")));
+    }
+
+    static long checkPositive(final String what, final long value) {
+        if (value <= 0) {
+            throw new IllegalArgumentException(what + " must be positive: " + value);
+        }
+        return value;
+    }
+
     /** Appended to the W1/W2 probe pids, so W1/W2 can run again on one load (W1 inserts, W2 upserts those pids). */
     public static String probeSuffix() {
         return checkLabel("probe suffix", property("bench.probeSuffix", "BENCH_PROBE_SUFFIX", ""));

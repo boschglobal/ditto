@@ -86,4 +86,11 @@ public final class BenchConfigTest {
         assertThatThrownBy(() -> BenchConfig.checkLabel("evidence label", "a b"))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("evidence label");
     }
+
+    @Test
+    public void pingActorSettingsMustBePositive() {
+        assertThat(BenchConfig.checkPositive("ping actor rate", 1_000L)).isEqualTo(1_000L);
+        assertThatThrownBy(() -> BenchConfig.checkPositive("ping actor interval", 0L))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("ping actor interval");
+    }
 }

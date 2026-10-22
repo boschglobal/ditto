@@ -57,6 +57,29 @@
             <artifactId>ditto-internal-utils-persistence-r2dbc</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- The persistence-ping stages run the production PersistencePingActor against the bench corpus. -->
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-internal-utils-persistent-actors</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- thing: pids then resolve to ThingId, not to a fallback id that logs a WARNING per ping -->
+        <dependency>
+            <groupId>org.eclipse.ditto</groupId>
+            <artifactId>ditto-things-model</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.pekko</groupId>
+            <artifactId>pekko-testkit_${scala.version}</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- an SLF4J provider: the ping-recovery stage captures the read journal's retry WARNs -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.mongodb</groupId>
             <artifactId>mongodb-driver-sync</artifactId>

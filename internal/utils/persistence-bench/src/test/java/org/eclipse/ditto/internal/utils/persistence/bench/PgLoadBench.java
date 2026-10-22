@@ -94,11 +94,18 @@ public final class PgLoadBench {
             return;
         }
         try (Connection connection = BenchConfig.openPg()) {
-            run(connection, BenchConfig.corpus(), true);
+            final CorpusGenerator gen = BenchConfig.corpus();
+            run(connection, gen, BenchConfig.pingTagMix() ? PingTagMix.of(gen) : null, true);
         }
     }
 
     public static LoadStats run(final Connection connection, final CorpusGenerator gen,
+            final boolean writeEvidence) throws Exception {
+        return run(connection, gen, null, writeEvidence);
+    }
+
+    /** {@code mix} null: every journal row gets {@code {}} as tags, the corpus of the committed evidence. */
+    public static LoadStats run(final Connection connection, final CorpusGenerator gen, final PingTagMix mix,
             final boolean writeEvidence) throws Exception {
         connection.setAutoCommit(true);
         final long t0 = System.nanoTime();
@@ -120,15 +127,11 @@ public final class PgLoadBench {
                 "COPY things_journal (pid, sn, manifest, tags, event, written_at) FROM STDIN");
         StringBuilder buf = new StringBuilder(1 << 21);
         for (long i = 0; i < gen.pidCount(); i++) {
+            final PingTagMix.Placement placement = mix == null ? null : mix.placement(i);
             final Iterator<CorpusGenerator.EventRow> events = gen.events(i);
             while (events.hasNext()) {
                 final CorpusGenerator.EventRow e = events.next();
-                buf.append(e.pid()).append('\t')
-                        .append(e.sn()).append('\t')
-                        .append(e.manifest()).append('\t')
-                        .append("{}").append('\t')
-                        .append(copyEscape(e.eventJson())).append('\t')
-                        .append(Instant.ofEpochMilli(e.timestampMillis()).toString()).append('\n');
+                appendJournalRow(buf, e, placement == null ? "{}" : placement.tagsLiteral(e.sn()));
                 journalRows++;
                 if (buf.length() > (1 << 20)) {
                     flush(copy, buf);
@@ -194,6 +197,11 @@ public final class PgLoadBench {
                     + " vs events=" + gen.totalEvents() + " pids=" + gen.pidCount()
                     + " snaps=" + gen.totalSnapshots());
         }
+        final long taggedRows = mix == null ? 0L : countTaggedRows(connection);
+        if (mix != null && taggedRows != mix.taggedRows()) {
+            throw new IllegalStateException("loaded tagged journal rows " + taggedRows
+                    + " do not match the ping tag mix: " + mix.taggedRows());
+        }
 
         if (writeEvidence) {
             final StringBuilder md = new StringBuilder(BenchProtocol.runHeader("Load evidence — PostgreSQL"));
@@ -203,6 +211,11 @@ public final class PgLoadBench {
             md.append(String.format("- COPY: %.1f s; constraints+indexes+ANALYZE: %.1f s; total: %.1f s%n%n",
                     copySeconds, indexSeconds, (System.nanoTime() - t0) / 1e9));
             md.append(BenchProtocol.freshCorpusLine(gen));
+            if (mix != null) {
+                md.append(mix.evidenceMarkdown())
+                        .append(String.format("- tagged journal rows loaded: %,d (`tags @> ARRAY['%s']`)%n%n",
+                                taggedRows, PingTagMix.TAG));
+            }
             md.append("## Sizes\n\n").append(sizesMarkdown(connection));
             md.append("\n- schema: persistence v").append(PostgresSchema.VERSION)
                     .append("; storage parameters: ").append(PgVacuumProbe.reloptions(connection))
@@ -211,9 +224,36 @@ public final class PgLoadBench {
                     .append("\n\nThe index and storage-parameter statements are PostgresSchema.ddlStatements()'s own "
                             + "things_* statements; the tables were created without PKs for the COPY and the PKs "
                             + "added afterwards (design plan, deviation 8).\n");
-            BenchProtocol.writeEvidence(BenchProtocol.corpusEvidenceName("load-pg", gen), md.toString());
+            BenchProtocol.writeEvidence(BenchProtocol.corpusEvidenceName(evidenceBase(mix), gen), md.toString());
         }
         return stats;
+    }
+
+    /** One COPY text row of things_journal. */
+    static StringBuilder appendJournalRow(final StringBuilder buf, final CorpusGenerator.EventRow e,
+            final String tagsLiteral) {
+        return buf.append(e.pid()).append('\t')
+                .append(e.sn()).append('\t')
+                .append(e.manifest()).append('\t')
+                .append(tagsLiteral).append('\t')
+                .append(copyEscape(e.eventJson())).append('\t')
+                .append(Instant.ofEpochMilli(e.timestampMillis()).toString()).append('\n');
+    }
+
+    static String evidenceBase(final PingTagMix mix) {
+        return mix == null ? "load-pg" : "load-pg-" + PingTagMix.EVIDENCE_SUFFIX;
+    }
+
+    /** Journal rows carrying the ping tag (served by things_journal_tags_idx). */
+    static long countTaggedRows(final Connection connection) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT count(*) FROM things_journal WHERE tags @> ARRAY[?]::text[]")) {
+            ps.setString(1, PingTagMix.TAG);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getLong(1);
+            }
+        }
     }
 
     static String sizesMarkdown(final Connection connection) throws SQLException {

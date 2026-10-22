@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.BeforeClass;
@@ -90,16 +91,39 @@ public final class RunBenchmarkScriptTest {
         final Result r = run("--help");
         assertThat(r.exit()).as(r.out()).isZero();
         assertThat(r.out()).contains("relimit").contains("mixed-sweep").contains("settle").contains("--cpus N")
-                .contains("--memory G").contains("BENCH_RESULTS_DIR").contains("BENCH_PROBE_SUFFIX");
+                .contains("--memory G").contains("BENCH_RESULTS_DIR").contains("BENCH_PROBE_SUFFIX")
+                .contains("ping-recovery").contains("ping-actor").contains("BENCH_PING_TAG_MIX");
+    }
+
+    @Test
+    public void thePingStagesRefuseAnotherBackendOrAnUntaggedCorpusBeforeTouchingDocker() throws Exception {
+        final Result mongo = run(Map.of("BENCH_PING_TAG_MIX", "true"), "ping", "--backend", "mongo");
+        assertThat(mongo.exit()).isNotZero();
+        assertThat(mongo.out()).contains("PostgreSQL-only").doesNotContain("creating", "already running", "starting");
+        final Result untagged = run(Map.of(), "ping-actor", "--backend", "pg");
+        assertThat(untagged.exit()).isNotZero();
+        assertThat(untagged.out()).contains("BENCH_PING_TAG_MIX=true");
+    }
+
+    @Test
+    public void aTaggedLoadIsPostgresqlOnly() throws Exception {
+        final Result r = run(Map.of("BENCH_PING_TAG_MIX", "true"), "load", "--backend", "both");
+        assertThat(r.exit()).isNotZero();
+        assertThat(r.out()).contains("BENCH_PING_TAG_MIX is PostgreSQL-only");
     }
 
     private record Result(int exit, String out) {}
 
     private static Result run(final String... args) throws Exception {
+        return run(Map.of(), args);
+    }
+
+    private static Result run(final Map<String, String> env, final String... args) throws Exception {
         final List<String> command = new ArrayList<>(List.of("bash", SCRIPT.toString()));
         command.addAll(List.of(args));
         final ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
         builder.environment().keySet().removeIf(key -> key.startsWith("BENCH_"));   // the script's own defaults
+        builder.environment().putAll(env);
         final Process process = builder.start();
         final String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertThat(process.waitFor(30, TimeUnit.SECONDS)).as("script finished").isTrue();

@@ -14,6 +14,7 @@ naming, and evidence rules). Design: `docs/superpowers/specs/2026-07-10-postgres
 | Superseded schema-v1 evidence (C1, W2) | `internal/utils/persistence-bench/src/test/resources/bench/results/history/2026-07-13-schema-v1/` |
 | Container-limited full run (2026-10-21), one store at a time | `internal/utils/persistence-bench/src/test/resources/bench/results/*-limits-pg.md`, `*-limits-mongo.md` |
 | W3 per-op latency profile (50k corpus, 2026-10-06) | `internal/utils/persistence-bench/src/test/resources/bench/results/w3-latency/` (start with its `README.md`) |
+| Persistence ping: 1M synthetic pids and the partly tagged 250k corpus (walks only; see §6) | `internal/utils/persistence-bench/src/test/resources/bench/results/ping-keyset-paging-1m.md`, `ping-partly-tagged-walks-250k.md` |
 | Reproduction script | `internal/utils/persistence-bench/benchmark/run-benchmark.sh` |
 | Design the bench validates | `docs/superpowers/specs/2026-07-10-postgres-persistence-bench-design.md` |
 | Plan deviations cited by the evidence ("plan deviation N") | `internal/utils/persistence-bench/benchmark/PLAN-DEVIATIONS.md` (extracted from the implementation plan, which is not committed) |
@@ -57,9 +58,10 @@ namespaces Zipf over 50; journal depth piecewise log-uniform with median 20, p99
 backend; `--count 500000` matches the design's ~40 GB-per-backend budget); things-shaped event JSON
 300 B–1 KB; snapshots every 500 events (things default `snapshot.threshold`), 2–10 KB, carried by
 the ~3.4% of pids with depth ≥ 500; PG additionally gets one `things_journal_seq` row per pid.
-No journal tags and no DELETED-lifecycle snapshots (all corpus entities live) — the PG loader still builds
-exactly the persistence schema's `things_*` indexes and storage parameters (taken from
-`PostgresSchema.ddlStatements()`; schema v3 has no lifecycle index).
+No journal tags unless the load runs with `BENCH_PING_TAG_MIX=true` (PostgreSQL only; evidence
+`results/ping-partly-tagged-walks-250k.md`, runs in §6), and no DELETED-lifecycle snapshots (all corpus entities
+live) — the PG loader still builds exactly the persistence schema's `things_*` indexes and storage parameters
+(taken from `PostgresSchema.ddlStatements()`; schema v3 has no lifecycle index).
 
 Row timestamps: every row is written at 2026-01-01 + sn seconds, months older than any cleanup
 retention. `--fresh-share S` (`-Dbench.freshShare`) instead writes ALL rows of a share S of the pids
@@ -366,6 +368,24 @@ BENCH_EVIDENCE_LABEL=credits-pg BENCH_SWEEP_MAX_SECONDS=7200 BENCH_SAMPLE_INTERV
 
 Between stages the runs waited until two host-memory samples 2 minutes apart showed no swapping (≤ 1,000 pages
 swapped out, ≥ 50 % free), and every measured stage had such a sample right before and after it.
+
+The persistence-ping runs of the partly tagged corpus (PostgreSQL only; label 250k):
+
+    export BENCH_PING_TAG_MIX=true BENCH_EVIDENCE_LABEL=250k
+    benchmark/run-benchmark.sh build up load settle --backend pg --count 250000   # load-pg-partly-tagged-250k.md
+    benchmark/run-benchmark.sh ping --backend pg --count 250000                   # ping-partly-tagged-walks-250k.md
+    benchmark/run-benchmark.sh ping-recovery --backend pg --count 250000          # restarts the container mid-walk
+    benchmark/run-benchmark.sh ping-actor --backend pg --count 250000             # ≈ 31 min: four walks at interval 10m
+    benchmark/run-benchmark.sh down --purge --backend pg
+
+`BENCH_PING_ACTOR_RATE` (default 1000 pings/s) and `BENCH_PING_ACTOR_INTERVAL_SECONDS` (default 600) set the actor
+stage; each evidence file has a host-memory sample right before and after every measured stage.
+
+At 250k only `load` and `ping` have evidence. In `ping-partly-tagged-walks-250k.md` the ID-order walks delivered
+exactly the expected pids. The priority-order (TAGS) statement exceeded the 60 s `statement_timeout` on all 11
+attempts, so that walk delivered nothing. Its row's statement count (33) has three listener records per cancelled
+execution, and its order and priority checks pass only because nothing was delivered. `ping-recovery` and `ping-actor`
+have no 250k evidence yet.
 
 The container-limited run (`*-limits-pg.md`, `*-limits-mongo.md`): one store at a time, the other container stopped or
 removed, and for every stage

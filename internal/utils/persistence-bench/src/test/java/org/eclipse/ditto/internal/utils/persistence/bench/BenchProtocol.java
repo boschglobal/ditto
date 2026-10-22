@@ -151,7 +151,8 @@ public final class BenchProtocol {
         final String label = BenchConfig.evidenceLabel();
         return "# " + title + "\n\n"
                 + "- generated: " + Instant.now() + "\n"
-                + "- corpus: count=" + BenchConfig.count() + " seed=" + BenchConfig.seed() + freshCorpusSuffix() + "\n"
+                + "- corpus: count=" + BenchConfig.count() + " seed=" + BenchConfig.seed() + freshCorpusSuffix()
+                + pingTagMixSuffix() + "\n"
                 + "- backend(s): " + BenchConfig.backend() + "\n"
                 + containersLine(BenchConfig.containerLimits())
                 + "- protocol: " + BenchConfig.warmups() + " warmup + " + BenchConfig.iterations()
@@ -172,6 +173,11 @@ public final class BenchProtocol {
         return share > 0.0
                 ? " freshShare=" + share + " freshBase=" + Instant.ofEpochMilli(BenchConfig.freshBaseMillis())
                 : "";
+    }
+
+    /** Empty without the ping tag mix, so evidence headers of untagged corpora keep their format. */
+    private static String pingTagMixSuffix() {
+        return BenchConfig.pingTagMix() ? " pingTagMix=" + PingTagMix.EVIDENCE_SUFFIX : "";
     }
 
     /**
