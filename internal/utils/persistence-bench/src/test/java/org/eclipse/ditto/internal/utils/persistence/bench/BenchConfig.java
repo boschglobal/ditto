@@ -172,6 +172,15 @@ public final class BenchConfig {
     }
 
     /**
+     * Server cache state the C1 payload what-if establishes before timing (NOT PRODUCTION): asis (default: no
+     * preparation), cold (the stage expects a server recreated right before it and fails unless timing read blocks)
+     * or warm (one untimed pass over the whole pid stream with the production page first).
+     */
+    public static CleanupShapeBench.CacheState c1CacheState() {
+        return CleanupShapeBench.CacheState.parse(property("bench.c1.cacheState", "BENCH_C1_CACHE_STATE", "asis"));
+    }
+
+    /**
      * Suffix for every evidence file name, e.g. "limits-pg" writes r1-latest-snapshot-limits-pg.md; "" (default) keeps
      * the committed names.
      */

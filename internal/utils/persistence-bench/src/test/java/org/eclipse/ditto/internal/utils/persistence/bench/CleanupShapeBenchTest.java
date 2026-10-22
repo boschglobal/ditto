@@ -13,7 +13,9 @@
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.time.Duration;
 import java.util.List;
 
 import org.junit.Test;
@@ -41,13 +43,62 @@ public final class CleanupShapeBenchTest {
     }
 
     @Test
-    public void eachLabelledWhatIfRunWritesItsOwnEvidenceFile() {
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", "run1"))
+    public void eachLabelledWhatIfRunWritesItsOwnEvidenceFileAndTheCacheStateComesBeforeTheLabel() {
+        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.ASIS, "run1"))
                 .isEqualTo("c1-payload-free-what-if-retention3d-pg-run1.md");
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", "run3"))
-                .isEqualTo("c1-payload-free-what-if-retention3d-pg-run3.md");
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", ""))
+        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.ASIS, ""))
                 .isEqualTo("c1-payload-free-what-if-retention3d-pg.md");
+        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.COLD, "limits-whatif-run1"))
+                .isEqualTo("c1-payload-free-what-if-retention3d-pg-cold-limits-whatif-run1.md");
+        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.WARM, ""))
+                .isEqualTo("c1-payload-free-what-if-retention3d-pg-warm.md");
+    }
+
+    @Test
+    public void theCacheStateKnobTakesThreeWordsOnly() {
+        assertThat(CleanupShapeBench.CacheState.parse("asis")).isEqualTo(CleanupShapeBench.CacheState.ASIS);
+        assertThat(CleanupShapeBench.CacheState.parse("cold")).isEqualTo(CleanupShapeBench.CacheState.COLD);
+        assertThat(CleanupShapeBench.CacheState.parse("warm")).isEqualTo(CleanupShapeBench.CacheState.WARM);
+        assertThatThrownBy(() -> CleanupShapeBench.CacheState.parse("hot"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("asis, cold or warm");
+    }
+
+    @Test
+    public void aColdRunMustReadBlocksAndAWarmRunAlmostNone() {
+        final CleanupShapeBench.PgIo noReads = new CleanupShapeBench.PgIo(0, 40_000, 0, 5_000, 0, 20_000, 0.0);
+        final CleanupShapeBench.PgIo fewReads = new CleanupShapeBench.PgIo(3, 40_000, 1, 5_000, 2, 20_000, 0.4);
+        final CleanupShapeBench.PgIo manyReads =
+                new CleanupShapeBench.PgIo(900, 40_000, 50, 5_000, 2_000, 20_000, 310.5);
+        assertThat(CleanupShapeBench.cacheStateCheck(CleanupShapeBench.CacheState.COLD, noReads))
+                .hasValueSatisfying(f -> assertThat(f).contains("cold state not established"));
+        assertThat(CleanupShapeBench.cacheStateCheck(CleanupShapeBench.CacheState.COLD, manyReads)).isEmpty();
+        assertThat(CleanupShapeBench.cacheStateCheck(CleanupShapeBench.CacheState.WARM, fewReads)).isEmpty();
+        assertThat(CleanupShapeBench.cacheStateCheck(CleanupShapeBench.CacheState.WARM, manyReads))
+                .hasValueSatisfying(f -> assertThat(f).contains("warm state not established").contains("2950"));
+        assertThat(CleanupShapeBench.cacheStateCheck(CleanupShapeBench.CacheState.ASIS, manyReads)).isEmpty();
+    }
+
+    @Test
+    public void theColdStateTimesTheMinAgeZeroPairFirstAndTheOtherStatesKeepTheOrderOfTheFirstRuns() {
+        final Duration retention = Duration.ofDays(3);
+        assertThat(CleanupShapeBench.pairOrder(CleanupShapeBench.CacheState.COLD, retention))
+                .containsExactly(Duration.ZERO, retention);
+        assertThat(CleanupShapeBench.pairOrder(CleanupShapeBench.CacheState.ASIS, retention))
+                .containsExactly(retention, Duration.ZERO);
+        assertThat(CleanupShapeBench.pairOrder(CleanupShapeBench.CacheState.WARM, retention))
+                .containsExactly(retention, Duration.ZERO);
+    }
+
+    @Test
+    public void ioDeltasSubtractEveryCounterAndSumTheReadsAndHits() {
+        final CleanupShapeBench.PgIo before = new CleanupShapeBench.PgIo(10, 100, 1, 50, 5, 200, 1.5);
+        final CleanupShapeBench.PgIo after = new CleanupShapeBench.PgIo(19, 1_100, 5, 350, 453, 2_200, 25.5);
+        final CleanupShapeBench.PgIo during = after.minus(before);
+        assertThat(during).isEqualTo(new CleanupShapeBench.PgIo(9, 1_000, 4, 300, 448, 2_000, 24.0));
+        assertThat(during.reads()).isEqualTo(461);
+        assertThat(during.hits()).isEqualTo(3_300);
+        assertThat(during.line()).isEqualTo(
+                "heap 9 read / 1000 hit, index 4 / 300, toast 448 / 2000; 461 reads in all, read time 24.0 ms");
     }
 
     @Test

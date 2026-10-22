@@ -23,6 +23,9 @@
 #                the same --cpus/--memory limits; refuses a container created with other limits or server arguments
 #   relimit      recreate the containers of --backend with this run's limits and server arguments on their data
 #                volumes (keeps the loaded corpus); a container that already matches is left as it is
+#   recreate     stop, remove and run the containers of --backend again on their data volumes, with this run's
+#                limits and server arguments (pass the same --cpus/--memory; keeps the loaded corpus; the server
+#                starts with empty caches: the C1 what-if's cold state)
 #   build        mvn install -DskipTests the bench module + its reactor dependencies
 #   load         PgLoadBench + MongoLoadBench — generate + bulk-load the corpus, build indexes
 #   settle       PostgreSQL: wait until things_journal and things_snaps were vacuumed since the load and no vacuum
@@ -98,6 +101,8 @@
 #   BENCH_C4_OFFLINE_RECLAIM  false: skip C4's VACUUM FULL / compact
 #   BENCH_SWEEP_MAX_SECONDS   bound of the window stage
 #   BENCH_C1_VACUUM_TIMEOUT   C1 stages: bound of the wait for a quiet PG server, seconds (default 3600)
+#   BENCH_C1_CACHE_STATE      payload-whatif: asis (default) | cold (run `recreate` right before; the stage fails unless
+#                             timing read blocks into shared buffers) | warm (an untimed pass over the pid stream first)
 #   BENCH_SETTLE_TIMEOUT      bound of the settle stage, seconds (default 3600)
 #   BENCH_PROBE_SUFFIX        appended to the W1/W2 probe pids, so wcheck can run again on one load (default: none)
 #   BENCH_RESULTS_DIR         evidence folder (default: the committed results folder); point trial runs elsewhere
@@ -276,8 +281,17 @@ stage_up() {
     [ "$BACKEND" = pg ] || up_one "$MONGO_CONTAINER" mongo "$(expected_mongo_config)"
 }
 
-relimit_one() { # container pg|mongo expected-config
+recreate_one() { # container pg|mongo why: stop, remove and run it again on its data volumes (caches start empty)
     local vargs=()
+    read -r -a vargs <<< "$(volume_args "$1")"
+    [ ${#vargs[@]} -gt 0 ] || die "$3: $1 has no data volume to keep; use 'down' and 'load' instead"
+    log "$3: stopping $1 (its volumes stay: ${vargs[*]})"
+    docker stop -t 300 "$1" >/dev/null
+    docker rm "$1" >/dev/null
+    "create_$2" "${vargs[@]}"
+}
+
+relimit_one() { # container pg|mongo expected-config
     if ! container_exists "$1"; then
         log "relimit: $1 does not exist; creating it"
         "create_$2"
@@ -288,17 +302,19 @@ relimit_one() { # container pg|mongo expected-config
         container_running "$1" || { docker start "$1" >/dev/null; "wait_$2"; }
         return 0
     fi
-    read -r -a vargs <<< "$(volume_args "$1")"
-    [ ${#vargs[@]} -gt 0 ] || die "relimit: $1 has no data volume to keep; use 'down' and 'load' instead"
-    log "relimit: stopping $1 (its volumes stay: ${vargs[*]})"
-    docker stop -t 300 "$1" >/dev/null
-    docker rm "$1" >/dev/null
-    "create_$2" "${vargs[@]}"
+    recreate_one "$1" "$2" relimit
 }
 
 stage_relimit() {
     [ "$BACKEND" = mongo ] || relimit_one "$PG_CONTAINER" pg "$(expected_pg_config)"
     [ "$BACKEND" = pg ] || relimit_one "$MONGO_CONTAINER" mongo "$(expected_mongo_config)"
+}
+
+stage_recreate() { # unconditional, unlike relimit: a server with empty caches on the loaded corpus
+    [ "$BACKEND" = mongo ] || { container_exists "$PG_CONTAINER" || die "recreate: ${PG_CONTAINER} does not exist"
+        recreate_one "$PG_CONTAINER" pg recreate; }
+    [ "$BACKEND" = pg ] || { container_exists "$MONGO_CONTAINER" || die "recreate: ${MONGO_CONTAINER} does not exist"
+        recreate_one "$MONGO_CONTAINER" mongo recreate; }
 }
 
 stage_config() { # what up / relimit would create; touches no container
@@ -416,8 +432,13 @@ stage_retention() {
 
 stage_payload_whatif() {
     [ "$BACKEND" = pg ] || die "payload-whatif is PostgreSQL only: pass --backend pg"
+    case "${BENCH_C1_CACHE_STATE:-asis}" in
+        asis|cold|warm) ;;
+        *) die "BENCH_C1_CACHE_STATE must be asis, cold or warm, got '${BENCH_C1_CACHE_STATE}'" ;;
+    esac
     stage_up
-    log "C1 payload what-if (NOT PRODUCTION): retention ${BENCH_C1_RETENTION:-3d} and 0"
+    log "C1 payload what-if (NOT PRODUCTION): retention ${BENCH_C1_RETENTION:-3d} and 0;" \
+        "cache state ${BENCH_C1_CACHE_STATE:-asis}"
     # shellcheck disable=SC2046
     run_bench 'CleanupShapeBench#c1PayloadFreeWhatIf' $(quick_props)
 }
@@ -581,6 +602,7 @@ for stage in "${STAGES[@]}"; do
         config) stage_config ;;
         up) stage_up ;;
         relimit) stage_relimit ;;
+        recreate) stage_recreate ;;
         build) stage_build ;;
         load) stage_load ;;
         settle) stage_settle ;;

@@ -16,6 +16,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -23,6 +24,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.LongSummaryStatistics;
+import java.util.Optional;
 import java.util.function.IntFunction;
 
 import org.bson.Document;
@@ -41,7 +43,7 @@ import com.mongodb.client.model.Filters;
  * with the bench's history-retention pin minAge=0; the C1 retention variant repeats it with the
  * production min age (things.conf history-retention-duration, default 3d) next to minAge=0. The C1
  * payload what-if (NOT PRODUCTION) times the same PG page without the snapshot payload, to size the
- * payload's share of it.
+ * payload's share of it, in a chosen server cache state (as is, cold, warm).
  * C2: the full single-pid cleanup sequence Cleanup.java performs — min-event-sn, batched event
  * range deletes tiling to snapshotSn-1, min-snapshot-sn, batched snapshot range deletes keeping
  * the latest. NOTE (plan deviation 2): no journal_seq.deleted_to update — the real cleanup path
@@ -66,6 +68,158 @@ public final class CleanupShapeBench {
                     + "WHERE pid = p.pid AND (? OR written_at < now() - ?::interval) "
                     + "ORDER BY sn DESC, written_at DESC LIMIT 1"
                     + ") s ORDER BY p.pid";
+
+    /** Server cache state the what-if establishes before timing ({@code bench.c1.cacheState}; NOT PRODUCTION). */
+    enum CacheState {
+        /** No preparation: whatever the server held when the stage started (the 2026-10-20 runs). */
+        ASIS("asis", "as is: no preparation, whatever the server held when the stage started"),
+        /**
+         * The server was recreated right before the stage ({@code run-benchmark.sh recreate}): shared buffers start
+         * empty; the VM's page cache is not controlled. The run fails unless timing read blocks into shared buffers.
+         */
+        COLD("cold", "cold: the server was recreated right before the stage (shared buffers started empty; the VM's "
+                + "page cache is not controlled, its hits show as reads too; the read time per block tells page-cache "
+                + "reads from disk reads)"),
+        /** One untimed pass over the whole pid stream with the production page first: every page in shared buffers. */
+        WARM("warm", "warm: one untimed pass over the whole pid stream with the production page before timing");
+
+        final String word;
+        final String description;
+
+        CacheState(final String word, final String description) {
+            this.word = word;
+            this.description = description;
+        }
+
+        static CacheState parse(final String word) {
+            for (final CacheState state : values()) {
+                if (state.word.equals(word)) {
+                    return state;
+                }
+            }
+            throw new IllegalArgumentException("bench.c1.cacheState: asis, cold or warm, got '" + word + "'");
+        }
+    }
+
+    /**
+     * things_snaps block reads and hits (heap, indexes, TOAST table and its index; pg_statio_user_tables) and the
+     * database's block read time in ms (pg_stat_database.blk_read_time, counted only for sessions with
+     * track_io_timing on). A read is a block that was not in shared buffers; where it came from (the VM's page cache
+     * or the disk) shows in the read time.
+     */
+    record PgIo(long heapRead, long heapHit, long idxRead, long idxHit, long toastRead, long toastHit,
+            double readTimeMs) {
+
+        PgIo minus(final PgIo o) {
+            return new PgIo(heapRead - o.heapRead, heapHit - o.heapHit, idxRead - o.idxRead, idxHit - o.idxHit,
+                    toastRead - o.toastRead, toastHit - o.toastHit, readTimeMs - o.readTimeMs);
+        }
+
+        long reads() {
+            return heapRead + idxRead + toastRead;
+        }
+
+        long hits() {
+            return heapHit + idxHit + toastHit;
+        }
+
+        String line() {
+            return String.format(Locale.ROOT,
+                    "heap %d read / %d hit, index %d / %d, toast %d / %d; %d reads in all, read time %.1f ms",
+                    heapRead, heapHit, idxRead, idxHit, toastRead, toastHit, reads(), readTimeMs);
+        }
+    }
+
+    /** A {@link PgIo} snapshot after the session's pending statistics were flushed (pg_stat_force_next_flush). */
+    static PgIo pgIo(final Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            st.execute("SELECT pg_stat_force_next_flush()");
+        }
+        try (PreparedStatement ps = c.prepareStatement("SELECT s.heap_blks_read, s.heap_blks_hit, s.idx_blks_read, "
+                + "s.idx_blks_hit, coalesce(s.toast_blks_read, 0) + coalesce(s.tidx_blks_read, 0) AS toast_read, "
+                + "coalesce(s.toast_blks_hit, 0) + coalesce(s.tidx_blks_hit, 0) AS toast_hit, "
+                + "(SELECT d.blk_read_time FROM pg_stat_database d WHERE d.datname = current_database()) AS read_ms "
+                + "FROM pg_statio_user_tables s WHERE s.relname = 'things_snaps'");
+                ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) {
+                throw new IllegalStateException("no things_snaps statistics: is the corpus loaded?");
+            }
+            return new PgIo(rs.getLong("heap_blks_read"), rs.getLong("heap_blks_hit"), rs.getLong("idx_blks_read"),
+                    rs.getLong("idx_blks_hit"), rs.getLong("toast_read"), rs.getLong("toast_hit"),
+                    rs.getDouble("read_ms"));
+        }
+    }
+
+    /** "<pg_postmaster_start_time UTC>Z, N s before this sample": dates the recreate of a cold run. */
+    static String pgServerStart(final Connection c) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement("SELECT pg_postmaster_start_time() AT TIME ZONE 'UTC', "
+                + "extract(epoch FROM now() - pg_postmaster_start_time())::bigint");
+                ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getString(1) + "Z, " + rs.getLong(2) + " s before this sample";
+        }
+    }
+
+    /** What one untimed pass over the whole pid stream read. */
+    record WarmPass(int pages, long pids, double seconds, PgIo blocks) {
+
+        String line() {
+            return String.format(Locale.ROOT, "%d pages / %d pids with the production page at minAge 0 in %.1f s; "
+                    + "things_snaps blocks during the pass: %s", pages, pids, seconds, blocks.line());
+        }
+    }
+
+    /**
+     * One keyset pass over the whole pid stream with the production page (payload included) at minAge 0, as a sweep
+     * reads it: every index, heap and TOAST block a cleanup page touches is in shared buffers afterwards (the corpus's
+     * things_snaps is about 300 MB against 4 GB of shared buffers). Untimed: not part of any Timing.
+     */
+    static WarmPass pgWarmPass(final Connection c, final PreparedStatement withPayload, final int limit)
+            throws SQLException {
+        final PgIo before = pgIo(c);
+        final long t0 = System.nanoTime();
+        int pages = 0;
+        long pids = 0;
+        String lowerBound = "";
+        while (true) {
+            final List<NewestSnapshotOracle.PidSn> page = pgPage(withPayload, lowerBound, Duration.ZERO, limit);
+            if (page.isEmpty()) {
+                break;
+            }
+            pages++;
+            pids += page.size();
+            lowerBound = page.get(page.size() - 1).pid();
+            if (page.size() < limit) {
+                break;
+            }
+        }
+        final double seconds = (System.nanoTime() - t0) / 1_000_000_000.0;
+        return new WarmPass(pages, pids, seconds, pgIo(c).minus(before));
+    }
+
+    /** The failure a cache state's block counts during timing imply, if any: cold must read, warm (almost) not. */
+    static Optional<String> cacheStateCheck(final CacheState state, final PgIo duringTiming) {
+        return switch (state) {
+            case COLD -> duringTiming.reads() == 0
+                    ? Optional.of("cold state not established: things_snaps had no buffer read during timing (the "
+                            + "server was not recreated right before the stage, or something read the pages first)")
+                    : Optional.empty();
+            case WARM -> duringTiming.reads() * 100 > duringTiming.hits()
+                    ? Optional.of("warm state not established: " + duringTiming.reads() + " buffer reads against "
+                            + duringTiming.hits() + " hits during timing (more than 1 %)")
+                    : Optional.empty();
+            case ASIS -> Optional.empty();
+        };
+    }
+
+    /**
+     * The min ages of the what-if's two timed pairs, in order. Both pairs read the same lower bounds, so only the
+     * first meets cold shared buffers: the cold state times minAge 0 (the C1 row's filter) first; the other states
+     * keep the order of the 2026-10-20 runs (retention, then 0).
+     */
+    static List<Duration> pairOrder(final CacheState state, final Duration retention) {
+        return state == CacheState.COLD ? List.of(Duration.ZERO, retention) : List.of(retention, Duration.ZERO);
+    }
 
     /** Sink for {@link #pgPageDecoded}'s parse results, so the JIT cannot drop the parse. */
     private static long parsedFields;
@@ -260,7 +414,9 @@ public final class CleanupShapeBench {
      * fresh-share corpus of the retention stage; {@code bench.evidenceLabel} numbers the runs of a series. After
      * timing, every page of both statements is checked against {@link NewestSnapshotOracle}; the run fails (after
      * writing its evidence) if a page or the age mix differs, if the quiet-server gate timed out, or if a vacuum
-     * was running when timing started.
+     * was running when timing started. The server cache state before timing follows {@code bench.c1.cacheState}
+     * ({@link CacheState}); the evidence records what the timed statements read into shared buffers and how long
+     * those reads took.
      */
     @Test
     public void c1PayloadFreeWhatIf() throws Exception {
@@ -273,6 +429,7 @@ public final class CleanupShapeBench {
         if (retention.isZero()) {
             throw new IllegalArgumentException("the what-if compares a non-zero retention with minAge 0: " + spec);
         }
+        final CacheState cacheState = BenchConfig.c1CacheState();
         final int limit = PersistenceShapes.READS_PER_QUERY;
         final NewestSnapshotOracle oracle = NewestSnapshotOracle.of(gen);
         final List<String> lowerBounds = c1LowerBounds(gen);
@@ -284,6 +441,9 @@ public final class CleanupShapeBench {
         try (Connection c = BenchConfig.openPg();
                 PreparedStatement withPayload = c.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE);
                 PreparedStatement withoutPayload = c.prepareStatement(PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION)) {
+            try (Statement st = c.createStatement()) {
+                st.execute("SET track_io_timing = on");   // this session only: blk_read_time and EXPLAIN I/O timings
+            }
             final String gate = awaitPgQuiet(c);
             if (!gate.startsWith("quiet")) {
                 failures.add("the quiet-server gate timed out: " + gate);
@@ -292,9 +452,13 @@ public final class CleanupShapeBench {
             if (!"none".equals(vacuumsBefore)) {
                 failures.add("a vacuum was in progress at timing start: " + vacuumsBefore);
             }
-            final long[] mix = pgAgeMix(c, retention);
+            final String serverStart = pgServerStart(c);
+            // nothing but the statements under test reads things_snaps between the two I/O snapshots: the age mix
+            // (a full scan of things_snaps that would warm the heap) is read after timing
+            final String pass = cacheState == CacheState.WARM ? pgWarmPass(c, withPayload, limit).line() : "none";
+            final PgIo ioBefore = pgIo(c);
             final List<List<String>> rows = new ArrayList<>();
-            for (final Duration minAge : List.of(retention, Duration.ZERO)) {
+            for (final Duration minAge : pairOrder(cacheState, retention)) {
                 final BenchProtocol.Timing[] t = BenchProtocol.measurePair(
                         BenchConfig.warmups(), BenchConfig.iterations(),
                         iteration -> pgPage(withPayload, lbAt.apply(iteration), minAge, limit),
@@ -305,7 +469,10 @@ public final class CleanupShapeBench {
                     BenchConfig.warmups(), BenchConfig.iterations(),
                     iteration -> pgPage(withPayload, lbAt.apply(iteration), retention, limit),
                     iteration -> pgPageDecoded(withPayload, lbAt.apply(iteration), retention, limit));
+            final PgIo ioDuring = pgIo(c).minus(ioBefore);
             final String vacuumsAfter = pgVacuumsInProgress(c);
+            cacheStateCheck(cacheState, ioDuring).ifPresent(failures::add);
+            final long[] mix = pgAgeMix(c, retention);
 
             final String pagesWith = checkPages("PG production page", lowerBounds, retention, failures,
                     (lb, minAge) -> pgPage(withPayload, lb, minAge, limit),
@@ -328,7 +495,13 @@ public final class CleanupShapeBench {
                     .append(pagesWith.replace("- result check", "- production page: result check"))
                     .append(pagesWithout.replace("- result check", "- payload-free what-if: result check"))
                     .append(payloadLines(c, lowerBounds, retention, spec, limit))
-                    .append(ageMixLine("PG", spec, mix, oracle, failures))
+                    .append(ageMixLine("PG", spec, mix, oracle, failures,
+                            "read after timing (its full scan of things_snaps would warm the heap before a cold run)"))
+                    .append("- cache state: ").append(cacheState.description).append("; server started ")
+                    .append(serverStart).append("; warm pass before timing: ").append(pass).append('\n')
+                    .append("- things_snaps blocks during timing (pg_statio_user_tables; read = not in shared buffers; "
+                            + "read time = pg_stat_database.blk_read_time of this session's reads, track_io_timing "
+                            + "on): ").append(ioDuring.line()).append('\n')
                     .append("- quiet-server gate before timing: ").append(gate).append('\n')
                     .append("- vacuums in progress at timing start: ").append(vacuumsBefore)
                     .append("; at timing end: ").append(vacuumsAfter).append('\n')
@@ -348,7 +521,7 @@ public final class CleanupShapeBench {
             body.append(literalStatements(spec, mid, retention));
         }
 
-        BenchProtocol.writeEvidence(whatIfEvidenceName(spec, BenchConfig.evidenceLabel()),
+        BenchProtocol.writeEvidence(whatIfEvidenceName(spec, cacheState, BenchConfig.evidenceLabel()),
                 BenchProtocol.runHeader("C1 what-if (NOT PRODUCTION) — the PG cleanup page with and without the "
                         + "snapshot payload (retention " + spec + " and 0, batch 100)")
                         + BenchProtocol.freshCorpusLine(gen)
@@ -365,9 +538,17 @@ public final class CleanupShapeBench {
                         + "every payload as a String and parses it with JsonFactory.newObject, as "
                         + "PostgresReadJournal.toSnapshotEntry does (production reads through r2dbc, so that row "
                         + "is an estimate). Timing: each pair interleaved per lower bound, alternating which runs "
-                        + "first; pairs in the order retention, minAge 0, decode; result checks, payload sizes, "
+                        + "first; pairs in the order retention, minAge 0, decode (cold: minAge 0, retention, decode, "
+                        + "as only the first pair meets cold shared buffers; the later pairs re-read the same lower "
+                        + "bounds); result checks, payload sizes, "
                         + "plans and statements after timing. MongoDB is not run: its cleanup pipeline projects "
-                        + "the payload away (sn and lifecycle only).\n");
+                        + "the payload away (sn and lifecycle only). Cache state (bench.c1.cacheState): as is = no "
+                        + "preparation; cold = the server was recreated right before the stage (run-benchmark.sh "
+                        + "recreate), so shared buffers started empty while the VM's page cache is not controlled, "
+                        + "and the run fails unless timing read blocks; warm = one untimed pass over the whole pid "
+                        + "stream with the production page first. The things_snaps block line counts what the timed "
+                        + "statements read into shared buffers (pg_statio_user_tables) and the time those reads took "
+                        + "(pg_stat_database.blk_read_time, track_io_timing on in this session).\n");
         if (!failures.isEmpty()) {
             throw new AssertionError("C1 payload what-if result check failed: " + failures);
         }
@@ -415,12 +596,17 @@ public final class CleanupShapeBench {
 
     private static String ageMixLine(final String backend, final String spec, final long[] mix,
             final NewestSnapshotOracle oracle, final List<String> failures) {
+        return ageMixLine(backend, spec, mix, oracle, failures, "at timing start");
+    }
+
+    private static String ageMixLine(final String backend, final String spec, final long[] mix,
+            final NewestSnapshotOracle oracle, final List<String> failures, final String when) {
         if (mix[0] != oracle.snapshottedPids() || mix[1] != oracle.freshOnlySnapshottedPids()) {
             failures.add(backend + " age mix differs from the generator: " + mix[0] + " snapshotted / " + mix[1]
                     + " without an old-enough row vs expected " + oracle.snapshottedPids() + " / "
                     + oracle.freshOnlySnapshottedPids());
         }
-        return "- age mix at timing start: " + mix[0] + " pids with snapshots (expected " + oracle.snapshottedPids()
+        return "- age mix " + when + ": " + mix[0] + " pids with snapshots (expected " + oracle.snapshottedPids()
                 + "), " + mix[1] + " of them without a snapshot older than " + spec + " (expected "
                 + oracle.freshOnlySnapshottedPids() + ")\n";
     }
@@ -436,8 +622,10 @@ public final class CleanupShapeBench {
                 100.0 * (1.0 - withoutPayload.p95Ms() / withPayload.p95Ms()));
     }
 
-    static String whatIfEvidenceName(final String retentionSpec, final String label) {
-        return BenchProtocol.labelled("c1-payload-free-what-if-retention" + retentionSpec + "-pg", label) + ".md";
+    /** The state word sits before the label; {@code asis} keeps the names of the 2026-10-20 runs. */
+    static String whatIfEvidenceName(final String retentionSpec, final CacheState state, final String label) {
+        final String base = "c1-payload-free-what-if-retention" + retentionSpec + "-pg";
+        return BenchProtocol.labelled(state == CacheState.ASIS ? base : base + "-" + state.word, label) + ".md";
     }
 
     /** Untimed: payload kB per production page over all lower bounds, per min age. */

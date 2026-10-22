@@ -19,6 +19,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -222,6 +223,26 @@ public final class LoaderSmokeIT {
             assertThat(rowsAndBytes[0]).isEqualTo(limit);
             // corpus snapshots carry 2-10 KB of JSON each (CorpusGenerator targetBytes)
             assertThat(rowsAndBytes[1]).isGreaterThan(limit * 1_024L);
+            // NOT PRODUCTION what-if, cache states: I/O snapshot, server start and warm pass on a real server
+            try (Statement st = connection.createStatement()) {
+                st.execute("SET track_io_timing = on");
+            }
+            assertThat(CleanupShapeBench.pgServerStart(connection)).contains("Z, ").endsWith(" s before this sample");
+            try (PreparedStatement ps = connection.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE)) {
+                final CleanupShapeBench.WarmPass pass = CleanupShapeBench.pgWarmPass(connection, ps, limit);
+                assertThat(pass.pids()).isEqualTo(oracle.snapshottedPids());
+                assertThat(pass.pages()).isEqualTo((int) ((oracle.snapshottedPids() + limit - 1) / limit));
+                assertThat(pass.blocks().hits() + pass.blocks().reads()).isPositive();
+                assertThat(pass.blocks().readTimeMs()).isGreaterThanOrEqualTo(0.0);
+                // after the pass every page is in shared buffers: two pages hit, (almost) nothing is read
+                final CleanupShapeBench.PgIo afterPass = CleanupShapeBench.pgIo(connection);
+                for (final String lb : lowerBounds) {
+                    CleanupShapeBench.pgPage(ps, lb, Duration.ZERO, limit);
+                }
+                final CleanupShapeBench.PgIo warmReads = CleanupShapeBench.pgIo(connection).minus(afterPass);
+                assertThat(warmReads.hits()).isPositive();
+                assertThat(CleanupShapeBench.cacheStateCheck(CleanupShapeBench.CacheState.WARM, warmReads)).isEmpty();
+            }
         }
 
         final String mongoUri = "mongodb://" + mongo.getHost() + ":" + mongo.getMappedPort(27017);
