@@ -88,8 +88,8 @@ public final class SearchQueryAssemblerTest {
     }
 
     @Test
-    public void rangeOnlyCriterionGetsARangeLegWhenRangeLegsAreAvailable() {
-        // a lone one-sided range still has none
+    public void aTwoSidedRangeAloneHasNoCteEvenWithRangeLegs() {
+        // a lone one-sided range has none either
         final Criteria oneSided = cf.fieldCriteria(fef.filterByAttribute("range"), cf.gt(5));
         assertThat(SearchQueryAssembler.findAll(oneSided, SUBJECTS, thingIdSort(), 26L, 0L,
                 SelectiveLegs.POINT_AND_RANGE).sql()).doesNotContain("sel_leg");
@@ -99,10 +99,24 @@ public final class SearchQueryAssemblerTest {
                 cf.fieldCriteria(fef.filterByAttribute("range"), cf.le(9))));
         final RenderedSql r = SearchQueryAssembler.findAll(twoSided, SUBJECTS, thingIdSort(), 26L, 0L,
                 SelectiveLegs.POINT_AND_RANGE);
-        assertThat(r.sql()).startsWith("WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE "
-                + "(sfc.wpath = $1 AND sfc.val_num >= $2 AND sfc.val_num <= $3) UNION ALL SELECT sfc.thing_id FROM "
-                + "search_flat sfc WHERE (sfc.wpath = $4 AND sfc.ord = 1))");
-        assertThat(r.sql()).contains("EXISTS (SELECT 1 FROM sel_leg sl WHERE sl.thing_id = st.thing_id)")
+        assertThat(r.sql()).isEqualTo(SearchQueryAssembler.findAll(twoSided, SUBJECTS, thingIdSort(), 26L, 0L).sql())
+                .startsWith("SELECT st.thing_id, st.t_modified").doesNotContain("sel_leg")
+                .doesNotContain("GROUP BY").contains("st.global_read && ");
+    }
+
+    @Test
+    public void eqAndRangeReadTheGroupedLegWithRangeLegs() {
+        final Criteria pair = cf.and(List.of(
+                cf.fieldCriteria(fef.filterByAttribute("color"), cf.eq("red")),
+                cf.fieldCriteria(fef.filterByAttribute("range"), cf.ge(5)),
+                cf.fieldCriteria(fef.filterByAttribute("range"), cf.le(9))));
+        final RenderedSql r = SearchQueryAssembler.findAll(pair, SUBJECTS, thingIdSort(), 26L, 0L,
+                SelectiveLegs.POINT_AND_RANGE);
+        assertThat(r.sql()).startsWith("WITH sel_pick AS MATERIALIZED (")
+                .contains("), sel_leg AS MATERIALIZED (SELECT sli.thing_id FROM (SELECT sfc.thing_id FROM "
+                        + "search_flat sfc WHERE ")
+                .contains(") sli GROUP BY sli.thing_id) SELECT st.thing_id, st.t_modified")
+                .contains("EXISTS (SELECT 1 FROM sel_leg sl WHERE sl.thing_id = st.thing_id)")
                 .contains("st.global_read && ");
     }
 

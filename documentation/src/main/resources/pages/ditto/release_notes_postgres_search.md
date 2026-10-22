@@ -89,9 +89,12 @@ installation guide.
 
 A filter that combines an equality with a two-sided numeric range on one field (`ge`/`gt` and `le`/`lt` on the same
 field) no longer always starts from the equality: the search counts the index entries of both in the same statement
-and starts from the smaller one; a two-sided range alone is started from directly. Results never change. Because two
-range conditions may be met by different array elements (as on MongoDB), the range start also uses the new system index
-`sf_multi` (search schema version 3), which the search service builds in the background with
+and starts from the smaller one; a two-sided range alone keeps the previous plan, because starting from it was measured
+slower (about 50× to 2,000× for a range over most things). The candidates of that start are handed to the rest of the
+filter once per thing, which keeps the planner from reading every row of the other condition (582 → 162 ms for an
+equality + range filter on the 1M-thing benchmark corpus). Results never change. Because two range conditions may be met by
+different array elements (as on MongoDB), the range start also uses the new system index `sf_multi` (search schema
+version 3), which the search service builds in the background with
 `CREATE INDEX CONCURRENTLY` after the schema bootstrap, like the per-path indexes (it needs the same direct database
 connection). Until an instance sees the index valid, range filters keep the previous plan. Version-2 images run against
 the version-3 schema unchanged. See "Range filters and the system index sf_multi" in the installation guide.

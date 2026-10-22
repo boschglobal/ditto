@@ -68,6 +68,7 @@ final class ProductionConfigShapes {
     private static final String[] CE_ZIPS = {
             "12345", "23456", "34567", "45678", "56789", "67890", "78901", "89012", "90123", "11111",
     };
+    private static final BigDecimal LONE_MID_WIDTH = new BigDecimal("2.89");
 
     /** Length of shape 1/5's filter rotation (city and temperature bucket advance together). */
     static final int SHAPE1_CYCLE = lcm(CITIES.length, TEMP_BUCKET_LO.length);
@@ -168,6 +169,22 @@ final class ProductionConfigShapes {
         final BigDecimal lo = BigDecimal.valueOf(TEMP_BUCKET_LO[iteration % TEMP_BUCKET_LO.length]);
         return "and(ge(" + TEMP_FIELD + "," + lo.toPlainString() + "),le(" + TEMP_FIELD + ","
                 + lo.add(new BigDecimal("0.99")).toPlainString() + "))";
+    }
+
+    /** A lone two-sided temperature range over the whole generated domain (~62 % of the things). */
+    static String loneWideFilter(final int iteration) {
+        return "and(ge(" + TEMP_FIELD + ",0),le(" + TEMP_FIELD + ",100))";
+    }
+
+    /**
+     * A lone two-sided temperature range 2.89 wide: 290 points of the 0.01 grid, about 40,000 of 1M things (the
+     * generator spreads 90 % of the things uniformly over [-20, 45]), below the selective leg's count cap of 50,000.
+     * The bucket cycles as in {@link #ceCFilter(int)}.
+     */
+    static String loneMidFilter(final int iteration) {
+        final BigDecimal lo = BigDecimal.valueOf(TEMP_BUCKET_LO[iteration % TEMP_BUCKET_LO.length]);
+        return "and(ge(" + TEMP_FIELD + "," + lo.toPlainString() + "),le(" + TEMP_FIELD + ","
+                + lo.add(LONE_MID_WIDTH).toPlainString() + "))";
     }
 
     /** Shape 4 next page via the service cursor (what a client sends: the cursor and the page size). */

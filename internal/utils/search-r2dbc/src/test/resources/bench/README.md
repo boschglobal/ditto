@@ -151,17 +151,22 @@ or stage by stage, in this order: `pc-up`, `pc-load`, `pc-read` (`--rounds N`), 
 range legs while the system index `sf_multi` is valid (the harness checks it once with the service's
 `SystemIndexProbe`); `off` forces point legs only, the statement as before range legs. `environment.md` records which
 one ran ("Selective range legs: on (sf_multi valid)", "off (sf_multi missing or invalid)" or "off (forced:
-bench.pc.rangeLegs=off)"). `--variants 1,5,2,ce-a,…` (`pc-read`; `bench.pc.variants`) runs only those variants. The
-counter-examples of the leg choice are permanent variants in `ce-leg-choice.md`: `ce-a` (a rare zip equality with a
-wide temperature range: the point leg must win), `ce-a-sudo` (the same without auth), `ce-b` (shape 1's city with a
-0.09-wide temperature range: the range leg must win) and `ce-c` (a lone two-sided temperature range). Stage
-`pc-invariance` (`ProductionConfigReadBench#legInvariance`) runs every request of shapes 1, 5 and the counter-examples
-over its whole rotation, plus two `attributes/region` array filters, with point legs only and with range legs, and
-compares the request's result and the full ordered sudo match list (count + md5): `invariance.md`, and the stage
-fails on any difference. **Run `pc-bias` after `pc-cold`, never before:** its read-only counts
-read exactly the pages the first cold samples need (the fixed subject pair's `search_things` blocks, Stuttgart's heap,
-a full `search_things` scan) and the cold protocol cannot drop the macOS host cache, so running it first would warm
-those samples. The corpus stays in the named volume across stages and container restarts, so later sessions
+bench.pc.rangeLegs=off)"). `--variants 1,5,2,ce-a,…` (`pc-read`, `pc-invariance`; `bench.pc.variants`) runs only
+those variants. The counter-examples of the leg choice are permanent variants in `ce-leg-choice.md`: `ce-a` (a rare zip
+equality with a wide temperature range: the point leg must win), `ce-a-sudo` (the same without auth), `ce-b` (shape 1's
+city with a 0.09-wide temperature range: the range leg must win) and `ce-c` (a lone two-sided temperature range: no
+CTE, the statement as before range legs). The lone ranges in `lone-range.md` are the temperature range 0..100 (sudo
+and auth, find and count: `lone-wide`, `lone-wide-sudo`, `lone-wide-count`, `lone-wide-sudo-count`) and a 2.89-wide
+range of ~40,000 things (sudo and auth find: `lone-mid-sudo`, `lone-mid`). Stage `pc-invariance`
+(`ProductionConfigReadBench#legInvariance`) runs every request of the variants with a two-sided range over its whole
+rotation (`--variants`, default: all of them), plus three `attributes/region` array filters, with point legs only and
+with range legs, and compares the request's result and the full ordered sudo match list (count + md5, computed once
+per filter): `invariance.md` (written after every request), and the stage fails on any difference. An equality +
+range request must render the pick with its multi-valued branch; a lone range must render the identical statement in
+both modes, so it is recorded as identical and not executed. **Run `pc-bias` after `pc-cold`, never before:** its
+read-only counts read exactly the pages the first cold samples need (the fixed subject pair's `search_things` blocks,
+Stuttgart's heap, a full `search_things` scan) and the cold protocol cannot drop the macOS host cache, so running it
+first would warm those samples. The corpus stays in the named volume across stages and container restarts, so later sessions
 re-run only `pc-read` → `pc-cold` → `pc-bias`. `--results-dir` redirects the evidence (default
 `results/production-config/`, relative to the module), e.g. for a re-run next to the baseline. Evidence files:
 `load.md`, `environment.md`, `shape-*.md` (request, rendered SQL + binds, warm table per round, per-iteration

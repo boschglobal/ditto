@@ -32,7 +32,8 @@ import org.junit.Test;
 /**
  * Golden-SQL unit tests for the candidate and preference rule of {@link SelectiveLegCte}: which conjunct becomes the
  * selective leg (point or range) with and without range legs, and the shape of the range leg (with its multi-valued
- * branch) and of the runtime pick between a point and a range leg. Rendered through
+ * branch) only next to a point leg: a range alone renders the statement as before range legs, and the shape of the
+ * runtime pick between a point and a range leg. Rendered through
  * {@link SearchQueryAssembler#count(Criteria, List, long, long, SelectiveLegs)} (sudo, plain count) so every assertion
  * is on real SQL. No database.
  */
@@ -47,20 +48,23 @@ public final class SelectiveLegCteTest {
     private static final String POINT_ONLY = "WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc "
             + "WHERE (sfc.wpath = $1 AND sfc.val_text = $2)) " + SEMI_JOIN;
 
-    private static final String RANGE_ONLY = "WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc "
-            + "WHERE (sfc.wpath = $1 AND sfc.val_num >= $2 AND sfc.val_num <= $3) UNION ALL SELECT sfc.thing_id FROM "
-            + "search_flat sfc WHERE (sfc.wpath = $4 AND sfc.ord = 1)) " + SEMI_JOIN;
+    /** A lone two-sided range, with or without range legs: the statement as before range legs (no CTE). */
+    private static final String RANGE_ALONE = "SELECT count(*) FROM search_things st WHERE (EXISTS (SELECT 1 FROM "
+            + "search_flat sf WHERE (sf.thing_id = st.thing_id AND sf.wpath = $1 AND sf.val_num >= $2)) AND EXISTS "
+            + "(SELECT 1 FROM search_flat sf WHERE (sf.thing_id = st.thing_id AND sf.wpath = $3 AND "
+            + "sf.val_num <= $4)))";
 
     private static final String PICKED = "WITH sel_pick AS MATERIALIZED (SELECT pc.n <= (SELECT count(*) FROM (SELECT 1 "
             + "FROM search_flat sfc WHERE (sfc.wpath = $1 AND sfc.val_num >= $2 AND sfc.val_num <= $3) UNION ALL "
             + "SELECT 1 FROM search_flat sfc WHERE (sfc.wpath = $4 AND sfc.ord = 1) LIMIT pc.n + 1) rr) AS point_wins "
             + "FROM (SELECT count(*) AS n FROM (SELECT 1 FROM search_flat sfc WHERE (sfc.wpath = $5 AND "
             + "sfc.val_text = $6) LIMIT 50000) pr) pc), "
-            + "sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE ((sfc.wpath = $7 AND "
-            + "sfc.val_text = $8) AND (SELECT sp.point_wins FROM sel_pick sp)) UNION ALL SELECT sfc.thing_id FROM "
-            + "search_flat sfc WHERE ((sfc.wpath = $9 AND sfc.val_num >= $10 AND sfc.val_num <= $11) AND NOT (SELECT "
-            + "sp.point_wins FROM sel_pick sp)) UNION ALL SELECT sfc.thing_id FROM search_flat sfc WHERE "
-            + "((sfc.wpath = $12 AND sfc.ord = 1) AND NOT (SELECT sp.point_wins FROM sel_pick sp))) " + SEMI_JOIN;
+            + "sel_leg AS MATERIALIZED (SELECT sli.thing_id FROM (SELECT sfc.thing_id FROM search_flat sfc WHERE "
+            + "((sfc.wpath = $7 AND sfc.val_text = $8) AND (SELECT sp.point_wins FROM sel_pick sp)) UNION ALL SELECT "
+            + "sfc.thing_id FROM search_flat sfc WHERE ((sfc.wpath = $9 AND sfc.val_num >= $10 AND sfc.val_num <= $11) "
+            + "AND NOT (SELECT sp.point_wins FROM sel_pick sp)) UNION ALL SELECT sfc.thing_id FROM search_flat sfc "
+            + "WHERE ((sfc.wpath = $12 AND sfc.ord = 1) AND NOT (SELECT sp.point_wins FROM sel_pick sp))) sli GROUP BY "
+            + "sli.thing_id) " + SEMI_JOIN;
 
     private final ThingsFieldExpressionFactory fef = ThingsFieldExpressionFactory.of(Map.of(
             "thingId", "_id", "namespace", "_namespace"));
@@ -115,27 +119,47 @@ public final class SelectiveLegCteTest {
     }
 
     @Test
-    public void aTwoSidedRangeAloneBecomesARangeLegWithTheMultiValuedBranch() {
-        final RenderedSql r = count(range("p", 5, 9), RANGE);
+    public void aTwoSidedRangeAloneKeepsTheStatementBeforeRangeLegs() {
+        for (final Criteria lone : List.of(range("p", 5, 9), and(gt("p", 5), lt("p", 9)), range("p", 9, 5),
+                featureRange("env", 1, 2), and(ge("a", 1), ge("b", 1), le("b", 2), ge("a", 5), le("a", 9)))) {
+            assertSameInBothModes(lone);
+            assertThat(count(lone, RANGE).sql()).as("%s", lone).doesNotContain("WITH ").doesNotContain("sel_");
+        }
+        assertThat(count(range("p", 5, 9), RANGE).sql()).isEqualTo(RANGE_ALONE);
+        assertThat(count(range("p", 5, 9), RANGE).bindValues()).containsExactly(
+                "/attributes/p", BigDecimal.valueOf(5), "/attributes/p", BigDecimal.valueOf(9));
+    }
 
-        assertThat(r.sql()).startsWith(RANGE_ONLY);
-        assertThat(r.bindValues().subList(0, 4))
-                .containsExactly("/attributes/p", BigDecimal.valueOf(5), BigDecimal.valueOf(9), "/attributes/p");
+    /** A sorted sudo find with no CTE can stop early; a materialised or grouped range leg could not. */
+    @Test
+    public void aLoneRangeFindHasNoCteAndNoGrouping() {
+        final PostgresSortClause sort = PostgresSortClause.of(List.of(
+                new SortOption(fef.sortByThingId(), SortDirection.ASC)));
+        final Criteria lone = range("p", 5, 9);
+        final RenderedSql find = SearchQueryAssembler.findAll(lone, null, sort, 26L, 0L, RANGE);
+        final RenderedSql unlimited = SearchQueryAssembler.findAllUnlimited(lone, null, sort, null, 0L, RANGE);
+
+        assertThat(find.sql()).isEqualTo(SearchQueryAssembler.findAll(lone, null, sort, 26L, 0L, POINT).sql())
+                .startsWith("SELECT st.thing_id, st.t_modified").doesNotContain("sel_leg").doesNotContain("GROUP BY");
+        assertThat(binds(find)).isEqualTo(binds(SearchQueryAssembler.findAll(lone, null, sort, 26L, 0L, POINT)));
+        assertThat(unlimited.sql()).isEqualTo(
+                SearchQueryAssembler.findAllUnlimited(lone, null, sort, null, 0L, POINT).sql());
     }
 
     @Test
     public void gtAndLtFormARangeLegToo() {
-        assertThat(count(and(gt("p", 5), lt("p", 9)), RANGE).sql())
-                .startsWith("WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE (sfc.wpath = "
-                        + "$1 AND sfc.val_num > $2 AND sfc.val_num < $3) UNION ALL ");
+        assertThat(count(and(eq("c", "x"), gt("p", 5), lt("p", 9)), RANGE).sql())
+                .startsWith("WITH sel_pick AS MATERIALIZED (SELECT pc.n <= (SELECT count(*) FROM (SELECT 1 FROM "
+                        + "search_flat sfc WHERE (sfc.wpath = $1 AND sfc.val_num > $2 AND sfc.val_num < $3) "
+                        + "UNION ALL ");
     }
 
     @Test
     public void anEmptyIntervalIsStillARangeLeg() {
         // an array like [10, 1] matches and(ge(p,9),le(p,5)): each bound may be met by another element
-        final RenderedSql r = count(range("p", 9, 5), RANGE);
+        final RenderedSql r = count(and(eq("c", "x"), range("p", 9, 5)), RANGE);
 
-        assertThat(r.sql()).startsWith(RANGE_ONLY);
+        assertThat(r.sql()).startsWith(PICKED);
         assertThat(r.bindValues().subList(1, 3)).containsExactly(BigDecimal.valueOf(9), BigDecimal.valueOf(5));
     }
 
@@ -144,6 +168,7 @@ public final class SelectiveLegCteTest {
         final RenderedSql r = count(and(eq("c", "x"), ge("p", 5), le("p", 9)), RANGE);
 
         assertThat(r.sql()).startsWith(PICKED);
+        assertThat(r.sql()).contains(") sli GROUP BY sli.thing_id) ");
         assertThat(r.sql().split("sel_leg AS MATERIALIZED", -1)).hasSize(2);
         assertThat(r.sql().indexOf("sel_pick AS MATERIALIZED")).isLessThan(r.sql().indexOf("sel_leg AS MATERIALIZED"));
         assertThat(r.sql()).contains("LIMIT 50000").contains("LIMIT pc.n + 1");
@@ -156,15 +181,28 @@ public final class SelectiveLegCteTest {
     }
 
     @Test
+    public void onlyThePicksLegIsGrouped() {
+        assertThat(count(and(eq("c", "x"), ge("p", 5), le("p", 9)), RANGE).sql())
+                .contains("), sel_leg AS MATERIALIZED (SELECT sli.thing_id FROM (SELECT sfc.thing_id FROM search_flat ")
+                .contains(") sli GROUP BY sli.thing_id) SELECT count(*) FROM search_things st");
+        for (final Criteria pointAlone : List.of(eq("c", "x"), in("n", 1, 2), and(eq("c", "x"), gt("p", 5)))) {
+            assertThat(count(pointAlone, RANGE).sql()).as("%s", pointAlone).startsWith("WITH sel_leg AS MATERIALIZED "
+                    + "(SELECT sfc.thing_id FROM search_flat sfc WHERE ").doesNotContain("GROUP BY");
+        }
+        assertThat(count(range("p", 5, 9), RANGE).sql()).doesNotContain("GROUP BY").doesNotContain("WITH ");
+    }
+
+    @Test
     public void thePairMayBeSplitAcrossNestedAnds() {
         assertThat(count(and(eq("c", "x"), range("p", 5, 9)), RANGE).sql()).startsWith(PICKED);
     }
 
     @Test
     public void theFirstPathWithBothBoundsWinsWithItsFirstBounds() {
-        final RenderedSql r = count(and(ge("a", 1), ge("b", 1), le("b", 2), ge("a", 5), le("a", 9)), RANGE);
+        final RenderedSql r = count(and(eq("c", "x"), ge("a", 1), ge("b", 1), le("b", 2), ge("a", 5), le("a", 9)),
+                RANGE);
 
-        assertThat(r.sql()).startsWith(RANGE_ONLY);
+        assertThat(r.sql()).startsWith(PICKED);
         assertThat(r.bindValues().subList(0, 4))
                 .containsExactly("/attributes/a", BigDecimal.valueOf(1), BigDecimal.valueOf(9), "/attributes/a");
     }
@@ -197,9 +235,9 @@ public final class SelectiveLegCteTest {
 
     @Test
     public void aNamedFeatureRangeIsACandidate() {
-        final RenderedSql r = count(featureRange("env", 1, 2), RANGE);
+        final RenderedSql r = count(and(eq("c", "x"), featureRange("env", 1, 2)), RANGE);
 
-        assertThat(r.sql()).startsWith(RANGE_ONLY);
+        assertThat(r.sql()).startsWith(PICKED);
         assertThat(r.bindValues().get(0)).isEqualTo("/features/env/properties/t");
         assertThat(r.bindValues().get(3)).isEqualTo("/features/env/properties/t");
     }
@@ -219,9 +257,9 @@ public final class SelectiveLegCteTest {
     public void eqNullAndNeDoNotBecomePointLegsNextToARange() {
         for (final Criteria criteria : List.of(and(eq("c", null), ge("p", 5), le("p", 9)),
                 and(field("c", cf.ne("x")), ge("p", 5), le("p", 9)))) {
-            final RenderedSql r = count(criteria, RANGE);
-
-            assertThat(r.sql()).as("%s", criteria).startsWith(RANGE_ONLY).doesNotContain("sel_pick");
+            // no point leg ⇒ the range is alone ⇒ no CTE at all
+            assertSameInBothModes(criteria);
+            assertThat(count(criteria, RANGE).sql()).as("%s", criteria).doesNotContain("WITH ");
         }
     }
 
@@ -233,7 +271,7 @@ public final class SelectiveLegCteTest {
 
     @Test
     public void ordIsALiteralNotABind() {
-        final RenderedSql r = count(range("p", 5, 9), RANGE);
+        final RenderedSql r = count(and(eq("c", "x"), ge("p", 5), le("p", 9)), RANGE);
 
         assertThat(r.sql()).contains("sfc.ord = 1");
         assertThat(r.bindValues()).noneMatch(bind -> bind instanceof Integer || bind instanceof Long);

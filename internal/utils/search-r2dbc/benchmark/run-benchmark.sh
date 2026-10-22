@@ -70,7 +70,7 @@
 #                the committed evidence; pass a scratch folder for trial runs)
 #   --range-legs MODE   pc-read/pc-cold/pc-invariance: selective range legs: auto (default; as the
 #                service: while the system index sf_multi is valid) | off (point legs only)
-#   --variants LIST     pc-read: comma list of variant ids to run (default: all), e.g. 1,5,2,ce-a,ce-a-sudo,ce-b,ce-c
+#   --variants LIST     pc-read/pc-invariance: comma list of variant ids (default: all), e.g. 1,5,2,ce-a,ce-b,lone-mid
 #   --soak-seconds N    soak-run: gated period (default 3600; the gate needs >= 3600)
 #   --warmup-seconds N  soak-run: warm-up before the gated period, reported but not gated (default 300)
 #   --plateau-seconds N soak-run: trailing part of the gated period for the plateau verdict (default 3600)
@@ -154,7 +154,7 @@ while [ $# -gt 0 ]; do
         --cold-samples) PC_COLD_SAMPLES="$2"; shift 2 ;;
         --results-dir) PC_RESULTS_DIR="$2"; shift 2 ;;
         --range-legs) PC_RANGE_LEGS="$2"; shift 2 ;;   # pc-read/pc-cold/pc-invariance: auto (default) | off
-        --variants) PC_VARIANTS="$2"; shift 2 ;;       # pc-read: comma list of variant ids (default: all)
+        --variants) PC_VARIANTS="$2"; shift 2 ;;       # pc-read/pc-invariance: comma list of variant ids (default: all)
         --soak-seconds) SOAK_SECONDS="$2"; shift 2 ;;
         --warmup-seconds) SOAK_WARMUP="$2"; shift 2 ;;
         --plateau-seconds) SOAK_PLATEAU="$2"; shift 2 ;;

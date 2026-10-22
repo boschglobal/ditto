@@ -418,6 +418,27 @@ Findings (each read off the committed plans / per-iteration tables):
      1 and 5 still miss the gate (B p95 3.4–7.6 s on a swapping host; warm EXPLAINs ~0.93–1.43 s): the main statement
      then scans the whole city (~90k rows) for the city's `EXISTS` conjunct instead of probing the range candidates.
      Evidence: `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/selective-range-leg/`.
+   - Update (2026-10-22, quiet host: 0 swap-outs in every run): a two-sided range alone is no longer materialised; its
+     statement is the one without range legs. With an equality and a range, the picked leg's thing ids are grouped
+     (`GROUP BY thing_id`), so the main statement is planned with 200 candidates instead of ~33,500 and checks the
+     city per candidate. Results are unchanged (ITs on PostgreSQL 16/17/18, parity battery). Shapes 1 and 5 now pass
+     the 200 ms gate: B p95 160–165 ms and 132–135 ms (shape 5 settled, shape 1 not). All-rounds warm p95, ms:
+
+     | variant | `off`, before | `auto`, before | `off`, after | `auto`, after |
+     |---|---:|---:|---:|---:|
+     | `1` | 1,046 | 582 | 1,314 | 162 ¹ |
+     | `5` | 856 | 515 | 1,116 | 134 ¹ |
+     | `ce-b` | 844 | 428 | 852 | 19 |
+     | `ce-c` | 209 | 128 | 215 | 148 ² |
+     | `lone-wide` | 112 | 5,854 | 113 | 114 ² |
+     | `lone-mid` | 152 | 366 | 485 | 479 ² |
+
+     "Before" = the code with the lone-range CTE and the ungrouped pick, "after" = the final code, each on its own load
+     of the same corpus. ¹ `off` moved beyond the noise band between the loads for shapes 1/5, so their before/after
+     comparison was repeated on one load: 1,250 → 132 ms and 523 → 126 ms (the start code's shape 1 had slow first
+     rounds there; rounds 2–3 mostly 520–530 ms). ² The same statement as `off` on that load
+     (the differences are run-to-run drift, mostly a slow first round). Evidence:
+     `internal/utils/search-r2dbc/src/test/resources/bench/results/production-config/range-legs-quiet-host/`.
 2. **Shape 2** drives from `global_read` (~29k things), filters by the per-field auth and probes the flat PK per
    survivor. It runs leader-only in the shipped path.
    - 109–146 ms once a subject pair's pages are cached.

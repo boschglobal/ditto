@@ -22,8 +22,9 @@ public enum SelectiveLegs {
 
     /**
      * Point legs and same-path two-sided numeric ranges. When both are present, the statement counts their index
-     * entries and materialises the smaller one. Requires the valid system index {@code sf_multi}, which serves the range
-     * leg's multi-valued branch.
+     * entries and materialises the smaller one; a two-sided range alone is never materialised (the statement keeps the
+     * plan it had before range legs). Requires the valid system index {@code sf_multi}, which serves the range leg's
+     * multi-valued branch.
      */
     POINT_AND_RANGE;
 

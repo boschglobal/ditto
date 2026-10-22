@@ -182,15 +182,15 @@ public final class PostgresSearchPathIndexBootstrapIT {
 
             await(provider.pathIndexMaintenanceOutcome());
             awaitTrue(() -> provider.multiValuedIndexProbe().getAsBoolean(), "sf_multi valid");
-            final String sql = provider.renderForDiagnostics(rangeQuery(), null);
+            final String sql = provider.renderForDiagnostics(pairQuery(), null);
             assertThat(sql).contains("UNION ALL").contains("sfc.ord = 1");
 
-            // and back: without sf_multi the same provider renders point legs only (a lone range has no leg then)
+            // and back: without sf_multi the same provider renders point legs only (the equality's leg, no pick)
             query("DROP INDEX " + MULTI);
             awaitTrue(() -> !Boolean.TRUE.equals(provider.multiValuedIndexProbe().refresh(connectionFactory)
                     .block(Duration.ofSeconds(10L))), "sf_multi seen missing");
-            assertThat(provider.renderForDiagnostics(rangeQuery(), null))
-                    .doesNotContain("UNION ALL").doesNotContain("sel_leg");
+            assertThat(provider.renderForDiagnostics(pairQuery(), null))
+                    .doesNotContain("UNION ALL").doesNotContain("sel_pick");
         });
     }
 
@@ -245,11 +245,15 @@ public final class PostgresSearchPathIndexBootstrapIT {
         }
     }
 
-    /** {@code and(ge(attributes/p,1),le(attributes/p,2))}, sorted by thing id. */
-    private static PostgresQuery rangeQuery() {
+    /**
+     * {@code and(eq(attributes/c,"x"),ge(attributes/p,1),le(attributes/p,2))}, sorted by thing id: a range leg is
+     * rendered only next to a point leg.
+     */
+    private static PostgresQuery pairQuery() {
         final CriteriaFactory cf = CriteriaFactory.getInstance();
         final ThingsFieldExpressionFactory fef = ThingsFieldExpressionFactory.of(Map.of("thingId", "_id"));
-        return new PostgresQuery(cf.and(List.of(cf.fieldCriteria(fef.filterByAttribute("p"), cf.ge(1)),
+        return new PostgresQuery(cf.and(List.of(cf.fieldCriteria(fef.filterByAttribute("c"), cf.eq("x")),
+                cf.fieldCriteria(fef.filterByAttribute("p"), cf.ge(1)),
                 cf.fieldCriteria(fef.filterByAttribute("p"), cf.le(2)))),
                 List.of(new SortOption(fef.sortByThingId(), SortDirection.ASC)), 25, 0);
     }

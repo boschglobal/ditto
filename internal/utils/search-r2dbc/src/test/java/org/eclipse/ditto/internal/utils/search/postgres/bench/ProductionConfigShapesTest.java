@@ -13,6 +13,7 @@
 package org.eclipse.ditto.internal.utils.search.postgres.bench;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.List;
 import java.util.Optional;
@@ -95,7 +96,10 @@ public final class ProductionConfigShapesTest {
                 java.util.Map.entry("4-offset", 3), java.util.Map.entry("4-keyset", 3),
                 java.util.Map.entry("4-offset-5000", 3), java.util.Map.entry("4-keyset-5000", 3),
                 java.util.Map.entry("5", 10), java.util.Map.entry("ce-a", 10), java.util.Map.entry("ce-a-sudo", 10),
-                java.util.Map.entry("ce-b", 10), java.util.Map.entry("ce-c", 10));
+                java.util.Map.entry("ce-b", 10), java.util.Map.entry("ce-c", 10),
+                java.util.Map.entry("lone-wide", 3), java.util.Map.entry("lone-wide-sudo", 3),
+                java.util.Map.entry("lone-wide-count", 3), java.util.Map.entry("lone-wide-sudo-count", 3),
+                java.util.Map.entry("lone-mid", 10), java.util.Map.entry("lone-mid-sudo", 10));
         for (final ProductionConfigReadBench.Variant variant : variants) {
             final java.util.Set<String> distinctRequests = new java.util.HashSet<>();
             for (int i = 0; i < 20; i++) {
@@ -175,34 +179,37 @@ public final class ProductionConfigShapesTest {
                 + "    ->  Subquery Scan on pc  (cost=1.00..2.00 rows=1 width=1) "
                 + "(actual time=40.100..40.200 rows=1 loops=1)\n"
                 + "  CTE sel_leg\n"
-                + "    ->  Append  (cost=1.00..900.00 rows=300 width=40) "
+                + "    ->  HashAggregate  (cost=900.00..902.00 rows=200 width=40) "
+                + "(actual time=45.600..46.900 rows=14012 loops=1)\n"
+                + "          Group Key: sfc.thing_id\n"
+                + "          ->  Append  (cost=1.00..900.00 rows=300 width=40) "
                 + "(actual time=40.300..45.500 rows=14012 loops=1)\n"
-                + "          ->  Result  (cost=0.01..300.00 rows=100 width=40) "
+                + "                ->  Result  (cost=0.01..300.00 rows=100 width=40) "
                 + "(actual time=0.002..0.002 rows=0 loops=1)\n"
-                + "                One-Time Filter: $3\n"
-                + "                InitPlan 3 (returns $3)\n"
-                + "                  ->  CTE Scan on sel_pick sp  (cost=0.00..0.02 rows=1 width=1) "
+                + "                      One-Time Filter: $3\n"
+                + "                      InitPlan 3 (returns $3)\n"
+                + "                        ->  CTE Scan on sel_pick sp  (cost=0.00..0.02 rows=1 width=1) "
                 + "(actual time=40.150..40.250 rows=1 loops=1)\n"
-                + "                ->  Bitmap Heap Scan on search_flat sfc  (cost=10.68..824.41 rows=207 width=40) "
+                + "                      ->  Bitmap Heap Scan on search_flat sfc  (cost=10.68..824.41 rows=207 "
+                + "width=40) (never executed)\n"
+                + "                            ->  Bitmap Index Scan on sf_text  (cost=0.00..10.63 rows=207 width=0) "
                 + "(never executed)\n"
-                + "                      ->  Bitmap Index Scan on sf_text  (cost=0.00..10.63 rows=207 width=0) "
-                + "(never executed)\n"
-                + "          ->  Result  (cost=0.01..300.00 rows=100 width=40) "
+                + "                ->  Result  (cost=0.01..300.00 rows=100 width=40) "
                 + "(actual time=0.100..4.000 rows=14000 loops=1)\n"
-                + "                One-Time Filter: (NOT $5)\n"
-                + "                InitPlan 5 (returns $5)\n"
-                + "                  ->  CTE Scan on sel_pick sp_1  (cost=0.00..0.02 rows=1 width=1) "
+                + "                      One-Time Filter: (NOT $5)\n"
+                + "                      InitPlan 5 (returns $5)\n"
+                + "                        ->  CTE Scan on sel_pick sp_1  (cost=0.00..0.02 rows=1 width=1) "
                 + "(actual time=0.001..0.001 rows=1 loops=1)\n"
-                + "                ->  Index Scan using sf_num on search_flat sfc_1  (cost=0.56..290.00 rows=99 "
+                + "                      ->  Index Scan using sf_num on search_flat sfc_1  (cost=0.56..290.00 rows=99 "
                 + "width=40) (actual time=0.050..3.900 rows=14000 loops=1)\n"
-                + "          ->  Result  (cost=0.01..300.00 rows=100 width=40) "
+                + "                ->  Result  (cost=0.01..300.00 rows=100 width=40) "
                 + "(actual time=0.010..0.500 rows=12 loops=1)\n"
-                + "                One-Time Filter: (NOT $7)\n"
-                + "                InitPlan 7 (returns $7)\n"
-                + "                  ->  CTE Scan on sel_pick sp_2  (cost=0.00..0.02 rows=1 width=1) "
+                + "                      One-Time Filter: (NOT $7)\n"
+                + "                      InitPlan 7 (returns $7)\n"
+                + "                        ->  CTE Scan on sel_pick sp_2  (cost=0.00..0.02 rows=1 width=1) "
                 + "(actual time=0.001..0.001 rows=1 loops=1)\n"
-                + "                ->  Index Only Scan using sf_multi on search_flat sfc_2  (cost=0.42..8.44 rows=1 "
-                + "width=40) (actual time=0.010..0.400 rows=12 loops=1)\n"
+                + "                      ->  Index Only Scan using sf_multi on search_flat sfc_2  (cost=0.42..8.44 "
+                + "rows=1 width=40) (actual time=0.010..0.400 rows=12 loops=1)\n"
                 + "Execution Time: 150.114 ms\n";
 
         assertThat(sql.sql()).startsWith("WITH sel_pick AS MATERIALIZED");
@@ -212,9 +219,56 @@ public final class ProductionConfigShapesTest {
                 .contains("point: (sfc.wpath = '/attributes/location/city' AND sfc.val_text = 'Stuttgart')")
                 .contains("range: (sfc.wpath = '/features/env/properties/temperature' AND sfc.val_num >= ")
                 .contains("UNION ALL (sfc.wpath = '/features/env/properties/temperature' AND sfc.ord = 1)")
-                .contains("`->  Append`) produced 14012 thing ids in 45.500 ms")
+                .contains("`->  HashAggregate`) produced 14012 thing ids in 46.900 ms")
                 .contains("the pick (`sel_pick`) took 40.200 ms")
                 .contains("of 150.114 ms total execution"));
+        assertThat(sql.sql())
+                .contains("sel_leg AS MATERIALIZED (SELECT sli.thing_id FROM (SELECT sfc.thing_id FROM search_flat sfc "
+                        + "WHERE ((sfc.wpath = ")
+                .contains(" AND NOT (SELECT sp.point_wins FROM sel_pick sp))) sli GROUP BY sli.thing_id) SELECT ");
+    }
+
+    @Test
+    public void cteBranchesFailLoudlyOnAPickWithoutThreeBranches() {
+        final RenderedSql broken = new RenderedSql("WITH sel_pick AS MATERIALIZED (SELECT true AS point_wins), sel_leg "
+                + "AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE (sfc.ord = 1)) SELECT 1", List.of());
+
+        assertThatThrownBy(() -> ProductionConfigReadBench.cteCondition(broken))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("expected 3 gated branches");
+    }
+
+    @Test
+    public void invarianceRejectsAVacuousComparison() {
+        final Query shape1 =
+                path.find(ProductionConfigShapes.shape1Filter(0), ProductionConfigShapes.defaultFindOptions());
+        final Query ceC = path.find(ProductionConfigShapes.ceCFilter(0), ProductionConfigShapes.defaultFindOptions());
+        final RenderedSql shape1Point = ProductionSearchPath.renderFind(shape1, null, SelectiveLegs.POINT);
+        final RenderedSql shape1Range = ProductionSearchPath.renderFind(shape1, null, SelectiveLegs.POINT_AND_RANGE);
+        final RenderedSql ceCPoint = ProductionSearchPath.renderFind(ceC, null, SelectiveLegs.POINT);
+        final RenderedSql ceCRange = ProductionSearchPath.renderFind(ceC, null, SelectiveLegs.POINT_AND_RANGE);
+
+        assertThat(ProductionConfigReadBench.legProblem(ProductionConfigReadBench.ExpectedLeg.PICK, shape1Point,
+                shape1Range)).isEmpty();
+        assertThat(ProductionConfigReadBench.legProblem(ProductionConfigReadBench.ExpectedLeg.NONE, ceCPoint,
+                ceCRange)).isEmpty();
+        assertThat(ProductionConfigReadBench.legProblem(ProductionConfigReadBench.ExpectedLeg.PICK, ceCPoint,
+                ceCRange)).hasValueSatisfying(problem -> assertThat(problem).contains("would pass vacuously"));
+        assertThat(ProductionConfigReadBench.legProblem(ProductionConfigReadBench.ExpectedLeg.NONE, shape1Point,
+                shape1Range)).isPresent();
+    }
+
+    @Test
+    public void aLoneRangeHasNoSelectiveLegSummary() {
+        for (final String filter : List.of(ProductionConfigShapes.ceCFilter(0),
+                ProductionConfigShapes.loneWideFilter(0), ProductionConfigShapes.loneMidFilter(0))) {
+            final Query query = path.find(filter, ProductionConfigShapes.defaultFindOptions());
+            final RenderedSql range = ProductionSearchPath.renderFind(query, null, SelectiveLegs.POINT_AND_RANGE);
+
+            assertThat(range.sql()).as(filter)
+                    .isEqualTo(ProductionSearchPath.renderFind(query, null, SelectiveLegs.POINT).sql())
+                    .doesNotContain("sel_leg");
+            assertThat(ProductionConfigReadBench.selectiveLegSummary(range, "Execution Time: 1.000 ms\n")).isEmpty();
+        }
     }
 
     @Test
@@ -232,6 +286,24 @@ public final class ProductionConfigShapesTest {
                 + "ge(features/env/properties/temperature,-15.0),le(features/env/properties/temperature,-14.91))");
         assertThat(ProductionConfigShapes.ceCFilter(1)).isEqualTo("and(ge(features/env/properties/temperature,-10.0),"
                 + "le(features/env/properties/temperature,-9.01))");
+    }
+
+    @Test
+    public void loneRangeFiltersParseAndRotate() {
+        assertThat(ProductionConfigShapes.loneWideFilter(7)).isEqualTo(
+                "and(ge(features/env/properties/temperature,0),le(features/env/properties/temperature,100))");
+        assertThat(ProductionConfigShapes.loneMidFilter(0)).isEqualTo(
+                "and(ge(features/env/properties/temperature,-15.0),le(features/env/properties/temperature,-12.11))");
+        assertThat(ProductionConfigShapes.loneMidFilter(9)).isEqualTo(
+                "and(ge(features/env/properties/temperature,30.0),le(features/env/properties/temperature,32.89))");
+        for (int i = 0; i < ProductionConfigShapes.CE_CYCLE; i++) {
+            for (final String filter : List.of(ProductionConfigShapes.loneWideFilter(i),
+                    ProductionConfigShapes.loneMidFilter(i))) {
+                assertThat(path.find(filter, ProductionConfigShapes.defaultFindOptions()).getCriteria())
+                        .as(filter).isNotNull();
+                assertThat(path.count(filter).getCriteria()).as(filter).isNotNull();
+            }
+        }
     }
 
     @Test

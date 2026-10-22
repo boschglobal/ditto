@@ -230,11 +230,47 @@ Reading the table (all from the committed plans and per-iteration tables):
       `ce-a-sudo`; `ce-c` has only the range, and `ce-a` with the corpus's auth returns no row before any CTE runs),
       but the **gate is missed**: the main statement then reads the whole city anyway (a bitmap scan of ~90k rows into
       a merge/hash semi join instead of ~5 per-thing probes; the planner estimates the city at 1,223 rows).
-    - Not measured: a lone **wide** two-sided range, which is now materialised in full (no cap) where it had no CTE
-      before; see the evidence README.
+    - Measured since on a host that did not swap: see the next bullet.
     - The host swapped heavily during these runs (shape 1's A runs are ~5× this section's baseline), so the absolute
       numbers are inflated; the plans are the finding.
     - Evidence: `results/production-config/selective-range-leg/`.
+- **Range legs on a quiet host (2026-10-22):**
+  - A two-sided range alone is never materialised any more: its statement is byte for byte the one without range legs
+    (`off`). Materialising it was never faster than that statement: for the range over ~62 % of the things it was 52×
+    (auth find), 82× (auth count) and ~2,300× (sudo find) slower.
+  - With an equality and a range, the picked leg's thing ids are grouped (`SELECT sli.thing_id FROM (…) sli GROUP BY
+    sli.thing_id`). Its estimate drops from ~33,500 (the multi-valued branch's column-wide over-estimate) to 200, and
+    the main statement checks the city per candidate instead of scanning all ~90k city rows.
+  - All-rounds warm p95 in ms, mean of two runs per arm (ABBA, `--rounds 3`, every run with 0 swap-outs; free memory
+    82–87 % before, 71–79 % after). "Before" = the code with the lone-range CTE and the ungrouped pick, "after" = the
+    final code, on two loads of the same corpus:
+
+    | variant | off (before) | auto, start code (before) | off (after) | auto, final code (after) | band | verdict |
+    |---|---:|---:|---:|---:|---:|---|
+    | `1` | 1,046 | 582 | 1,314 | 162 | 125 | faster ¹ |
+    | `5` | 856 | 515 | 1,116 | 134 | 52 | faster ¹ |
+    | `2` | 237 | 135 | 289 | 171 | 29 | identical statement ² |
+    | `ce-a` | 2.1 | 2.8 | 2.2 | 2.3 | 10 | within band |
+    | `ce-a-sudo` | 1.6 | 1.8 | 1.6 | 1.9 | 10 | within band |
+    | `ce-b` | 844 | 428 | 852 | 19 | 43 | faster |
+    | `ce-c` | 209 | 128 | 215 | 148 | 22 | identical statement ² |
+    | `lone-wide` | 112 | 5,854 | 113 | 114 | 11 | within band |
+    | `lone-wide-sudo` | 1.4 | 3,301 | 1.7 | 1.4 | 10 | within band |
+    | `lone-wide-count` | 71 | 5,804 | 77 | 107 | 10 | identical statement ² |
+    | `lone-wide-sudo-count` | 6,148 | 9,322 | 5,615 | 5,619 | 562 | within band |
+    | `lone-mid` | 152 | 366 | 485 | 479 | 49 | within band |
+    | `lone-mid-sudo` | 5.0 | 155 | 5.9 | 5.7 | 10 | within band |
+
+    The verdict compares the final code's `auto` with `off` on the same load for the lone ranges and shape 2, and with
+    the start code's `auto` for the pairs (`1`, `5`, `ce-*`). ¹ `off` moved beyond the band between the two loads for
+    shapes 1 and 5, so their verdict comes from an extra ABBA on the "after" load, start code `auto` vs final code
+    `auto`: 1,250 → 132 ms and 523 → 126 ms (the start code's shape 1 had slow first rounds there, 1,517 / 1,303 ms,
+    and 520–530 ms in rounds 2–3 but one). ² The same statement in both modes (no selective-leg CTE), so the
+    difference is run-to-run drift, mostly an unsettled first round; an extra pair for `ce-c` and `lone-wide-count`
+    gave `off`/`auto` 319/225 and 72/66 ms.
+  - Gate: shapes 1 and 5 pass the 200 ms gate with the final code (B runs 160–165 ms and 132–135 ms; the extra ABBA
+    128–137 ms and 124–129 ms). Shape 5 settled; shape 1 did not (its first round was 25–33 % slower than round 3).
+  - Evidence: `results/production-config/range-legs-quiet-host/`.
 - **Shape 2:** the plan drives from the ~29k `global_read` things (bitmap scan), filters by the per-field auth and
   probes the flat PK for each survivor.
   - It is executed **leader-only**, like every shipped `findAll` (see below).
@@ -344,12 +380,13 @@ Stages can be run individually (they build on each other in this order):
 | `down` | Remove the container (`--purge` also deletes the data volume) | seconds |
 | `production-config` | `pc-up pc-load pc-read pc-cold pc-bias`: the shipped-schema + shipped-translator baseline (§5), own container `ditto-search-bench-pc` (port 55433, volume `ditto-search-bench-pc-data`) | ~25 min at 1M (load 678 s; warm 551 s, cold 161 s, bias 11 s) |
 | `pc-load` / `pc-read` / `pc-cold` / `pc-bias` | the stages individually, in this order (`--rounds N`, `--cold-samples N`, `--results-dir DIR`); `pc-bias` only after `pc-cold` (it reads the pages the first cold samples need); `pc-status`, `pc-down [--purge]` | see above |
-| `pc-invariance` | the selective-leg requests (shapes 1/5, the counter-examples `ce-*`, two `attributes/region` array filters) with point legs only and with range legs: same request results and same full ordered sudo match lists (`invariance.md`), fails on a difference | hours at 1M (each iteration runs the request and the full sudo match list in both modes, ~1.7 min per shape-1 iteration) |
+| `pc-invariance` | the selective-leg requests (`--variants`, default: every variant with a two-sided range: shapes 1/5, the counter-examples `ce-*`, the `lone-*` ranges; plus three `attributes/region` array filters) with point legs only and with range legs: same request results and same full ordered sudo match lists (`invariance.md`, written after every request), fails on a difference. An equality + range request must render the pick with its multi-valued branch; a lone range must render the identical statement in both modes, so it is recorded as identical and not executed. The full sudo match list is computed once per filter | hours at 1M (each iteration runs the request and, once per filter, the full sudo match list in both modes, ~1.7 min per shape-1 iteration) |
 | `soak-up` / `soak-load` / `soak-run` | production write-path soak (`WriteSoakBench`): own container `ditto-search-bench-soak` (127.0.0.1:55434, volume `ditto-search-bench-soak-data`); load the text-heavy soak twin with the production DDL (`--count N`, resumable with `--load-from N`), then a warm-up + gated soak through the shipped `PostgresSearchUpdaterFlow` with per-window throughput, latency, WAL, dead tuples, sizes and autovacuum activity, and the throughput-gate / bloat-plateau verdicts; `soak-status`, `soak-down [--purge]` | load ~minutes per 100k things on a laptop; soak = warm-up + `--soak-seconds` |
 
 Production-config knobs: `--range-legs auto|off` (selective range legs as the service uses them while the system
 index `sf_multi` is valid, or forced off: point legs only; recorded in `environment.md`) and `--variants LIST`
-(`pc-read`: only these variant ids, e.g. `1,5,2,ce-a,ce-a-sudo,ce-b,ce-c`). The `pc-load` catalog check includes
+(`pc-read`, `pc-invariance`: only these variant ids, e.g. `1,5,2,ce-a,ce-a-sudo,ce-b,ce-c,lone-wide,lone-mid`). The
+`pc-load` catalog check includes
 `sf_multi`, so a corpus loaded with search schema v2 has to be reloaded.
 
 Write-soak knobs: `--soak-seconds N` (gated period, default 3600), `--warmup-seconds N` (300), `--plateau-seconds N`

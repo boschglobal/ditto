@@ -65,6 +65,7 @@ max(10 % of the A mean, 10 ms), the noise band of `../`.
   cap, where the statement before range legs had no selective-leg CTE. An earlier measurement on a 1M corpus of the
   same generator materialised the temperature range 0..100 as the only leg: 622,807 thing ids in 2,851 ms. A lone
   filter of that width is therefore expected to be slower with range legs; it is not measured here.
+  Measured since on a host that did not swap, and a lone range is no longer materialised: `../range-legs-quiet-host/`.
 - **Warm EXPLAINs** (iteration 0 / slowest, ms; a single execution each, less affected by the swapping than the timed
   p95): shape 1 A 2,110 / 1,852 · 1,793 / 3,695 → B 929 / 1,043 · 978 / 972 · 1,368 / 1,216; shape 5 A 1,582 / 1,608 ·
   1,762 / 4,036 → B 966 / 1,002 · 973 / 990 · 1,375 / 1,427.

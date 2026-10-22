@@ -67,11 +67,24 @@ import org.eclipse.ditto.rql.query.expression.visitors.FilterFieldExpressionVisi
  * {@code exists}/{@code empty}, root-mapped and {@code features/*} fields are never legs.
  * </p>
  * <p>
- * <b>Choice.</b> One candidate: it is materialised. A point and a range leg: decided in the statement, not by the
+ * <b>Choice.</b> A point leg alone is materialised. A range leg alone is never materialised: the statement keeps the
+ * plan it had before range legs. Measured on the 1M-thing benchmark corpus, materialising a lone range was never
+ * faster than that plan and much slower for wide ranges, because that plan stops early on a sorted sudo find and
+ * probes only the readable things with authorization. A point and a range leg: decided in the statement, not by the
  * planner's estimates. A one-row {@code sel_pick} counts the point leg's index entries up to
  * {@value #POINT_COUNT_CAP} and the range leg's (both branches) up to that count + 1, and {@code sel_leg} materialises
  * the range leg only if it counted fewer (ties go to the point leg). The branch not chosen is skipped by a one-time
  * filter. At most one {@code sel_leg} per statement, one round trip.
+ * </p>
+ * <p>
+ * <b>Estimate.</b> The pick's {@code sel_leg} returns its thing ids grouped
+ * ({@code SELECT sli.thing_id FROM (…) sli GROUP BY sli.thing_id}). The semi-join reads {@code sel_leg} as a set, so
+ * the result is the same. What changes is the row estimate the main statement is planned with: ungrouped, it is the
+ * sum of the branches' estimates, and the multi-valued branch is estimated from the column-wide share of
+ * {@code ord = 1} rows even on a path that holds no array. On the benchmark corpus that branch was estimated at
+ * 31,795 rows and returned none, and the main statement then scanned every row of the equality instead of probing
+ * the candidates. Grouped, the estimate is the planner's default group count. A range leg alone is never grouped:
+ * with that small estimate a sorted sudo find would drive from every id instead of stopping early.
  * </p>
  */
 final class SelectiveLegCte {
@@ -93,6 +106,7 @@ final class SelectiveLegCte {
     private static final String POINT_COUNT_ALIAS = "pc";
     private static final String POINT_ROWS_ALIAS = "pr";
     private static final String RANGE_ROWS_ALIAS = "rr";
+    private static final String GROUPED_ALIAS = "sli";
     private static final SqlExpression ONE = Sql.raw("1");
     private static final SqlExpression COUNT_STAR = Sql.raw("count(*)");
     private static final TimePlaceholder TIME_PLACEHOLDER = TimePlaceholder.getInstance();
@@ -114,10 +128,8 @@ final class SelectiveLegCte {
         if (point.isPresent() && range.isPresent()) {
             return Optional.of(Prelude.picked(point.get(), range.get()));
         }
-        if (point.isPresent()) {
-            return Optional.of(Prelude.point(point.get()));
-        }
-        return range.map(Prelude::range);
+        // a range leg alone is never materialised: the statement keeps the plan it had before range legs
+        return point.map(Prelude::point);
     }
 
     /**
@@ -149,12 +161,6 @@ final class SelectiveLegCte {
             return new Prelude(null, flat(thingId(), pointRows(point)));
         }
 
-        static Prelude range(final RangeLeg range) {
-            return new Prelude(null, flatBuilder(thingId(), rangeRows(range))
-                    .unionAll(flat(thingId(), multiValuedRows(range)))
-                    .build());
-        }
-
         static Prelude picked(final PointLeg point, final RangeLeg range) {
             final Select pointCount = Sql.select().column(COUNT_STAR, "n")
                     .from(flatBuilder(ONE, pointRows(point))
@@ -175,16 +181,25 @@ final class SelectiveLegCte {
                     .column(Sql.col(PICK_ALIAS, POINT_WINS))
                     .from(PICK_CTE, PICK_ALIAS)
                     .build());
-            final Select leg = flatBuilder(thingId(), Sql.and(pointRows(point), pointWins))
+            final Select branches = flatBuilder(thingId(), Sql.and(pointRows(point), pointWins))
                     .unionAll(flat(thingId(), Sql.and(rangeRows(range), Sql.not(pointWins))))
                     .unionAll(flat(thingId(), Sql.and(multiValuedRows(range), Sql.not(pointWins))))
                     .build();
-            return new Prelude(pick, leg);
+            return new Prelude(pick, groupedThingIds(branches));
         }
     }
 
     private static SqlExpression thingId() {
         return Sql.col(CTE_FLAT_ALIAS, AbstractFieldSqlCreator.THING_ID);
+    }
+
+    /**
+     * {@code SELECT sli.thing_id FROM (<branches>) sli GROUP BY sli.thing_id}: the pick's thing ids, each once (see
+     * "Estimate." in the class comment).
+     */
+    private static Select groupedThingIds(final Select branches) {
+        final SqlExpression thingId = Sql.col(GROUPED_ALIAS, AbstractFieldSqlCreator.THING_ID);
+        return Sql.select().column(thingId).from(branches, GROUPED_ALIAS).groupBy(thingId).build();
     }
 
     private static Select.Builder flatBuilder(final SqlExpression column, final SqlExpression where) {

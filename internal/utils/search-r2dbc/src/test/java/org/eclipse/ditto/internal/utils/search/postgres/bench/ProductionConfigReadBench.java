@@ -169,7 +169,8 @@ public class ProductionConfigReadBench {
                 case "1", "5" -> ProductionConfigShapes.SHAPE1_CYCLE;
                 case "2" -> ProductionConfigShapes.SHAPE2_CYCLE;
                 case "3-low", "3-high" -> ProductionConfigShapes.SHAPE3_CYCLE;
-                case "ce-a", "ce-a-sudo", "ce-b", "ce-c" -> ProductionConfigShapes.CE_CYCLE;
+                case "ce-a", "ce-a-sudo", "ce-b", "ce-c", "lone-mid", "lone-mid-sudo" ->
+                        ProductionConfigShapes.CE_CYCLE;
                 default -> 1;
             };
         }
@@ -256,6 +257,26 @@ public class ProductionConfigReadBench {
                 false, ProductionConfigShapes::ceCFilter, defaultFind, cycling,
                 "filter `" + ProductionConfigShapes.ceCFilter(0) + "` (bucket cycles), options `"
                         + ProductionConfigShapes.defaultFindOptions() + "`"));
+        final IntFunction<List<String>> sudo = i -> null;
+        final String wide = ProductionConfigShapes.loneWideFilter(0);
+        final String mid = ProductionConfigShapes.loneMidFilter(0);
+        final String find = "`, options `" + ProductionConfigShapes.defaultFindOptions() + "`";
+        variants.add(new Variant("lone-wide", "lone two-sided temperature range 0..100 (~62 % of the things)",
+                "lone-range.md", false, ProductionConfigShapes::loneWideFilter, defaultFind, cycling,
+                "filter `" + wide + find));
+        variants.add(new Variant("lone-wide-sudo", "lone two-sided temperature range 0..100, sudo", "lone-range.md",
+                false, ProductionConfigShapes::loneWideFilter, defaultFind, sudo,
+                "filter `" + wide + find + ", no auth"));
+        variants.add(new Variant("lone-wide-count", "count with the lone range 0..100", "lone-range.md", true,
+                ProductionConfigShapes::loneWideFilter, i -> List.of(), cycling, "count, filter `" + wide + "`"));
+        variants.add(new Variant("lone-wide-sudo-count", "sudo count with the lone range 0..100", "lone-range.md", true,
+                ProductionConfigShapes::loneWideFilter, i -> List.of(), sudo, "count, filter `" + wide + "`, no auth"));
+        variants.add(new Variant("lone-mid", "lone two-sided temperature range of ~40,000 things", "lone-range.md",
+                false, ProductionConfigShapes::loneMidFilter, defaultFind, cycling,
+                "filter `" + mid + "` (bucket cycles)" + find.substring(1)));
+        variants.add(new Variant("lone-mid-sudo", "lone two-sided temperature range of ~40,000 things, sudo",
+                "lone-range.md", false, ProductionConfigShapes::loneMidFilter, defaultFind, sudo,
+                "filter `" + mid + "` (bucket cycles)" + find.substring(1) + ", no auth"));
         return variants;
     }
 
@@ -609,11 +630,15 @@ public class ProductionConfigReadBench {
 
     /**
      * The selective-leg choice changes plans, never results: every request of the variants with a two-sided range
-     * ({@code 1}, {@code 5}, {@code ce-a}, {@code ce-a-sudo}, {@code ce-b}, {@code ce-c}) over its whole rotation, and
-     * two filters on the array-heavy {@code attributes/region} (one straddling range, one empty interval), rendered
-     * with point legs only and with range legs. Compared: (a) the request itself (the find page incl. the has-next row,
-     * in order, or the count) and (b) the full sudo match list ordered by thing id (count + md5). For the region
-     * filters both leader-only plans are appended. Writes {@code invariance.md}; fails at the end on any difference.
+     * ({@code INVARIANCE_VARIANTS}, filtered by {@code --variants}) over its whole rotation, and three filters on the
+     * array-heavy {@code attributes/region} (a straddling range and an empty interval alone, and the straddling range
+     * next to {@code eq(city,"Stuttgart")}), rendered with point legs only and with range legs. Compared: (a) the
+     * request itself (the find page incl. the has-next row, in order, or the count) and (b) the full sudo match list
+     * ordered by thing id (count + md5), computed once per distinct filter and mode. Before anything runs, each pair of
+     * renders is checked so that a pass is not vacuous: an equality + range request must carry the pick with its
+     * {@code ord = 1} branch; a lone range must render identically in both modes, so it is recorded as identical and
+     * not executed. For the region filters both leader-only plans are appended. Writes {@code invariance.md} after
+     * every request (a stopped run keeps what it compared); fails at the end on any difference.
      */
     @Test
     public void legInvariance() throws Exception {
@@ -634,20 +659,32 @@ public class ProductionConfigReadBench {
             md.append("| request | iteration | subjects | (a) point legs | (a) range legs | (b) point legs | ")
                     .append("(b) range legs | same |\n|---|---:|---|---|---|---|---|:---:|\n");
             final List<Variant> variants = variants(new Cursors("", ""));
-            for (final String id : List.of("1", "5", "ce-a", "ce-a-sudo", "ce-b", "ce-c")) {
-                final Variant variant = find(variants, id);
+            final Set<String> requested = BenchConfig.productionConfigVariants();
+            final Map<String, List<String>> sudoLists = new LinkedHashMap<>();
+            for (final Map.Entry<String, ExpectedLeg> entry : INVARIANCE_VARIANTS.entrySet()) {
+                if (!requested.isEmpty() && !requested.contains(entry.getKey())) {
+                    continue;
+                }
+                final Variant variant = find(variants, entry.getKey());
                 for (int i = 0; i < variant.cycle(); i++) {
-                    System.out.printf("invariance %s iteration %d%n", id, i);
-                    compareLegs(db, id, i, variant.query(path, i), variant.subjects().apply(i), variant.count(), md,
+                    System.out.printf("invariance %s iteration %d%n", entry.getKey(), i);
+                    compareLegs(db, entry.getKey(), i, variant.filter().apply(i), variant.query(path, i),
+                            variant.subjects().apply(i), variant.count(), entry.getValue(), sudoLists, md,
                             differences);
+                    write("invariance.md", md.toString());   // incremental: a stopped run keeps what it compared
                 }
             }
-            for (final String filter : List.of(
-                    "and(ge(" + REGION_FIELD + ",91700),le(" + REGION_FIELD + ",93000))",
-                    "and(ge(" + REGION_FIELD + ",93000),le(" + REGION_FIELD + ",91700))")) {
+            for (final Map.Entry<String, ExpectedLeg> region : List.of(
+                    Map.entry("and(ge(" + REGION_FIELD + ",91700),le(" + REGION_FIELD + ",93000))", ExpectedLeg.NONE),
+                    Map.entry("and(ge(" + REGION_FIELD + ",93000),le(" + REGION_FIELD + ",91700))", ExpectedLeg.NONE),
+                    Map.entry("and(eq(" + ProductionConfigShapes.CITY_FIELD + ",\"Stuttgart\"),ge(" + REGION_FIELD
+                            + ",91700),le(" + REGION_FIELD + ",93000))", ExpectedLeg.PICK))) {
+                final String filter = region.getKey();
                 System.out.printf("invariance %s%n", filter);
                 final Query query = path.find(filter, ProductionConfigShapes.defaultFindOptions());
-                compareLegs(db, "`" + filter + "`", 0, query, null, false, md, differences);
+                compareLegs(db, "`" + filter + "`", 0, filter, query, null, false, region.getValue(), sudoLists, md,
+                        differences);
+                write("invariance.md", md.toString());
                 for (final SelectiveLegs mode : SelectiveLegs.values()) {
                     plans.append("### `").append(filter).append("`, ").append(mode).append(" (sudo find, ")
                             .append(executionMode(find(variants, "1"))).append(")\n\n```\n")
@@ -665,29 +702,93 @@ public class ProductionConfigReadBench {
         }
     }
 
-    private void compareLegs(final ProductionSearchDb db, final String request, final int iteration, final Query query,
-            @Nullable final List<String> subjects, final boolean count, final StringBuilder md,
+    /** What the {@code POINT_AND_RANGE} render of an invariance request must be, so that a pass is not vacuous. */
+    enum ExpectedLeg {
+        /** An equality and a two-sided range: {@code sel_pick} and three gated branches, the last {@code … ord = 1}. */
+        PICK,
+        /** A two-sided range alone: no CTE, the statement and binds identical to the {@code POINT} render. */
+        NONE
+    }
+
+    /** Every read variant with a two-sided range, in run order, with the render its range-legs form must have. */
+    private static final Map<String, ExpectedLeg> INVARIANCE_VARIANTS = invarianceVariants();
+
+    private static Map<String, ExpectedLeg> invarianceVariants() {
+        final Map<String, ExpectedLeg> variants = new LinkedHashMap<>();
+        List.of("1", "5", "ce-a", "ce-a-sudo", "ce-b").forEach(id -> variants.put(id, ExpectedLeg.PICK));
+        List.of("ce-c", "lone-mid", "lone-mid-sudo", "lone-wide", "lone-wide-sudo", "lone-wide-count",
+                "lone-wide-sudo-count").forEach(id -> variants.put(id, ExpectedLeg.NONE));
+        return Collections.unmodifiableMap(variants);
+    }
+
+    /**
+     * @return why comparing these two renders would not test a range leg, or empty if it would: a pick must carry the
+     * multi-valued branch; a lone range must render exactly as with point legs only.
+     */
+    static Optional<String> legProblem(final ExpectedLeg expected, final RenderedSql point, final RenderedSql range) {
+        final List<String> branches = cteBranches(range);
+        return switch (expected) {
+            case PICK -> range.sql().startsWith("WITH sel_pick AS MATERIALIZED") && branches.size() == 3
+                    && branches.get(2).endsWith(" AND sfc.ord = 1)")
+                    ? Optional.empty()
+                    : Optional.of("no range leg with its ord = 1 branch in the range-legs render: the comparison "
+                            + "would pass vacuously");
+            case NONE -> branches.isEmpty() && range.sql().equals(point.sql())
+                    && bindStrings(range).equals(bindStrings(point))
+                    ? Optional.empty()
+                    : Optional.of("a lone range renders differently with range legs");
+        };
+    }
+
+    private static List<String> bindStrings(final RenderedSql sql) {
+        return sql.bindValues().stream().map(ProductionConfigReadBench::bindToString).toList();
+    }
+
+    private void compareLegs(final ProductionSearchDb db, final String request, final int iteration,
+            final String filter, final Query query, @Nullable final List<String> subjects, final boolean count,
+            final ExpectedLeg expected, final Map<String, List<String>> sudoLists, final StringBuilder md,
             final List<String> differences) throws NoSuchAlgorithmException {
-        final List<String> pointRequest = requestResult(db, query, subjects, count, SelectiveLegs.POINT);
-        final List<String> rangeRequest = requestResult(db, query, subjects, count, SelectiveLegs.POINT_AND_RANGE);
-        final List<String> pointList = db.ids(fullSudoList(query, SelectiveLegs.POINT));
-        final List<String> rangeList = db.ids(fullSudoList(query, SelectiveLegs.POINT_AND_RANGE));
+        final RenderedSql pointRequestSql = renderRequest(query, subjects, count, SelectiveLegs.POINT);
+        final RenderedSql rangeRequestSql = renderRequest(query, subjects, count, SelectiveLegs.POINT_AND_RANGE);
+        final RenderedSql pointListSql = fullSudoList(query, SelectiveLegs.POINT);
+        final RenderedSql rangeListSql = fullSudoList(query, SelectiveLegs.POINT_AND_RANGE);
+        final Optional<String> problem = legProblem(expected, pointRequestSql, rangeRequestSql)
+                .or(() -> legProblem(expected, pointListSql, rangeListSql));
+        final String row = "| " + request + " | " + iteration + " | " + subjectsOrSudo(subjects) + " | ";
+        if (problem.isPresent()) {
+            differences.add(request + " iteration " + iteration + ": " + problem.get());
+            md.append(row).append("**").append(problem.get()).append("** | | | | **NO** |\n");
+            return;
+        }
+        if (expected == ExpectedLeg.NONE) {
+            md.append(row).append("identical statement in both modes (no CTE), not executed | | | | yes |\n");
+            return;
+        }
+        final List<String> pointRequest = executeRequest(db, pointRequestSql, count);
+        final List<String> rangeRequest = executeRequest(db, rangeRequestSql, count);
+        // the full sudo match list depends only on the filter: computed once per distinct filter and mode
+        final List<String> pointList = sudoLists.computeIfAbsent("POINT " + filter, key -> db.ids(pointListSql));
+        final List<String> rangeList =
+                sudoLists.computeIfAbsent("POINT_AND_RANGE " + filter, key -> db.ids(rangeListSql));
         final boolean same = pointRequest.equals(rangeRequest) && pointList.equals(rangeList);
         if (!same) {
             differences.add(request + " iteration " + iteration);
         }
-        md.append("| ").append(request).append(" | ").append(iteration).append(" | ").append(subjectsOrSudo(subjects))
-                .append(" | ").append(describe(pointRequest, count)).append(" | ")
-                .append(describe(rangeRequest, count)).append(" | ").append(describe(pointList, false)).append(" | ")
-                .append(describe(rangeList, false)).append(" | ").append(same ? "yes" : "**NO**").append(" |\n");
+        md.append(row).append(describe(pointRequest, count)).append(" | ").append(describe(rangeRequest, count))
+                .append(" | ").append(describe(pointList, false)).append(" | ").append(describe(rangeList, false))
+                .append(" | ").append(same ? "yes" : "**NO**").append(" |\n");
+    }
+
+    private static RenderedSql renderRequest(final Query query, @Nullable final List<String> subjects,
+            final boolean count, final SelectiveLegs mode) {
+        return count ? ProductionSearchPath.renderCount(query, subjects, mode)
+                : ProductionSearchPath.renderFind(query, subjects, mode);
     }
 
     /** The find page incl. the has-next row, in order; or the count as a one-element list. */
-    private static List<String> requestResult(final ProductionSearchDb db, final Query query,
-            @Nullable final List<String> subjects, final boolean count, final SelectiveLegs mode) {
-        return count
-                ? List.of(String.valueOf(db.executeCount(ProductionSearchPath.renderCount(query, subjects, mode))))
-                : db.executeThingIds(ProductionSearchPath.renderFind(query, subjects, mode));
+    private static List<String> executeRequest(final ProductionSearchDb db, final RenderedSql sql,
+            final boolean count) {
+        return count ? List.of(String.valueOf(db.executeCount(sql))) : db.executeThingIds(sql);
     }
 
     private RenderedSql fullSudoList(final Query query, final SelectiveLegs mode) {
@@ -1013,6 +1114,9 @@ public class ProductionConfigReadBench {
     }
 
     private static final String LEG_CTE_START = "sel_leg AS MATERIALIZED (";
+    /** The pick's leg is grouped: {@code SELECT sli.thing_id FROM (<branch> UNION ALL …) sli GROUP BY sli.thing_id}. */
+    private static final String GROUPED_LEG_START = "SELECT sli.thing_id FROM (";
+    private static final String GROUPED_LEG_END = ") sli GROUP BY sli.thing_id)";
     private static final String UNION_ALL = " UNION ALL ";
     private static final String WHERE = " WHERE ";
     private static final String PICK_GATE = " AND (SELECT sp.point_wins FROM sel_pick sp))";
@@ -1050,6 +1154,11 @@ public class ProductionConfigReadBench {
         final List<String> bodies = new ArrayList<>();
         int depth = 1;
         int branchStart = start + LEG_CTE_START.length();
+        final boolean grouped = text.startsWith(GROUPED_LEG_START, branchStart);
+        if (grouped) {
+            // step into the derived table: depth 1 is now inside its parentheses, so its UNION ALLs split
+            branchStart += GROUPED_LEG_START.length();
+        }
         int i = branchStart;
         while (i < text.length() && depth > 0) {
             final char c = text.charAt(i);
@@ -1064,7 +1173,14 @@ public class ProductionConfigReadBench {
             }
             i++;
         }
+        if (grouped && !text.startsWith(GROUPED_LEG_END, i - 1)) {
+            throw new IllegalStateException("sel_leg: unexpected grouped body in " + text);
+        }
         bodies.add(text.substring(branchStart, i - 1));
+        if (text.startsWith("WITH sel_pick AS MATERIALIZED") && bodies.size() != 3) {
+            throw new IllegalStateException("sel_leg: expected 3 gated branches next to sel_pick, got "
+                    + bodies.size());
+        }
         return bodies.stream()
                 .map(body -> withoutPickGate(body.substring(body.indexOf(WHERE) + WHERE.length())))
                 .map(condition -> withBinds(condition, sql))

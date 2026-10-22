@@ -31,7 +31,8 @@ import org.eclipse.ditto.rql.query.criteria.Criteria;
  * <p>
  * <b>Statement shape ({@code findAll}).</b>
  * <pre>{@code
- * [WITH [sel_pick AS MATERIALIZED (…),] sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE …)]
+ * [WITH sel_leg AS MATERIALIZED (SELECT sfc.thing_id FROM search_flat sfc WHERE …)]       -- a point leg alone, or
+ * [WITH sel_pick AS MATERIALIZED (…), sel_leg AS MATERIALIZED (SELECT sli.thing_id FROM (…) sli GROUP BY sli.thing_id)]
  * SELECT st.thing_id, st.t_modified, <cursor-projection cols>
  * FROM search_things st
  * [LEFT JOIN LATERAL (…) k0 ON true …]                              -- one per flat sort key (D3)
@@ -39,7 +40,8 @@ import org.eclipse.ditto.rql.query.criteria.Criteria;
  * ORDER BY … LIMIT $ OFFSET $
  * }</pre>
  * The selective-leg semi-join is an <em>additional</em> conjunct; the full predicate (auth rechecks included) is always
- * applied, so the CTE only ever changes the plan, never the result (see {@link SelectiveLegCte}). Reads do NOT filter
+ * applied, so the CTE only ever changes the plan, never the result (see {@link SelectiveLegCte}). A two-sided range
+ * alone gets no CTE (see {@link SelectiveLegCte}). Reads do NOT filter
  * {@code delete_at} (plan §3.6): a purge-marked row stays visible until the reaper removes it, matching Mongo (whose
  * TTL-marked docs likewise remain queryable until physically deleted).
  * </p>

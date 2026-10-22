@@ -458,7 +458,8 @@ To see whether a build or drop is running:
 
 A filter with a two-sided numeric range on one field (`ge` or `gt` together with `le` or `lt` on the same field), for example `and(eq(attributes/location/city,"Stuttgart"),ge(features/env/properties/temperature,-15),le(features/env/properties/temperature,-14.01))`, may start from the range instead of the equality:
 
-* With an equality and a range in the same filter, the search counts their index entries in the same statement (the equality up to 50,000 entries, the range up to one more than the equality) and starts from the one with fewer entries; a tie keeps the equality. A two-sided range alone is started from directly.
+* With an equality and a range in the same filter, the search counts their index entries in the same statement (the equality up to 50,000 entries, the range up to one more than the equality) and starts from the one with fewer entries; a tie keeps the equality. A two-sided range alone keeps the previous plan. Measured on the 1M-thing benchmark corpus on a host that did not swap, starting from it was at best as fast as that plan (a range matching ~14,000 things) and slower for wider ranges: ~40,000 things 152 → 366 ms, ~620,000 things 112 ms → 5.9 s (all-rounds warm p95 of a find with authorization).
+* When the search starts from the equality or the range, it hands each candidate thing to the rest of the filter once. That keeps the database's estimate of the candidates realistic, so it checks the remaining conditions per candidate instead of reading every row of the other condition. Measured on the same corpus: `and(eq(city), range)` with ~14,000 things in the range and ~90,000 in the city, 582 → 162 ms (all-rounds warm p95).
 * Results never change: the start only narrows the candidates, and the whole filter, including every authorization check, is still applied.
 * One-sided ranges, string ranges, `features/*` fields and ranges under `or`/`not` keep the previous plan.
 

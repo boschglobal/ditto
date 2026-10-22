@@ -32,6 +32,7 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.search.PostgresSear
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.pathindex.SystemSearchIndex;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQuery;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresQueryBuilderFactory;
+import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.PostgresSortClause;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SearchQueryAssembler;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.SelectiveLegs;
 import org.eclipse.ditto.internal.utils.persistence.postgres.search.query.ast.RenderedSql;
@@ -464,6 +465,11 @@ public final class PostgresSearchReadIT {
         for (final Criteria criteria : filters) {
             assertSameResults(criteria);
         }
+        // the two pairs still exercise a range leg (the lone ranges compare identical statements now)
+        for (final Criteria pair : List.of(filters.get(3), filters.get(4))) {
+            assertThat(SearchQueryAssembler.count(pair, null, 0L, 0L, SelectiveLegs.POINT_AND_RANGE).sql())
+                    .contains("sel_pick").contains("sfc.ord = 1");
+        }
         // the straddling thing is matched (MongoDB semantics), which a single-row range leg would lose
         assertThat(sudoFindWith(withRangeLegs(), filters.get(0))).contains("straddle");
         assertThat(sudoFindWith(withRangeLegs(), filters.get(2))).contains("straddle");
@@ -498,8 +504,57 @@ public final class PostgresSearchReadIT {
         seedRangeCorpus();
         runDdl(MULTI);
         runDdl("VACUUM ANALYZE search_flat");
-        final String plan = explainText(cf.and(List.of(ge("region", 91700), le("region", 93000))));
+        // a range leg only exists next to a point leg
+        final String plan =
+                explainText(cf.and(List.of(eqAttr("kind", "common"), ge("region", 91700), le("region", 93000))));
         assertThat(plan).contains("Index Only Scan using sf_multi");
+    }
+
+    /** Clones of a lone range's matching thing: tens of thousands, the setting in which a grouped leg was slowest. */
+    private static final int LONE_RANGE_CLONES = 40_000;
+
+    @Test
+    public void aLoneRangeIsNeverMaterialisedEvenWithTensOfThousandsOfMatches() {
+        // matches [0, 10] with no element inside it (MongoDB semantics)
+        write(docAuth("straddle-n", attributes(JsonObject.newBuilder().set("n", JsonArray.of("[-5, 20]")).build()),
+                S1, rootGrant("s1")), 1L);
+        write(docAuth("template", attributes(JsonObject.newBuilder().set("n", 5).build()), S1, rootGrant("s1")), 1L);
+        write(docAuth("outside", attributes(JsonObject.newBuilder().set("n", 50).build()), S1, rootGrant("s1")), 1L);
+        runDdl(MULTI);
+        cloneThing("template", 1, LONE_RANGE_CLONES);
+        runDdl("ANALYZE search_things");
+        runDdl("ANALYZE search_flat");
+        final Criteria lone = cf.and(List.of(ge("n", 0), le("n", 10)));
+        final PostgresSortClause byThingId =
+                PostgresSortClause.of(List.of(new SortOption(fef.sortByThingId(), SortDirection.ASC)));
+        final RenderedSql sudoFind =
+                SearchQueryAssembler.findAll(lone, null, byThingId, 26L, 0L, SelectiveLegs.POINT_AND_RANGE);
+
+        assertThat(sudoFind.sql())
+                .isEqualTo(SearchQueryAssembler.findAll(lone, null, byThingId, 26L, 0L, SelectiveLegs.POINT).sql())
+                .doesNotContain("sel_leg").doesNotContain("GROUP BY");
+        // no "Aggregate" check: a semi-join may unique-ify its inner side with a HashAggregate on its own
+        assertThat(String.join("\n", explain("EXPLAIN (ANALYZE) ", sudoFind, false)))
+                .doesNotContain("CTE sel_leg").doesNotContain("CTE Scan");
+        assertSameResults(lone);
+        // the clones, the template and the straddling array; not "outside"
+        assertThat(runSingle(withRangeLegs().sudoCount(countQuery(lone), HEADERS))).isEqualTo(LONE_RANGE_CLONES + 2L);
+    }
+
+    @Test
+    public void theGroupedPickKeepsResultsWhenTheRangeWins() {
+        seedRangeCorpus();
+        // kind = common: straddle, inside, above + 2 padding things = 5 entries. The region range [91700, 93000]:
+        // inside and scalar-inside in range + the ord = 1 rows of straddle and above = 4. So the range wins (5 > 4).
+        write(doc("pad-1", attributes(JsonObject.newBuilder().set("kind", "common").build())), 1L);
+        write(doc("pad-2", attributes(JsonObject.newBuilder().set("kind", "common").build())), 1L);
+        runDdl(MULTI);
+        final Criteria pick = cf.and(List.of(eqAttr("kind", "common"), ge("region", 91700), le("region", 93000)));
+
+        assertThat(executedSelLegBranches(pick)).containsExactly(false, true, true);
+        assertSameResults(pick);
+        // straddle matches through two different elements; above has no element <= 93000
+        assertThat(sudoFindWith(withRangeLegs(), pick)).containsExactly("inside", "straddle");
     }
 
     private void assertSameResults(final Criteria criteria) {
@@ -508,10 +563,33 @@ public final class PostgresSearchReadIT {
                 .as("sudo find %s", criteria).isEqualTo(ids(pointLegsOnly().findAll(query, null, null, HEADERS)));
         assertThat(ids(withRangeLegs().findAll(query, S1, null, HEADERS)))
                 .as("auth find %s", criteria).isEqualTo(ids(pointLegsOnly().findAll(query, S1, null, HEADERS)));
-        assertThat(runSingle(withRangeLegs().sudoCount(query, HEADERS)))
-                .as("sudo count %s", criteria).isEqualTo(runSingle(pointLegsOnly().sudoCount(query, HEADERS)));
-        assertThat(runSingle(withRangeLegs().count(query, S1, HEADERS)))
-                .as("auth count %s", criteria).isEqualTo(runSingle(pointLegsOnly().count(query, S1, HEADERS)));
+        final PostgresQuery count = countQuery(criteria);
+        assertThat(runSingle(withRangeLegs().sudoCount(count, HEADERS)))
+                .as("sudo count %s", criteria).isEqualTo(runSingle(pointLegsOnly().sudoCount(count, HEADERS)));
+        assertThat(runSingle(withRangeLegs().count(count, S1, HEADERS)))
+                .as("auth count %s", criteria).isEqualTo(runSingle(pointLegsOnly().count(count, S1, HEADERS)));
+    }
+
+    /**
+     * The plain count (no skip/limit), which carries the selective-leg CTE; {@link #query} (limit 100) would take the
+     * bounded form, which has none.
+     */
+    private PostgresQuery countQuery(final Criteria criteria) {
+        return new PostgresQuery(criteria, List.of(new SortOption(fef.sortByThingId(), SortDirection.ASC)), 0, 0);
+    }
+
+    /**
+     * Copies thing {@code <ns>:<template>} (its search_things row and every search_flat row) as
+     * {@code <ns>:clone-<i>} for every {@code i} in {@code [from, to]}.
+     */
+    private static void cloneThing(final String template, final int from, final int to) {
+        final String ids = "generate_series(" + from + ", " + to + ") AS i";
+        runDdl("INSERT INTO search_things SELECT (jsonb_populate_record(t, jsonb_build_object('thing_id', "
+                + "replace(t.thing_id, ':" + template + "', ':clone-' || i)))).* FROM search_things t, " + ids
+                + " WHERE t.thing_id LIKE '%:" + template + "'");
+        runDdl("INSERT INTO search_flat SELECT (jsonb_populate_record(f, jsonb_build_object('thing_id', "
+                + "replace(f.thing_id, ':" + template + "', ':clone-' || i)))).* FROM search_flat f, " + ids
+                + " WHERE f.thing_id LIKE '%:" + template + "'");
     }
 
     private List<String> sudoFindWith(final PostgresThingsSearchPersistence searchPersistence,
