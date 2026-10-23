@@ -258,10 +258,10 @@ public final class PgBouncerStatementTimeoutIT {
 
     /**
      * The persistence pings consume their pid streams throttled, far more slowly than one statement may run under the
-     * role default. Read in short statements (windows in ID order, one statement per walk in priority order), the
-     * streams survive a consumer that pauses for longer than the role default (2s here) after the first window,
-     * behind transaction-mode PgBouncer, as the runtime role: every pid is delivered and no statement is cancelled (the
-     * streams run without retries, so a cancellation would fail them).
+     * role default. Read in short statements (windows in both orders), the streams survive a consumer that pauses for
+     * longer than the role default (2s here) after the first window, behind transaction-mode PgBouncer, as the runtime
+     * role: every pid is delivered and no statement is cancelled (the streams run without retries, so a cancellation
+     * would fail them).
      */
     @Test
     public void pausedPingStreamsAreNotCancelledByTheRuntimeRoleDefaultBehindTransactionPooling() throws Exception {

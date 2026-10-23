@@ -15,7 +15,9 @@ package org.eclipse.ditto.internal.utils.persistence.postgres;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.IntStream;
@@ -44,6 +46,10 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  * {@code statement_timeout} that is the statement that fails, on every retry, every walk. Bounded statements read a
  * window of the next pids in key order and keep the tagged ones, so a window may deliver nothing and the walk moves
  * on.
+ * </p>
+ * <p>
+ * The priority order walks the same windows (its order is made in memory once the last window is read), so its
+ * statements are bounded the same way; it no longer reads all tagged rows in one statement.
  * </p>
  */
 public final class PostgresClusteredTagLayoutIT {
@@ -107,21 +113,57 @@ public final class PostgresClusteredTagLayoutIT {
     }
 
     @Test
+    public void priorityWalkTakesBoundedTimePerStatementAndDeliversTheClusterInPidOrder() {
+        final PidStreamTestSupport.StatementRecorder recorder =
+                new PidStreamTestSupport.StatementRecorder("FROM " + JOURNAL + " WHERE pid > $1");
+        final DittoPostgresClient client = fixture.newClient(recorder::decorate);
+        try {
+            final PostgresReadJournal readJournal =
+                    PostgresReadJournal.of(PostgresPersistenceOperations.of(client, ENTITY));
+            final long start = System.nanoTime();
+            final List<String> pids = PidStreamTestSupport.run(
+                    readJournal.getJournalPidsWithTagOrderedByPriorityTag(TAG, MAX_IDLE_TIME), mat, WALK_TIMEOUT);
+            final long totalMillis = (System.nanoTime() - start) / 1_000_000L;
+            System.out.printf("[layout] priority order: %d pids in %d statements, total %d ms; per statement "
+                            + "p50 %.2f ms, p95 %.2f ms, slowest %.2f ms%n", pids.size(), recorder.nanos().size(),
+                    totalMillis, recorder.percentileMillis(50), recorder.percentileMillis(95),
+                    recorder.slowestMillis());
+
+            // no priority tags in this layout: every pid has priority 0, so the order is the pid order
+            assertThat(pids).containsExactlyElementsOf(IntStream.rangeClosed(FIRST_TAGGED, PIDS)
+                    .mapToObj(i -> NewestPerPidFixture.pid(PREFIX, i))
+                    .toList());
+            assertThat(recorder.nanos())
+                    .as("one statement per window of %s pids, plus the final empty window", BATCH_SIZE)
+                    .hasSize(PIDS / BATCH_SIZE + 1);
+            assertThat(recorder.slowestMillis()).as("slowest statement of the priority walk")
+                    .isLessThanOrEqualTo(STATEMENT_BUDGET_MS);
+            assertThat(recorder.rows()).allSatisfy(rows -> assertThat(rows).isLessThanOrEqualTo(BATCH_SIZE));
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
     public void statementAtTheStartOfTheUntaggedBlockReadsABoundedNumberOfBuffers() {
+        final Map<String, String> statements = new LinkedHashMap<>();
         for (final boolean considerOnlyLatest : List.of(false, true)) {
-            final String sql = PidStreamTestSupport.productionSql(ENTITY,
-                    readJournal -> readJournal.getJournalPidsWithTag(TAG, BATCH_SIZE, MAX_IDLE_TIME, mat,
-                            considerOnlyLatest), mat);
+            statements.put("ID order, considerOnlyLatest=" + considerOnlyLatest, PidStreamTestSupport.productionSql(
+                    ENTITY, readJournal -> readJournal.getJournalPidsWithTag(TAG, BATCH_SIZE, MAX_IDLE_TIME, mat,
+                            considerOnlyLatest), mat));
+        }
+        statements.put("priority order", PidStreamTestSupport.productionSql(ENTITY,
+                readJournal -> readJournal.getJournalPidsWithTagOrderedByPriorityTag(TAG, MAX_IDLE_TIME), mat));
+        statements.forEach((walk, sql) -> {
             final String plan = fixture.explain("ANALYZE, BUFFERS, COSTS OFF, TIMING OFF", sql,
                     List.of("", TAG, BATCH_SIZE));
-            System.out.printf("[layout] considerOnlyLatest=%s, first statement:%n%s%n", considerOnlyLatest, plan);
+            System.out.printf("[layout] %s, first statement:%n%s%n", walk, plan);
 
             assertThat(topNodeBuffers(plan))
-                    .as("buffers of the first statement (considerOnlyLatest=%s), plan:%n%s", considerOnlyLatest,
-                            plan)
+                    .as("buffers of the first statement (%s), plan:%n%s", walk, plan)
                     .isLessThanOrEqualTo(STATEMENT_BUFFER_BUDGET);
             assertThat(plan).as("the tag index is not part of the plan:%n%s", plan).doesNotContain("tags_idx");
-        }
+        });
     }
 
     private static void assertBoundedWalk(final boolean considerOnlyLatest) {

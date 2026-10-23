@@ -15,6 +15,7 @@ package org.eclipse.ditto.internal.utils.persistence.postgres;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -48,7 +49,8 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  * <ul>
  *     <li>{@code getJournalPidsWithTagOrderedByPriorityTag} filters <em>before</em> the newest pick: a pid is
  *     included if any of its events carries the tag, and its priority comes from its newest <em>tagged</em> event
- *     (Mongo parity: {@code $match} on the tag, then {@code $group} with {@code $last} tags).</li>
+ *     (Mongo parity: {@code $match} on the tag, then {@code $group} with {@code $last} tags). Equal priorities come
+ *     in pid order.</li>
  *     <li>{@code getJournalPidsWithTag(…, considerOnlyLatest = true)} filters <em>after</em> the newest pick: a pid is
  *     included only if its newest event carries the tag.</li>
  * </ul>
@@ -140,7 +142,7 @@ public final class PostgresNewestPerPidTagQueriesIT {
     }
 
     @Test
-    public void priorityQueryOrdersByDescendingNumericPriorityAndKeepsTiesTogether() {
+    public void priorityQueryOrdersByDescendingNumericPriorityAndOrdersTiesByPid() {
         final String tag = "prio-order";
         final String p10 = "connection:prio-order:a";
         final String p9 = "connection:prio-order:b";
@@ -162,10 +164,10 @@ public final class PostgresNewestPerPidTagQueriesIT {
         assertThat(ordered).hasSize(7);
         // numeric, not lexicographic ("priority-9" > "priority-10" as text); several priority tags -> the highest.
         assertThat(ordered.subList(0, 3)).containsExactly(p10, p9, p6FromTwoPriorityTags);
-        // ties have no defined order among themselves, but stay together between the higher and lower priorities.
-        assertThat(ordered.subList(3, 5)).containsExactlyInAnyOrder(p4First, p4Second);
-        // no priority tag and a malformed one both rank as priority 0.
-        assertThat(ordered.subList(5, 7)).containsExactlyInAnyOrder(noPriority, malformedPriority);
+        // equal priorities come in pid order ("…:d" < "…:e"), although "…:e" was written first.
+        assertThat(ordered.subList(3, 5)).containsExactly(p4First, p4Second);
+        // no priority tag and a malformed one both rank as priority 0, in pid order.
+        assertThat(ordered.subList(5, 7)).containsExactly(noPriority, malformedPriority);
     }
 
     @Test
@@ -187,7 +189,7 @@ public final class PostgresNewestPerPidTagQueriesIT {
 
         assertThat(ordered).hasSize(4);
         assertThat(ordered.subList(0, 2)).containsExactly(newestEventPriority6, priority2);
-        assertThat(ordered.subList(2, 4)).containsExactlyInAnyOrder(newestEventHasNoPriority, noTags);
+        assertThat(ordered.subList(2, 4)).containsExactly(newestEventHasNoPriority, noTags);
     }
 
     @Test
@@ -200,6 +202,9 @@ public final class PostgresNewestPerPidTagQueriesIT {
         assertThat(ordered).hasSize(BULK_PIDS).doesNotHaveDuplicates();
         final List<Integer> priorities = ordered.stream().map(pid -> bulkIndex(pid) % 10).toList();
         assertThat(priorities).isSortedAccordingTo((a, b) -> Integer.compare(b, a));
+        assertThat(ordered).as("equal priorities in pid order")
+                .isSortedAccordingTo(Comparator.comparing((String pid) -> bulkIndex(pid) % 10).reversed()
+                        .thenComparing(Comparator.naturalOrder()));
     }
 
     // =================================================================================================
@@ -319,8 +324,9 @@ public final class PostgresNewestPerPidTagQueriesIT {
     @Test
     public void priorityQueryNewestRowStepIsABackwardPrimaryKeyScanWithoutSort() {
         final String sql = productionSql(rj -> rj.getJournalPidsWithTagOrderedByPriorityTag("", STREAM_TIMEOUT));
-        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of(""), "");
-        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of(BULK_TAG), BULK_TAG);
+        // first window: ($1 cursor, $2 tag, $3 window size)
+        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of("", "", 100), "");
+        assertNewestRowStepIsABackwardPrimaryKeyScanWithoutSort(sql, List.of("", BULK_TAG, 100), BULK_TAG);
     }
 
     @Test

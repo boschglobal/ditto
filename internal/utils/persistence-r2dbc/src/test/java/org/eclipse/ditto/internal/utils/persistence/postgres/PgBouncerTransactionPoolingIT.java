@@ -176,8 +176,9 @@ public final class PgBouncerTransactionPoolingIT {
 
     /**
      * The tag pid streams (the ID-order persistence ping and connection-id retrieval, one short window per statement;
-     * the priority-order connectivity ping, one statement per walk): under transaction pooling every statement may run
-     * on another server connection, and the walk must still be complete, in order and free of duplicates.
+     * the priority-order connectivity ping, the same windows sorted in memory): under transaction pooling every
+     * statement may run on another server connection, and the walk must still be complete, in order and free of
+     * duplicates.
      */
     @Test
     public void pagedTagPidStreamsCompleteThroughTransactionPooling() throws Exception {

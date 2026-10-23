@@ -353,18 +353,29 @@ and a warm cache, up to about 160 s cold, and correspondingly more with long
 event histories (hundreds of events per policy with the default history
 retention). At 2 events per entity each statement stays far below
 `statement_timeout`; with long histories a window that is not in the cache can
-take seconds, because it reads every row of its untagged entities: lower
+take seconds, because it reads every row of its untagged entities (measured at
+250,000 things with about 140 events each, 87 % of them untagged, in an 8 GiB
+container: 572 ms per window at the median and 1.04 s at most, see
+`internal/utils/persistence-bench/src/test/resources/bench/results/ping-partly-tagged-walks-250k-repeat.md`): lower
 `read-journal-batch-size` well before a window approaches `statement_timeout`,
 and size the ping `interval` so that this read once per interval is acceptable.
 
-**Priority order (connectivity): one statement per walk.** The priority comes
-from the tags and is not stored, so ordering needs every connection's priority;
-one statement computes it once, and its whole result is read into memory before
-the first connection is pinged. Measured: about 11 ms for 5,000 connections,
-50 ms for 20,000, 0.3 s for 100,000. The price is memory in the connectivity
-service: about 80–100 bytes per connection for the duration of a walk, about
-10 MB for 100,000 connections. (The ID order needs only one window in memory; it
-is the order for millions of entities.)
+**Priority order (connectivity): windows, then a sort in memory.** The priority
+comes from the tags and is not stored, so no index orders the connections by it.
+The walk therefore reads the journal in windows of 500 ids in id order (fixed;
+`read-journal-batch-size` applies to the ID order), keeps each id that carries the
+tag with the priority of its newest tagged event, and when the last window is read
+sorts them, highest priority first and equal priorities in id order; only then is
+the first connection pinged. Every statement costs what an ID-order window costs,
+whatever share of the journal carries the tag. (Before, one statement read every
+tagged row; with millions of tagged rows PostgreSQL chose a sequential scan of the
+whole journal, which `statement_timeout` cancelled on every retry.) Measured:
+3.3 s for 1,000,000 ids with 2 events each (2,001 statements) and 183 s for
+250,000 entities with about 140 events each (501 statements, the slowest 799 ms),
+in the evidence file above. The price is memory in the connectivity service: one
+id and its priority per tagged connection until the walk has pinged them, about
+100–120 bytes each, about 12 MB for 100,000 connections. (MongoDB keeps the same
+set on the server while it sorts.)
 
 **Changes during a walk.**
 
@@ -373,10 +384,11 @@ is the order for millions of entities.)
   An entity that starts to qualify (created, or tagged) after that position is
   pinged in this walk, otherwise in the next walk; an entity deleted before the
   walk reaches it is not pinged; no entity is pinged twice in one walk.
-- Priority order: the walk pings the connections as of its statement. A
-  connection created during the walk is pinged in the next walk; one deleted
-  during the walk is still pinged (as on MongoDB, whose priority order is one
-  query too).
+- Priority order: every window reads the current state, but nothing is pinged
+  before the last window has been read. A connection that starts to qualify in a
+  part of the id space the walk has not read yet is pinged in this walk, otherwise
+  in the next one; one deleted after its window was read is still pinged (as on
+  MongoDB, whose priority order is one query); none is pinged twice.
 
 **Failures.** A failed statement (for example `57014` from `statement_timeout`,
 a lost connection, or the pool's acquire timeout under overload) is retried from
@@ -403,8 +415,10 @@ walk, but pinging does not stop. A failure that recurs at the same position
 cannot be walked past this way: the entities before it keep being pinged at least
 every other walk, the ones after it are reached once the failure is gone. The position is kept in memory only: after
 a restart of the service the next walk starts from the beginning. In priority
-order a failed walk is followed by one from the beginning. Every completed walk
-logs one INFO line with the number of entities pinged and the duration.
+order a failed window is retried the same way; a walk whose retries are
+exhausted has pinged nothing, and the next walk starts from the beginning. Every
+completed walk logs one INFO line with the number of entities pinged and the
+duration.
 
 **Ids that are no entity ids.** A persistence id in the journal that the ping
 cannot turn into an entity id (no entity-type prefix, or an id the entity type

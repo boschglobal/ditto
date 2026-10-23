@@ -16,6 +16,8 @@ import static org.eclipse.ditto.base.model.common.ConditionChecker.checkNotNull;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -32,6 +34,7 @@ import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotFilter;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.JournalRow;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
+import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations.PrioritizedPid;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations.WindowedPid;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.SnapshotRow;
 import org.eclipse.ditto.json.JsonFactory;
@@ -76,6 +79,17 @@ import org.apache.pekko.stream.javadsl.Source;
 public final class PostgresReadJournal implements DittoReadJournal {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(PostgresReadJournal.class);
+
+    /**
+     * Pids examined per statement of the priority order: the shipped {@code read-journal-batch-size} of both pings.
+     * The interface method has no batch size; {@link #getJournalPidsWithTagOrderedByPriorityTag(String, int, Duration)}
+     * takes one.
+     */
+    public static final int PRIORITY_WALK_WINDOW = 500;
+
+    /** Highest priority first; {@link List#sort} is stable, so pids of equal priority keep the walk's pid order. */
+    private static final Comparator<PrioritizedPid> HIGHEST_PRIORITY_FIRST =
+            Comparator.comparingInt(PrioritizedPid::priority).reversed();
 
     private final PostgresPersistenceOperations operations;
 
@@ -165,20 +179,6 @@ public final class PostgresReadJournal implements DittoReadJournal {
                 .mapMaterializedValue(ignored -> NotUsed.getInstance());
     }
 
-    /**
-     * One statement whose whole result is read at once, with the retries of a page.
-     */
-    private static <T> Source<T, NotUsed> singleStatement(final String streamName,
-            final Supplier<Source<T, NotUsed>> query, final PageRetry retry) {
-        return Source.fromMaterializer((mat, attributes) -> {
-                    final SharedKillSwitch retries = KillSwitches.shared(streamName);
-                    return Source.completionStage(retry.fetch(streamName, "", query, retries, mat))
-                            .<T>mapConcat(rows -> rows)
-                            .watchTermination((notUsed, done) -> stopOnTermination(notUsed, done, retries));
-                })
-                .mapMaterializedValue(ignored -> NotUsed.getInstance());
-    }
-
     private static <M> M stopOnTermination(final M materialized, final CompletionStage<Done> streamTermination,
             final SharedKillSwitch retries) {
         streamTermination.whenComplete((done, error) -> retries.shutdown());
@@ -249,29 +249,71 @@ public final class PostgresReadJournal implements DittoReadJournal {
     }
 
     /**
-     * The pids carrying {@code tag} in descending priority order (see
-     * {@link PostgresPersistenceOperations#getPidsWithTagOrderedByPriority} for the semantics), as ONE statement per
-     * stream whose whole result is read before the first pid is emitted, as {@code MongoReadJournal} reads it with one
-     * aggregation.
-     * <p>
-     * The order needs every qualifying pid's priority, which is computed from the tags: paged, every page would compute
-     * all priorities again (a walk would cost (pages + 1) times the single statement). One statement per walk costs it
-     * once, and because its result is read at once, no transaction or snapshot stays open while the throttled
-     * connectivity ping walks it. The trade-off is client memory proportional to the number of qualifying pids (about
-     * 100 bytes per pid: about 10 MB for 100,000 connections) where the ID order needs only one window; this order
-     * exists for connections (thousands), the ID order for always-alive entities (up to millions).
-     * </p>
-     * <p>
-     * The walk sees the pids as of the statement: a pid created afterwards comes in the next walk, a pid deleted during
-     * the walk is still delivered (as on MongoDB). A failed statement is retried as for {@link #getJournalPidsWithTag};
-     * nothing has been delivered before it succeeds.
-     * </p>
+     * The pids carrying {@code tag} on any event ({@code ""}: every pid), highest priority first, in windows of
+     * {@link #PRIORITY_WALK_WINDOW} pids; see
+     * {@link #getJournalPidsWithTagOrderedByPriorityTag(String, int, Duration)}.
      */
     @Override
     public Source<String, NotUsed> getJournalPidsWithTagOrderedByPriorityTag(final String tag,
             final Duration maxIdleTime) {
-        return singleStatement("pids with tag <" + tag + "> in priority order",
-                () -> operations.getPidsWithTagOrderedByPriority(tag), PageRetry.forMaxIdleTime(maxIdleTime));
+        return getJournalPidsWithTagOrderedByPriorityTag(tag, PRIORITY_WALK_WINDOW, maxIdleTime);
+    }
+
+    /**
+     * The pids carrying {@code tag} on any of their events ({@code ""}: every pid), highest priority first, pids of
+     * equal priority in pid order ({@code COLLATE "C"}). The priority of a pid is the one of its newest event that
+     * carries the tag (see {@link PostgresPersistenceOperations#getPrioritizedPidWindowAbove}). MongoDB returns the
+     * same set in the same priority order, with equal priorities in no defined order.
+     * <p>
+     * The priority is computed from the tags, not stored, so no index orders the pids by it. The walk therefore reads
+     * all pids window by window in pid order, as the ID order does ({@code window} pids per statement, each statement
+     * short and read completely), keeps the qualifying pids with their priority, and sorts them in memory once the
+     * last window is read; only then is the first pid emitted. Every statement costs what an ID-order window costs,
+     * whatever share of the journal carries the tag, and a walk takes (distinct pids / window) + 1 statements. The
+     * memory is one small record per qualifying pid (its pid and priority, about 100–120 bytes) until the walk has
+     * emitted them: about 12 MB for 100,000 connections. MongoDB holds the same set on the server ({@code $group} and
+     * {@code $sort} of its aggregation).
+     * </p>
+     * <p>
+     * Every window reads the current state, so the walk sees each pid as of the window that examined it: a pid that
+     * starts to qualify (created or tagged) in a part of the key space not read yet comes in this walk, otherwise in
+     * the next one; a pid deleted after its window was read is still delivered (as on MongoDB, whose aggregation reads
+     * once); no pid comes twice. A failed window is retried with exponential back-off from its own cursor, keeping the
+     * windows read before it, as in {@link #getJournalPidsWithTag}; {@code maxIdleTime} bounds the retries of a window.
+     * When they are exhausted the stream fails without having delivered any pid.
+     * </p>
+     *
+     * @param tag the tag, or {@code ""} for every pid.
+     * @param window the number of pids examined per statement.
+     * @param maxIdleTime bounds the retries of a window ({@link ReadJournalRestarts#computeMaxRestarts}).
+     * @return the pids, highest priority first.
+     */
+    public Source<String, NotUsed> getJournalPidsWithTagOrderedByPriorityTag(final String tag, final int window,
+            final Duration maxIdleTime) {
+        final String streamName = "pids with tag <" + tag + "> in priority order";
+        final PageRetry retry = PageRetry.forMaxIdleTime(maxIdleTime);
+        // a fresh list per materialisation: the same source may be run more than once
+        return Source.fromMaterializer((mat, attributes) -> keysetPages(streamName, "",
+                                (String start) -> operations.getPrioritizedPidWindowAbove(start, tag, window),
+                                PrioritizedPid::pid, retry)
+                        .fold(new ArrayList<PrioritizedPid>(), PostgresReadJournal::addQualifying)
+                        .mapConcat(PostgresReadJournal::inPriorityOrder))
+                .mapMaterializedValue(ignored -> NotUsed.getInstance());
+    }
+
+    private static ArrayList<PrioritizedPid> addQualifying(final ArrayList<PrioritizedPid> collected,
+            final List<PrioritizedPid> window) {
+        for (final PrioritizedPid pid : window) {
+            if (pid.qualifies()) {
+                collected.add(pid);
+            }
+        }
+        return collected;
+    }
+
+    private static List<String> inPriorityOrder(final ArrayList<PrioritizedPid> collected) {
+        collected.sort(HIGHEST_PRIORITY_FIRST);
+        return collected.stream().map(PrioritizedPid::pid).toList();
     }
 
     @Override

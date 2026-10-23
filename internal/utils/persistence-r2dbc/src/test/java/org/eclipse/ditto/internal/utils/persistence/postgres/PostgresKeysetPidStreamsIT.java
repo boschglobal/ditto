@@ -44,8 +44,8 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  * <ul>
  *     <li>ID order, read in windows of {@code batchSize} pids: completeness, bytewise pid order and no duplicates
  *     across many windows, for both variants;</li>
- *     <li>priority order, one statement per walk: the same pids and priority sequence as the single statement of the
- *     former implementation;</li>
+ *     <li>priority order, the same windows sorted in memory: the same pids and order as the single statement of the
+ *     former implementation, ties in pid order;</li>
  *     <li>what a walk sees of changes made while it runs;</li>
  *     <li>the plan of each statement.</li>
  * </ul>
@@ -55,7 +55,10 @@ public final class PostgresKeysetPidStreamsIT {
     private static final Duration TIMEOUT = Duration.ofSeconds(60);
     private static final int SMALL_BATCH = 7;
 
-    /** The unpaged priority query of the former implementation, as a reference (plus the priority as a column). */
+    /**
+     * The single priority statement of the former implementation, as a reference (plus the priority as a column, and
+     * the pid order of the new tie rule).
+     */
     private static final String REFERENCE_PRIORITY_SQL = "SELECT p.pid AS pid, COALESCE(pr.prio, 0)::text AS prio "
             + "FROM ("
             + "SELECT DISTINCT pid FROM connections_journal WHERE ($1 = '' OR tags @> ARRAY[$1]::text[])"
@@ -66,7 +69,7 @@ public final class PostgresKeysetPidStreamsIT {
             + "SELECT max((substring(tag from '^priority-([0-9]+)$'))::int) AS prio "
             + "FROM unnest(n.tags) AS tag WHERE tag ~ '^priority-[0-9]+$'"
             + ") pr ON true "
-            + "ORDER BY COALESCE(pr.prio, 0) DESC";
+            + "ORDER BY COALESCE(pr.prio, 0) DESC, p.pid";
 
     private static NewestPerPidFixture fixture;
     private static ActorSystem system;
@@ -142,11 +145,11 @@ public final class PostgresKeysetPidStreamsIT {
     }
 
     // =================================================================================================
-    // priority order: one statement per walk
+    // priority order: windows, then a sort in memory
     // =================================================================================================
 
     @Test
-    public void priorityStreamReturnsWhatTheSingleStatementReturns() {
+    public void priorityWalkReturnsWhatTheFormerSingleStatementReturnedWithTiesInPidOrder() {
         final String prefix = "connection:prio-char:";
         final String tag = "prio-char";
         final int seeded = 300;
@@ -161,23 +164,28 @@ public final class PostgresKeysetPidStreamsIT {
                 + "ELSE ARRAY['" + tag + "', 'priority-50'] END");
         fixture.analyze("connections_journal");
 
-        final List<Map<String, String>> reference = fixture.queryAsText(REFERENCE_PRIORITY_SQL, List.of(tag));
-        final Map<String, Integer> priorities = new HashMap<>();
-        reference.forEach(row -> priorities.put(row.get("pid"), Integer.parseInt(row.get("prio"))));
-        final List<String> referencePids = reference.stream().map(row -> row.get("pid")).toList();
-
-        final List<String> streamed = run(fixture.readJournal("connections")
-                .getJournalPidsWithTagOrderedByPriorityTag(tag, TIMEOUT));
-
-        assertThat(referencePids).hasSize(seeded);
-        assertThat(streamed).hasSize(seeded).doesNotHaveDuplicates()
-                .containsExactlyInAnyOrderElementsOf(referencePids);
-        assertThat(streamed.stream().map(priorities::get).toList())
-                .as("the same priority sequence (equal priorities come in no defined order)")
-                .containsExactlyElementsOf(referencePids.stream().map(priorities::get).toList());
-        assertThat(priorities.values()).as("the fixture covers the edge cases")
-                .contains(0, 12)
-                .doesNotContain(50, 99);
+        // the empty tag selects every pid of connections_journal (also other tests' pids): compared all the same,
+        // since the reference and the walks read the same table back to back
+        for (final String walkTag : List.of(tag, "")) {
+            final List<Map<String, String>> reference = fixture.queryAsText(REFERENCE_PRIORITY_SQL, List.of(walkTag));
+            final List<String> referencePids = reference.stream().map(row -> row.get("pid")).toList();
+            for (final int window : List.of(SMALL_BATCH, PostgresReadJournal.PRIORITY_WALK_WINDOW)) {
+                final List<String> streamed = run(fixture.readJournal("connections")
+                        .getJournalPidsWithTagOrderedByPriorityTag(walkTag, window, TIMEOUT));
+                assertThat(streamed)
+                        .as("tag '%s', window %s: the former statement's pids in its priority order, ties in pid "
+                                + "order", walkTag, window)
+                        .containsExactlyElementsOf(referencePids);
+            }
+            if (!walkTag.isEmpty()) {
+                final Map<String, Integer> priorities = new HashMap<>();
+                reference.forEach(row -> priorities.put(row.get("pid"), Integer.parseInt(row.get("prio"))));
+                assertThat(referencePids).hasSize(seeded);
+                assertThat(priorities.values()).as("the fixture covers the edge cases")
+                        .contains(0, 12)
+                        .doesNotContain(50, 99);
+            }
+        }
     }
 
     // =================================================================================================
@@ -226,7 +234,7 @@ public final class PostgresKeysetPidStreamsIT {
     }
 
     @Test
-    public void priorityWalkDeliversThePidsAsOfItsStatement() throws Exception {
+    public void priorityWalkDeliversThePidsAsOfTheWindowsThatReadThem() throws Exception {
         final String prefix = "connection:prio-live:";
         final String tag = "prio-live";
         fixture.seedJournal("connections", prefix, 60, 1, "ARRAY['" + tag + "', 'priority-' || (i % 6)]");
@@ -252,7 +260,8 @@ public final class PostgresKeysetPidStreamsIT {
         }
 
         assertThat(delivered)
-                .as("the walk is the statement's result: every pid of the time it ran, once, nothing added")
+                .as("the walk is what its windows read: every pid of the time they ran, once, nothing added after "
+                        + "the last window")
                 .hasSize(60)
                 .doesNotHaveDuplicates()
                 .contains(deletedDuringTheWalk)
@@ -307,22 +316,28 @@ public final class PostgresKeysetPidStreamsIT {
     }
 
     @Test
-    public void priorityStatementReadsEveryQualifyingPidOnce() {
+    public void priorityWindowIsAnIndexRangeScanOnThePrimaryKeyWithoutSortOrTagIndex() {
         seedPlanFixture();
-        final String priorityStatement = PidStreamTestSupport.productionSql(PLAN_ENTITY,
+        final String priorityWindow = PidStreamTestSupport.productionSql(PLAN_ENTITY,
                 readJournal -> readJournal.getJournalPidsWithTagOrderedByPriorityTag("", TIMEOUT), mat);
+        final String midCursor = NewestPerPidFixture.pid(PLAN_PREFIX, PLAN_PIDS / 2);
 
-        // BUFFERS OFF: PostgreSQL 18 reports buffers by default with ANALYZE, which puts a "Buffers:" line between a
-        // node and its child.
-        final String plan = fixture.explain("ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF", priorityStatement,
-                List.of(PLAN_TAG));
-        System.out.printf("[plan] priority statement:%n%s%n", plan);
-
-        // The priority is computed, not stored: one statement computes it for every qualifying pid and sorts them.
-        assertThat(plan).as("plan:%n%s", plan)
-                .startsWith("Sort")
-                .containsPattern("->  Limit[^\\n]*\\n\\s+->  Index (Only )?Scan Backward using " + PLAN_JOURNAL
-                        + "_pkey");
+        for (final String tag : List.of(PLAN_TAG, "")) {
+            final String forced = planWithoutSeqScanAndSort(priorityWindow, List.of(midCursor, tag, 500));
+            final String plain = fixture.explain(priorityWindow, List.of(midCursor, tag, 500));
+            System.out.printf("[plan] priority window, tag '%s':%n%s%n", tag, forced);
+            for (final String plan : List.of(forced, plain)) {
+                // the priority is computed per pid and the order made in memory: no sort, no full scan of tagged rows
+                assertThat(plan)
+                        .as("tag '%s', plan:%n%s", tag, plan)
+                        .doesNotContain("Sort")
+                        .doesNotContain("tags_idx")
+                        .containsPattern("Limit\\n(\\s+->  Result\\n)?\\s+->  Unique\\n\\s+->  Index (Only )?Scan using "
+                                + PLAN_JOURNAL + "_pkey on " + PLAN_JOURNAL + "\\n\\s+Index Cond: \\(pid > ")
+                        .containsPattern("->  Limit\\n\\s+->  Index (Only )?Scan Backward using " + PLAN_JOURNAL
+                                + "_pkey");
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------

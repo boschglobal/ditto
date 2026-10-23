@@ -68,8 +68,8 @@ public final class PostgresPersistenceOperations {
      * Server-side portal size bound via {@link Statement#fetchSize(int)} on the long, genuinely-unbounded streaming
      * read-journal queries without a {@code LIMIT} ({@code currentPersistenceIds}, {@code eventsByTag},
      * {@code getLatestJournalEntries}). The tag pid streams of the persistence ping and of connection-id retrieval do
-     * not use a portal: the ID order reads one short window per statement ({@link #getPidWindowAbove}), the priority
-     * order one statement per walk that is read completely at once ({@link #getPidsWithTagOrderedByPriority}).
+     * not use a portal: both orders read one short window per statement ({@link #getPidWindowAbove},
+     * {@link #getPrioritizedPidWindowAbove}), each read completely before its rows are emitted.
      * <p>
      * The connection-pool-wide default is {@code fetch-size=0} (see {@code ConnectionPoolFactory}/{@code PostgresConfig}),
      * for which the r2dbc-postgresql driver sends one fetch-all {@code Execute}: it still reads the rows demand-driven
@@ -367,47 +367,53 @@ public final class PostgresPersistenceOperations {
     // =====================================================================================================
 
     /**
-     * The pids carrying {@code tag} in descending priority order, as ONE statement whose whole result the caller
-     * reads at once. An empty {@code tag} selects ALL pids (Mongo parity — the PersistencePingActor default
-     * journal-tag is empty).
+     * One WINDOW of the priority-order pid stream: the next {@code window} distinct pids strictly above
+     * {@code lowerBoundPid} in pid order ({@code COLLATE "C"}), whether they qualify or not, each with whether it
+     * carries {@code tag} on ANY of its events (an empty {@code tag} qualifies every pid) and its priority. The caller
+     * keeps the qualifying pids, continues after the window's last pid, and orders what it collected by priority
+     * ({@code PostgresReadJournal#getJournalPidsWithTagOrderedByPriorityTag}).
      * <p>
-     * The tag filter applies BEFORE the newest-per-pid pick (Mongo parity: {@code $match} on the tag, then
-     * {@code $group} with {@code $last} tags): a pid qualifies if ANY of its events carries the tag, and its priority
-     * comes from its newest event that carries the tag, even when a newer event without the tag exists. Hence the
-     * filter appears in BOTH phases of the two-phase loose index scan: in the distinct-pid phase so a pid without any
-     * tagged event is dropped, and in the per-pid top-1 {@code CROSS JOIN LATERAL} backward PK scan so the newest
-     * TAGGED event wins. GIN containment via {@code @>}; the numeric-anchored priority regex avoids an integer-cast
-     * failure on a malformed user tag; LEFT JOIN LATERAL keeps {@code always-alive}-without-{@code priority-N} pids at
-     * default priority 0; ordering is descending so the highest-priority pids are recovered first (equal priorities
-     * come in no defined order).
+     * The priority comes from the pid's NEWEST event that carries the tag (Mongo parity: {@code $match} on the tag,
+     * then {@code $group} with {@code $last} tags), even when a newer event without the tag exists: the tag filter is
+     * part of the per-pid top-1 backward primary-key scan ({@code LEFT JOIN LATERAL … ORDER BY sn DESC LIMIT 1}), so
+     * that scan stops at the newest tagged event, and a pid whose scan finds none does not qualify (LEFT JOIN: it
+     * still comes back, so it can be the cursor). The highest {@code priority-<n>} of that event counts; the
+     * numeric-anchored regex avoids an integer-cast failure on a malformed {@code priority-x} tag, and an event without
+     * a priority tag has priority 0.
      * </p>
      * <p>
-     * The order needs every qualifying pid's priority, which is computed from the tags, not stored: there is no
-     * index to page by, so every page of a keyset walk would compute all priorities again. One statement per walk
-     * costs that once. Its result is read completely into memory before the first pid is emitted
-     * ({@link #pageQuerySource}), so the statement ends at once and no transaction or snapshot stays open while the
-     * consumer (the throttled connectivity ping) walks it; the server never waits on an unread socket either. The price
-     * is client memory proportional to the number of qualifying pids: one row is a pid string of a few dozen bytes,
-     * about 100 bytes on the heap, so about 10 MB for 100,000 connections. The ID order
-     * ({@link #getPidWindowAbove}) is the one meant for millions of entities: it reads bounded windows instead.
+     * A statement costs what a window of {@link #getPidWindowAbove} costs: an index-only scan of the window's pids and
+     * one backward probe per pid on its own primary-key range, which reads every row of a pid without a tagged event
+     * and stops at the newest tagged one otherwise, i.e. O(window × events per pid), whatever share of the journal
+     * carries the tag. The tag is matched with {@code $2 = ANY(tags)}, which the GIN tag index cannot serve. (A single
+     * statement over all tagged rows let the planner choose a sequential scan of the whole journal once about a tenth
+     * of its rows carried the tag.)
      * </p>
      *
-     * @param tag the membership tag (typically {@code always-alive}), or {@code ""} for all pids.
-     * @return a {@code Source} of pids in descending-priority order.
+     * @param lowerBoundPid the exclusive lower bound (the last pid of the previous window, or {@code ""}).
+     * @param tag the tag, or {@code ""} for all pids.
+     * @param window the number of distinct pids examined by this statement.
+     * @return a {@code Source} of the window's pids, in pid order.
      */
-    public Source<String, NotUsed> getPidsWithTagOrderedByPriority(final String tag) {
-        final String tagFilter = "($1 = '' OR tags @> ARRAY[$1]::text[])";
-        final String sql = "SELECT p.pid AS pid FROM ("
-                + "SELECT DISTINCT pid FROM " + tables.journalTable() + " WHERE " + tagFilter
-                + ") p CROSS JOIN LATERAL ("
-                + "SELECT tags FROM " + tables.journalTable() + " WHERE pid = p.pid AND " + tagFilter
-                + " ORDER BY sn DESC LIMIT 1"
-                + ") n LEFT JOIN LATERAL ("
+    public Source<PrioritizedPid, NotUsed> getPrioritizedPidWindowAbove(final String lowerBoundPid, final String tag,
+            final int window) {
+        final String sql = "SELECT w.pid AS pid, n.tags IS NOT NULL AS qualifies, COALESCE(pr.prio, 0) AS priority "
+                + "FROM (SELECT DISTINCT pid FROM " + tables.journalTable() + " WHERE pid > $1 ORDER BY pid LIMIT $3"
+                + ") w LEFT JOIN LATERAL ("
+                + "SELECT tags FROM " + tables.journalTable()
+                + " WHERE pid = w.pid AND ($2 = '' OR $2 = ANY(tags)) ORDER BY sn DESC LIMIT 1"
+                + ") n ON true LEFT JOIN LATERAL ("
                 + "SELECT max((substring(tag from '^priority-([0-9]+)$'))::int) AS prio "
                 + "FROM unnest(n.tags) AS tag WHERE tag ~ '^priority-[0-9]+$'"
-                + ") pr ON true "
-                + "ORDER BY COALESCE(pr.prio, 0) DESC";
-        return pageQuerySource(sql, stmt -> stmt.bind(0, tag), row -> getString(row, "pid"));
+                + ") pr ON true ORDER BY w.pid";
+        return pageQuerySource(sql,
+                stmt -> {
+                    stmt.bind(0, lowerBoundPid);
+                    stmt.bind(1, tag);
+                    stmt.bind(2, window);
+                },
+                row -> new PrioritizedPid(getString(row, "pid"),
+                        Boolean.TRUE.equals(row.get("qualifies", Boolean.class)), getInt(row, "priority")));
     }
 
     /**
@@ -852,6 +858,11 @@ public final class PostgresPersistenceOperations {
         return value == null ? 0L : value;
     }
 
+    private static int getInt(final Row row, final String name) {
+        final Integer value = row.get(name, Integer.class);
+        return value == null ? 0 : value;
+    }
+
     @Nullable
     private static Long getNullableLong(final Row row, final String name) {
         return row.get(name, Long.class);
@@ -880,5 +891,15 @@ public final class PostgresPersistenceOperations {
      * @param qualifies whether the pid carries the tag as the stream requires (any event, or the newest event).
      */
     public record WindowedPid(String pid, boolean qualifies) {}
+
+    /**
+     * A pid of a window of {@link #getPrioritizedPidWindowAbove}.
+     *
+     * @param pid the persistence id; the last one of a window is the cursor of the next window.
+     * @param qualifies whether one of its events carries the tag.
+     * @param priority the priority of its newest event that carries the tag (0 if it does not qualify or that event
+     * has no {@code priority-<n>} tag).
+     */
+    public record PrioritizedPid(String pid, boolean qualifies, int priority) {}
 
 }

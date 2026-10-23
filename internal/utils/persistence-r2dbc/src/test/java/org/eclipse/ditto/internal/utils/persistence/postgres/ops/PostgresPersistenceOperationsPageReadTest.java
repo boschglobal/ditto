@@ -38,7 +38,7 @@ import org.apache.pekko.stream.javadsl.Source;
 import org.apache.pekko.testkit.javadsl.TestKit;
 
 /**
- * The statements whose whole result a caller reads at once (keyset windows and pages, the priority statement) hand
+ * The statements whose whole result a caller reads at once (keyset windows of both orders, and pages) hand
  * their rows to the stream only after the statement has completed: the rows are collected by a single subscriber
  * that requests them all, never streamed to a Pekko subscriber that signals demand from its own thread. That is what
  * keeps r2dbc-postgresql 1.0.7 from delivering a row out of the statement's order (its receive fast path does not
@@ -79,9 +79,9 @@ public final class PostgresPersistenceOperationsPageReadTest {
     }
 
     @Test
-    public void priorityStatementIsCollectedBeforeItsRowsAreEmitted() throws Exception {
-        assertRowsOnlyAfterTheStatementCompleted("priority-", pidRows(),
-                ops -> ops.getPidsWithTagOrderedByPriority("always-alive"));
+    public void priorityWindowIsCollectedBeforeItsRowsAreEmitted() throws Exception {
+        assertRowsOnlyAfterTheStatementCompleted("priority-", priorityWindowRows(),
+                ops -> ops.getPrioritizedPidWindowAbove("", "always-alive", 10));
     }
 
     @Test
@@ -133,6 +133,12 @@ public final class PostgresPersistenceOperationsPageReadTest {
     private static List<Map<String, Object>> windowRows() {
         return List.of(Map.of("pid", "thing:ns:a", "qualifies", true), Map.of("pid", "thing:ns:b", "qualifies", true),
                 Map.of("pid", "thing:ns:c", "qualifies", false));
+    }
+
+    private static List<Map<String, Object>> priorityWindowRows() {
+        return List.of(Map.of("pid", "thing:ns:a", "qualifies", true, "priority", 3),
+                Map.of("pid", "thing:ns:b", "qualifies", false, "priority", 0),
+                Map.of("pid", "thing:ns:c", "qualifies", true, "priority", 7));
     }
 
     private static List<Map<String, Object>> pidRows() {

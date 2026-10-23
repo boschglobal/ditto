@@ -44,8 +44,8 @@ import org.apache.pekko.stream.javadsl.Source;
  * {@code eventsByTag()}) bind a positive per-statement {@code Statement.fetchSize(n)} instead, so a server-side portal
  * produces the rows fetch by fetch on demand. The tag pid streams (both {@code getJournalPidsWithTag} variants and the
  * priority order) are the deliberate exception: their consumer, the throttled persistence ping, would keep a portal's
- * transaction open past {@code statement_timeout}, so they read short windows (ID order) or one statement per walk
- * (priority order) without a portal instead.
+ * transaction open past {@code statement_timeout}, so they read short windows without a portal instead (the priority
+ * order sorts the qualifying pids of its windows in memory).
  * </p>
  * <p>
  * M-2: {@code getLatestJournalEntries} must NOT be an N+1 (one inner replay query per pid); a single
@@ -116,31 +116,35 @@ public final class PostgresReadJournalBackpressureTest {
     }
 
     @Test
-    public void getPidsWithTagOrderedByPriorityIsOneStatementWithoutAPortal() {
+    public void priorityOrderIsReadInWindowsWithoutAPortal() {
         final RecordingConnectionFactory factory = new RecordingConnectionFactory();
         final PostgresReadJournal journal = readJournal(factory);
 
         drain(journal.getJournalPidsWithTagOrderedByPriorityTag("always-alive", Duration.ofSeconds(1)));
 
+        assertThat(factory.executedContaining("priority-")).as("the priority window ran").isTrue();
         assertThat(factory.executedSql()).singleElement().satisfies(sql -> assertThat(sql)
-                .as("the whole priority order in one statement")
-                .contains("ORDER BY COALESCE(pr.prio, 0) DESC")
-                .doesNotContain("LIMIT $"));
+                .as("one window: the next pids after the cursor with whether they carry the tag and their priority, "
+                        + "the tag checked per pid without the GIN index; the order is made in memory")
+                .contains("SELECT DISTINCT pid FROM things_journal WHERE pid > $1 ORDER BY pid LIMIT $3",
+                        "$2 = ANY(tags)", "priority-")
+                .doesNotContain("tags @>", "ORDER BY COALESCE"));
         assertThat(factory.fetchSizeForSqlContaining("priority-"))
                 .as("the throttled priority ping must not hold a portal (open transaction, statement_timeout)")
                 .isZero();
     }
 
     @Test
-    public void getPidsWithTagOrderedByPriorityUsesLooseIndexScanNotDistinctOn() {
+    public void priorityOrderUsesLooseIndexScanNotDistinctOn() {
         final RecordingConnectionFactory factory = new RecordingConnectionFactory();
         final PostgresReadJournal journal = readJournal(factory);
 
         drain(journal.getJournalPidsWithTagOrderedByPriorityTag("always-alive", Duration.ofSeconds(1)));
 
         assertThat(factory.executedSql()).singleElement().satisfies(sql -> assertThat(sql)
-                .as("distinct-pid step + per-pid top-1 backward scan, not DISTINCT ON (pid) … ORDER BY pid, sn DESC")
-                .contains("SELECT DISTINCT pid FROM", "CROSS JOIN LATERAL", "ORDER BY sn DESC LIMIT 1")
+                .as("window step + per-pid top-1 backward scan that keeps non-qualifying pids (LEFT JOIN), "
+                        + "not DISTINCT ON (pid) … ORDER BY pid, sn DESC")
+                .contains("SELECT DISTINCT pid FROM", "LEFT JOIN LATERAL", "ORDER BY sn DESC LIMIT 1")
                 .doesNotContain("DISTINCT ON"));
     }
 
