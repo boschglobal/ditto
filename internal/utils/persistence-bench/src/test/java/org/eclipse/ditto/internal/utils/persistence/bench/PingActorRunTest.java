@@ -38,6 +38,7 @@ import org.junit.Test;
 public final class PingActorRunTest {
 
     private static final List<String> EXPECTED = List.of("thing:n:a", "thing:n:b", "thing:n:c", "thing:n:d");
+    private static final String FAIL_AT = "thing:n:c";
     private static ActorSystem system;
 
     @BeforeClass
@@ -52,17 +53,17 @@ public final class PingActorRunTest {
 
     @Test
     public void fourCorrectWalksHaveNoProblem() {
-        assertThat(PingActorRun.verify(walks(EXPECTED, List.of("thing:n:a")), EXPECTED, "thing:n:c")).isEmpty();
+        assertThat(PingActorRun.verify(walks(EXPECTED, List.of("thing:n:a")), EXPECTED, FAIL_AT)).isEmpty();
     }
 
     @Test
     public void aGapOrADuplicateInTheResumedWalkIsAProblem() {
         final List<PingActorRun.ActorWalk> gap = new ArrayList<>(walks(EXPECTED, List.of("thing:n:a")));
         gap.set(2, walk(3, true, "thing:n:a", List.of("thing:n:c", "thing:n:d")));
-        assertThat(PingActorRun.verify(gap, EXPECTED, "thing:n:c")).anyMatch(p -> p.contains("walk 3"));
+        assertThat(PingActorRun.verify(gap, EXPECTED, FAIL_AT)).anyMatch(p -> p.contains("walk 3"));
         final List<PingActorRun.ActorWalk> twice = new ArrayList<>(walks(EXPECTED, List.of("thing:n:a")));
         twice.set(0, walk(1, true, null, List.of("thing:n:a", "thing:n:a", "thing:n:b", "thing:n:c", "thing:n:d")));
-        assertThat(PingActorRun.verify(twice, EXPECTED, "thing:n:c")).anyMatch(p -> p.contains("duplicates"));
+        assertThat(PingActorRun.verify(twice, EXPECTED, FAIL_AT)).anyMatch(p -> p.contains("duplicates"));
     }
 
     @Test
@@ -73,7 +74,7 @@ public final class PingActorRunTest {
                     case "ensureTagPidIndex" -> CompletableFuture.completedFuture(Done.done());
                     default -> throw new UnsupportedOperationException(method.getName());
                 });
-        final DittoReadJournal wrapped = PingActorRun.failingOnce(stub, 2, "thing:n:c");
+        final DittoReadJournal wrapped = PingActorRun.failingOnce(stub, 2, FAIL_AT);
         final Materializer mat = SystemMaterializer.get(system).materializer();
         assertThat(drain(wrapped, mat)).containsExactlyElementsOf(EXPECTED);
         final List<String> seen = new ArrayList<>();
@@ -89,14 +90,64 @@ public final class PingActorRunTest {
                 .toCompletableFuture().get(10, TimeUnit.SECONDS);
     }
 
-    /** Walk 1 full, walk 2 failed after the given prefix, walk 3 the rest, walk 4 full. */
+    @Test
+    public void fewerThanFourWalksIsAProblem() {
+        assertThat(PingActorRun.verify(walks(EXPECTED, List.of("thing:n:a")).subList(0, 3), EXPECTED, FAIL_AT))
+                .singleElement().satisfies(p -> assertThat(p).startsWith("only 3 walks ended"));
+    }
+
+    @Test
+    public void aSecondWalkThatCompletedPingedNothingOrFailedForAnotherReasonIsAProblem() {
+        final List<PingActorRun.ActorWalk> completed = new ArrayList<>(walks(EXPECTED, List.of("thing:n:a")));
+        completed.set(1, walk(2, true, null, List.of("thing:n:a")));
+        assertThat(PingActorRun.verify(completed, EXPECTED, FAIL_AT)).anyMatch(p -> p.contains("walk 2 completed"));
+
+        final List<PingActorRun.ActorWalk> nothing = new ArrayList<>(walks(EXPECTED, List.of()));
+        assertThat(PingActorRun.verify(nothing, EXPECTED, FAIL_AT))
+                .singleElement().satisfies(p -> assertThat(p).contains("before it pinged a pid"));
+
+        final List<PingActorRun.ActorWalk> otherCause = new ArrayList<>(walks(EXPECTED, List.of("thing:n:a")));
+        otherCause.set(1, new PingActorRun.ActorWalk(2, Instant.EPOCH, Instant.EPOCH, false, null,
+                List.of("thing:n:a"), "Ping iteration failed after pinging <1> … Cause: connection lost"));
+        assertThat(PingActorRun.verify(otherCause, EXPECTED, FAIL_AT))
+                .anyMatch(p -> p.contains("did not end with the injected failure"));
+    }
+
+    @Test
+    public void aWrongResumePointOrAResumedFourthWalkIsAProblem() {
+        final List<PingActorRun.ActorWalk> wrongResume = new ArrayList<>(walks(EXPECTED, List.of("thing:n:a")));
+        wrongResume.set(2, walk(3, true, "thing:n:b", List.of("thing:n:b", "thing:n:c", "thing:n:d")));
+        assertThat(PingActorRun.verify(wrongResume, EXPECTED, FAIL_AT))
+                .anyMatch(p -> p.contains("walk 3 continued after <thing:n:b>"));
+        final List<PingActorRun.ActorWalk> resumedFourth = new ArrayList<>(walks(EXPECTED, List.of("thing:n:a")));
+        resumedFourth.set(3, walk(4, true, "thing:n:a", EXPECTED));
+        assertThat(PingActorRun.verify(resumedFourth, EXPECTED, FAIL_AT))
+                .anyMatch(p -> p.contains("walk 4 continued after"));
+    }
+
+    @Test
+    public void strayPingsOtherWarningsAndErrorsAreProblems() {
+        final List<PingActorRun.ActorWalk> good = walks(EXPECTED, List.of("thing:n:a"));
+        assertThat(PingActorRun.verify(new PingActorRun.Result(good, 0, List.of()), EXPECTED, FAIL_AT)).isEmpty();
+        assertThat(PingActorRun.verify(new PingActorRun.Result(good, 0,
+                        List.of("ping outside a walk: thing:n:x", "ERROR from PersistencePingActor: boom")),
+                EXPECTED, FAIL_AT))
+                .hasSize(2).allSatisfy(p -> assertThat(p).startsWith("unexpected during the run: "));
+    }
+
+    /** Walk 1 full, walk 2 failed after the given prefix by the injected failure, walk 3 the rest, walk 4 full. */
     private static List<PingActorRun.ActorWalk> walks(final List<String> expected, final List<String> prefix) {
-        final String last = prefix.get(prefix.size() - 1);
+        final String last = prefix.isEmpty() ? null : prefix.get(prefix.size() - 1);
         return List.of(walk(1, true, null, expected),
-                new PingActorRun.ActorWalk(2, Instant.EPOCH, Instant.EPOCH, false, null, prefix,
-                        "Ping iteration failed after pinging <" + prefix.size() + "> …"),
+                failedWalk(prefix),
                 walk(3, true, last, expected.subList(prefix.size(), expected.size())),
                 walk(4, true, null, expected));
+    }
+
+    private static PingActorRun.ActorWalk failedWalk(final List<String> prefix) {
+        return new PingActorRun.ActorWalk(2, Instant.EPOCH, Instant.EPOCH, false, null, prefix,
+                "Ping iteration failed after pinging <" + prefix.size() + "> … Cause: injected walk failure at <"
+                        + FAIL_AT + ">");
     }
 
     private static PingActorRun.ActorWalk walk(final int number, final boolean completed, final String resumedAfter,

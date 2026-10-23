@@ -13,6 +13,7 @@
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.junit.Assume.assumeTrue;
 
 import java.sql.Connection;
@@ -24,13 +25,18 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
+import org.apache.pekko.Done;
 import org.apache.pekko.NotUsed;
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.stream.Materializer;
 import org.apache.pekko.stream.SystemMaterializer;
 import org.apache.pekko.stream.javadsl.Source;
 import org.apache.pekko.testkit.javadsl.TestKit;
+import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgresClient;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.config.PostgresConfig;
 import org.eclipse.ditto.internal.utils.persistence.postgres.readjournal.PostgresReadJournal;
@@ -42,6 +48,12 @@ import org.testcontainers.containers.PostgreSQLContainer;
 
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+
+import io.r2dbc.spi.ConnectionFactory;
+import io.r2dbc.spi.Result;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * The persistence-ping harness on a small partly tagged corpus (Testcontainers postgres:16): the walks, a terminated
@@ -110,17 +122,23 @@ public final class PersistencePingIT {
             assertThat(PingWalks.check(any.delivered(), MIX.expectedIdOrder(false), true).problems()).isEmpty();
             assertThat(any.statements()).as("10 windows + the empty one").hasSize(11)
                     .allSatisfy(s -> assertThat(s.success()).isTrue());
+            assertThat(any.statements()).allSatisfy(s -> assertThat(s.rows()).isLessThanOrEqualTo(PingWalks.BATCH));
 
             final PingWalks.Walk newest = PingWalks.walk("newest", journal.getJournalPidsWithTag(PingTagMix.TAG,
                     PingWalks.BATCH, PingWalks.MAX_IDLE_TIME, mat, true), timer, mat, Duration.ofMinutes(2));
             assertThat(PingWalks.check(newest.delivered(), MIX.expectedIdOrder(true), true).problems()).isEmpty();
+            assertThat(newest.statements()).allSatisfy(s -> assertThat(s.rows()).isLessThanOrEqualTo(PingWalks.BATCH));
 
             final PingWalks.Walk priority = PingWalks.walk("priority",
                     journal.getJournalPidsWithTagOrderedByPriorityTag(PingTagMix.TAG, PingWalks.MAX_IDLE_TIME), timer,
                     mat, Duration.ofMinutes(2));
             assertThat(PingWalks.check(priority.delivered(), MIX.expectedIdOrder(false), false).problems()).isEmpty();
             assertThat(PingWalks.priorityViolations(priority.delivered(), MIX.priorityByPid())).isEmpty();
-            assertThat(priority.statements()).hasSize(1);
+            assertThat(priority.statements()).as("the same 10 windows + the empty one as the ID order").hasSize(11)
+                    .allSatisfy(s -> {
+                        assertThat(s.success()).isTrue();
+                        assertThat(s.rows()).isLessThanOrEqualTo(PingWalks.BATCH);
+                    });
         } finally {
             client.close();
         }
@@ -155,6 +173,67 @@ public final class PersistencePingIT {
             client.close();
             PingRecovery.release(warnings);
         }
+    }
+
+    @Test
+    public void aTerminatedPriorityWindowIsRetriedAndTheWalkStillDeliversEveryPidOnceInPriorityOrder()
+            throws Exception {
+        final String app = "ping-priority-break-it";
+        final ListAppender<ILoggingEvent> warnings = PingRecovery.captureReadJournalWarnings();
+        final DittoPostgresClient client = PingWalks.productionClient(config(app));
+        try {
+            final List<String> delivered = new CopyOnWriteArrayList<>();
+            final CompletableFuture<Done> done;
+            final String terminated;
+            try (Connection locker = jdbc()) {
+                locker.setAutoCommit(false);
+                try (Statement st = locker.createStatement()) {
+                    st.execute("LOCK TABLE things_journal IN ACCESS EXCLUSIVE MODE"); // the first window waits: active
+                }
+                try {
+                    done = PingWalks.readJournal(client, "things")
+                            .getJournalPidsWithTagOrderedByPriorityTag(PingTagMix.TAG, PingWalks.MAX_IDLE_TIME)
+                            .runForeach(delivered::add, mat).toCompletableFuture();
+                    terminated = PingRecovery.terminateActiveWindow(PersistencePingIT::jdbc, app,
+                            Duration.ofSeconds(30)).call();
+                } finally {
+                    locker.rollback();
+                }
+            }
+            done.get(2, TimeUnit.MINUTES);
+
+            assertThat(terminated).endsWith("terminated: true");
+            assertThat(PingWalks.check(delivered, MIX.expectedIdOrder(false), false).problems()).isEmpty();
+            assertThat(PingWalks.priorityViolations(delivered, MIX.priorityByPid())).isEmpty();
+            assertThat(warnings.list).anySatisfy(e -> assertThat(e.getFormattedMessage())
+                    .contains("Page query of read-journal stream <pids with tag <always-alive> in priority order>")
+                    .contains("after <the start> failed on attempt <1>"));
+        } finally {
+            client.close();
+            PingRecovery.release(warnings);
+        }
+    }
+
+    @Test
+    public void aStatementCancelledByStatementTimeoutIsOneFailedRecord() {
+        final StatementTimer timer = new StatementTimer();
+        final ConnectionFactory factory =
+                timer.decorate(ConnectionPoolFactory.createDdlConnectionFactory(config("timer-it")));
+        final io.r2dbc.spi.Connection connection = Mono.from(factory.create()).block(Duration.ofSeconds(30));
+        final Throwable failure;
+        try {
+            Flux.from(connection.createStatement("SET statement_timeout = '200ms'").execute())
+                    .flatMap(Result::getRowsUpdated).blockLast(Duration.ofSeconds(30));
+            failure = catchThrowable(() -> Flux.from(connection.createStatement("SELECT pg_sleep(5)").execute())
+                    .flatMap(result -> result.map((row, meta) -> 1)).blockLast(Duration.ofSeconds(30)));
+        } finally {
+            Mono.from(connection.close()).block(Duration.ofSeconds(30));
+        }
+
+        assertThat(StatementTimer.describe(failure)).contains("57014");
+        assertThat(timer.statements().stream().filter(s -> s.sql().contains("pg_sleep")).toList())
+                .as("one record per execution, however often r2dbc-proxy reports its end")
+                .singleElement().satisfies(s -> assertThat(s.success()).isFalse());
     }
 
     @Test

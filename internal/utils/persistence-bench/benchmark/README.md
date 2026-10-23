@@ -14,7 +14,7 @@ naming, and evidence rules). Design: `docs/superpowers/specs/2026-07-10-postgres
 | Superseded schema-v1 evidence (C1, W2) | `internal/utils/persistence-bench/src/test/resources/bench/results/history/2026-07-13-schema-v1/` |
 | Container-limited full run (2026-10-21), one store at a time | `internal/utils/persistence-bench/src/test/resources/bench/results/*-limits-pg.md`, `*-limits-mongo.md` |
 | W3 per-op latency profile (50k corpus, 2026-10-06) | `internal/utils/persistence-bench/src/test/resources/bench/results/w3-latency/` (start with its `README.md`) |
-| Persistence ping: 1M synthetic pids and the partly tagged 250k corpus (walks only; see §6) | `internal/utils/persistence-bench/src/test/resources/bench/results/ping-keyset-paging-1m.md`, `ping-partly-tagged-walks-250k.md` |
+| Persistence ping: 1M synthetic pids and the partly tagged 250k corpus (walks, recovery and the actor; see §5 and §6) | `internal/utils/persistence-bench/src/test/resources/bench/results/ping-keyset-paging-1m.md`, `ping-partly-tagged-walks-250k.md`, `ping-partly-tagged-walks-250k-repeat.md`, `ping-partly-tagged-recovery-250k.md`, `ping-partly-tagged-recovery-250k-repeat.md`, `ping-partly-tagged-actor-250k.md`, `ping-partly-tagged-actor-250k-repeat.md` |
 | Reproduction script | `internal/utils/persistence-bench/benchmark/run-benchmark.sh` |
 | Design the bench validates | `docs/superpowers/specs/2026-07-10-postgres-persistence-bench-design.md` |
 | Plan deviations cited by the evidence ("plan deviation N") | `internal/utils/persistence-bench/benchmark/PLAN-DEVIATIONS.md` (extracted from the implementation plan, which is not committed) |
@@ -59,7 +59,7 @@ backend; `--count 500000` matches the design's ~40 GB-per-backend budget); thing
 300 B–1 KB; snapshots every 500 events (things default `snapshot.threshold`), 2–10 KB, carried by
 the ~3.4% of pids with depth ≥ 500; PG additionally gets one `things_journal_seq` row per pid.
 No journal tags unless the load runs with `BENCH_PING_TAG_MIX=true` (PostgreSQL only; evidence
-`results/ping-partly-tagged-walks-250k.md`, runs in §6), and no DELETED-lifecycle snapshots (all corpus entities
+`results/ping-partly-tagged-*-250k*.md`, see §5, runs in §6), and no DELETED-lifecycle snapshots (all corpus entities
 live) — the PG loader still builds exactly the persistence schema's `things_*` indexes and storage parameters
 (taken from `PostgresSchema.ddlStatements()`; schema v3 has no lifecycle index).
 
@@ -268,6 +268,46 @@ average. Against Mongo's 1.15 / 1.63 ms from the 2026-10-02 run (not re-run): be
 JSON-parsing the payloads as production does adds 2.71 ms p50 / 4.28 ms p95 on top (pgjdbc +
 ditto-json estimate; production reads through r2dbc). See caveat 12.
 
+### Persistence ping on a partly tagged corpus
+
+The persistence ping was first measured on 1,000,000 synthetic pids with 2 events each
+(`results/ping-keyset-paging-1m.md`). Here it walks the 250k corpus above (≈ 140 events per thing, 35,070,304 journal
+rows), loaded with `BENCH_PING_TAG_MIX=true`: a deterministic mix of 32,038 tagged things (10 % spread over the key
+space and a contiguous 1 % block at its end, tagged on every event; 1 % tagged on older events only; 1 % on the newest
+event only; 87 % untagged; `priority-<n>` 0–9 on the tagged events). The expected pids of every walk come from the
+generator (counts and SHA-256 in `results/load-pg-partly-tagged-250k.md`). The bench corpus is `things_*`; the things
+service runs no ping, so the walks stand for the policies ping (ID order) and the connectivity ping (priority order):
+same SQL, other table name. 8 GiB / 4-CPU container, no throttle, 500 pids per window. Numbers from
+`results/ping-partly-tagged-walks-250k-repeat.md` (every walk RELIABLE):
+
+| walk | statements | delivered = expected | walk | p50 | p95 | p99 | slowest (of the 60 s `statement_timeout`) |
+|---|---|---|---|---|---|---|---|
+| ID order, any tagged event (policies) | 501 | 32,038, missing 0, extra 0 | 289.3 s | 571.69 ms | 813.37 ms | 965.77 ms | 1,037.39 ms (1.73 %) |
+| ID order, newest event tagged | 501 | 29,721 | 26.1 s | 49.00 ms | 80.93 ms | 95.65 ms | 181.32 ms (0.30 %) |
+| priority order (connectivity): windows, sorted by priority | 501 | 32,038, 0 out of priority order | 183.1 s | 347.48 ms | 597.02 ms | 715.47 ms | 799.29 ms (1.33 %) |
+| same-run control, 1M × 2 events, ID order / priority order | 2,001 / 2,001 | 10,000 / 10,000 | 3.4 s / 3.3 s | 1.47 / 1.47 ms | 1.76 / 1.76 ms | 2.25 / 2.06 ms | 3.46 / 4.32 ms |
+
+- What the long histories cost: per window ≈ 390× the 2-event window of the same container (571.69 ms vs 1.47 ms
+  p50), because a window reads every row of its untagged things; median per tenth flat (491–607 ms in the any-event
+  ID walk, 307–386 ms in the priority walk). The first run on the same load (`results/ping-partly-tagged-walks-250k.md`)
+  measured walk times and medians within 5 % of these (priority walk 189.6 s, p50 351.19 ms) and a slowest priority
+  statement of 941.40 ms; its priority walk ended at 49 % free host memory and is marked unreliable, hence the repeat.
+- The priority order reads the same windows as the ID order; before, it was one statement that PostgreSQL ran as a
+  sequential scan of the whole 36 GB journal (69.9 s, cancelled by `statement_timeout`; the previous version of
+  `results/ping-partly-tagged-walks-250k.md`).
+- Recovery (`results/ping-partly-tagged-recovery-250k.md`, `…-250k-repeat.md`): the ID walk was broken by
+  `pg_terminate_backend` and by a container restart; each break cost 3.6–4.2 s from the trigger to the first pid after
+  the failed window (two failed attempts each, then the retry from the window's cursor), and the walk delivered 32,038
+  with 0 missing and 0 duplicates, in both runs.
+- The actor (`results/ping-partly-tagged-actor-250k.md`, `…-250k-repeat.md`): the production `PersistencePingActor`
+  with the policies settings (interval 10m, rate raised to 1,000 pings/s) pinged every expected pid once per walk and
+  no other in four walks; walk 2 failed by injection after 16,019 pings and walk 3 continued after the last one; no
+  other WARN or ERROR, no skipped tick; 285–299 s per full walk (walks 1 and 4). Both runs gave the same result.
+- Host memory: the walks repeat and the actor repeat had 0 swap-outs and ≥ 50 % free around every measured part. The
+  first walks run (its priority walk ended at 49 % free), the first actor run and both recovery runs (48–49 % free at
+  their start; the recovery repeat also swapped out 16,020 pages) are marked unreliable; the recovery results are
+  about delivered pids and resume points, not timings.
+
 ## 6. Reproducing
 
 ```
@@ -381,11 +421,9 @@ The persistence-ping runs of the partly tagged corpus (PostgreSQL only; label 25
 `BENCH_PING_ACTOR_RATE` (default 1000 pings/s) and `BENCH_PING_ACTOR_INTERVAL_SECONDS` (default 600) set the actor
 stage; each evidence file has a host-memory sample right before and after every measured stage.
 
-At 250k only `load` and `ping` have evidence. In `ping-partly-tagged-walks-250k.md` the ID-order walks delivered
-exactly the expected pids. The priority-order (TAGS) statement exceeded the 60 s `statement_timeout` on all 11
-attempts, so that walk delivered nothing. Its row's statement count (33) has three listener records per cancelled
-execution, and its order and priority checks pass only because nothing was delivered. `ping-recovery` and `ping-actor`
-have no 250k evidence yet.
+At 250k all stages have evidence (§5). The previous `ping-partly-tagged-walks-250k.md`, with the priority order as one
+statement that exceeded `statement_timeout` on all 11 attempts, is in git history. A stage whose host-memory verdict
+was UNRELIABLE was run once more with `BENCH_EVIDENCE_LABEL=250k-repeat` on the same load; both files are kept.
 
 The container-limited run (`*-limits-pg.md`, `*-limits-mongo.md`): one store at a time, the other container stopped or
 removed, and for every stage

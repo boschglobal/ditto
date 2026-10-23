@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.LongStream;
 
+import org.apache.pekko.NotUsed;
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.stream.Materializer;
 import org.apache.pekko.stream.SystemMaterializer;
@@ -94,10 +95,31 @@ public final class PingWalksTest {
     }
 
     @Test
-    public void aRiseInPriorityAlongThePriorityWalkIsAViolation() {
+    public void aRiseInPriorityOrAnEqualPriorityOutOfPidOrderIsAViolation() {
         final Map<String, Integer> priority = Map.of("a", 9, "b", 9, "c", 3, "d", 5);
         assertThat(PingWalks.priorityViolations(List.of("a", "b", "c"), priority)).isEmpty();
         assertThat(PingWalks.priorityViolations(List.of("a", "c", "d"), priority)).containsExactly("d");
+        assertThat(PingWalks.priorityViolations(List.of("b", "a", "c"), priority))
+                .as("equal priorities come in ascending pid order").containsExactly("a");
+    }
+
+    @Test
+    public void thePriorityLineSaysNotCheckedWhenNothingWasDelivered() {
+        assertThat(PingWalks.priorityLine(List.of(), List.of())).contains("not checked (nothing delivered)");
+        assertThat(PingWalks.priorityLine(List.of("a", "b"), List.of()))
+                .startsWith("Priority order: 0 pids out of order");
+        assertThat(PingWalks.priorityLine(List.of("b", "a"), List.of("a"))).contains("1 pids out of order")
+                .contains("[a]");
+    }
+
+    @Test
+    public void aWalkThatDoesNotEndInTimeKeepsWhatItDeliveredAndSaysSo() throws Exception {
+        final StatementTimer timer = new StatementTimer();
+        final PingWalks.Walk stuck = PingWalks.walk("stuck", Source.from(List.of("a", "b"))
+                        .concat(Source.<String>maybe().mapMaterializedValue(m -> NotUsed.getInstance())),
+                timer, mat, Duration.ofMillis(300));
+        assertThat(stuck.delivered()).containsExactly("a", "b");
+        assertThat(stuck.failure()).contains("did not end within PT0.3S");
     }
 
     @Test

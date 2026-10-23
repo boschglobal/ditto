@@ -22,13 +22,20 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
+import org.apache.pekko.Done;
 import org.apache.pekko.NotUsed;
+import org.apache.pekko.japi.Pair;
+import org.apache.pekko.stream.KillSwitches;
 import org.apache.pekko.stream.Materializer;
+import org.apache.pekko.stream.UniqueKillSwitch;
+import org.apache.pekko.stream.javadsl.Keep;
 import org.apache.pekko.stream.javadsl.Sink;
 import org.apache.pekko.stream.javadsl.Source;
 import org.eclipse.ditto.internal.utils.persistence.postgres.client.ConnectionPoolFactory;
@@ -49,7 +56,6 @@ final class PingWalks {
     static final int BATCH = 500;                                   // the shipped read-journal-batch-size
     static final Duration MAX_IDLE_TIME = Duration.ofMinutes(10);   // the shipped ping interval: 10 retries per window
     static final String WINDOW_PARAMETER_TYPES = "text, text, integer";
-    static final String PRIORITY_PARAMETER_TYPES = "text";
 
     /** {@code failure}: empty when the walk completed, else the cause of its failed stream. */
     record Walk(String label, List<String> delivered, long nanos, List<StatementTimer.Statement> statements,
@@ -129,19 +135,26 @@ final class PingWalks {
 
     /**
      * Runs one walk to completion or failure, unthrottled; a failed walk keeps the pids it delivered and its cause.
-     * Its statements are the timer's statements that read a journal table: every window and the priority statement
-     * do; any housekeeping statement of the client would not.
+     * Its statements are the timer's statements that read a journal table: every window does; any housekeeping
+     * statement of the client would not.
      */
     static Walk walk(final String label, final Source<String, NotUsed> source, final StatementTimer timer,
             final Materializer mat, final Duration timeout) throws Exception {
         timer.clear();
         final List<String> delivered = new CopyOnWriteArrayList<>();
         final long start = System.nanoTime();
+        final Pair<UniqueKillSwitch, CompletionStage<Done>> running = source
+                .viaMat(KillSwitches.<String>single(), Keep.right())
+                .toMat(Sink.foreach(delivered::add), Keep.both())
+                .run(mat);
         String failure = "";
         try {
-            source.runForeach(delivered::add, mat).toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+            running.second().toCompletableFuture().get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (final ExecutionException e) {
             failure = StatementTimer.describe(e.getCause());
+        } catch (final TimeoutException e) {
+            running.first().abort(e);
+            failure = "the walk did not end within " + timeout;
         }
         final long nanos = System.nanoTime() - start;
         return new Walk(label, List.copyOf(delivered), nanos,
@@ -186,17 +199,34 @@ final class PingWalks {
         return offenders;
     }
 
-    /** Pids whose priority is above their predecessor's: the priority order must not rise. */
+    /**
+     * Pids out of the priority order: a pid whose priority is above its predecessor's (the order must not rise), or
+     * equal to it while the pid is not above its predecessor's (equal priorities come in pid order; the bench pids are
+     * ASCII, so String order is the bytewise COLLATE "C" order).
+     */
     static List<String> priorityViolations(final List<String> delivered, final Map<String, Integer> priorityOf) {
         final List<String> violations = new ArrayList<>();
         for (int i = 1; i < delivered.size(); i++) {
-            final Integer previous = priorityOf.get(delivered.get(i - 1));
-            final Integer current = priorityOf.get(delivered.get(i));
-            if (previous != null && current != null && current > previous) {
-                violations.add(delivered.get(i));
+            final String previousPid = delivered.get(i - 1);
+            final String pid = delivered.get(i);
+            final Integer previous = priorityOf.get(previousPid);
+            final Integer current = priorityOf.get(pid);
+            if (previous != null && current != null
+                    && (current > previous || (current.equals(previous) && pid.compareTo(previousPid) <= 0))) {
+                violations.add(pid);
             }
         }
         return violations;
+    }
+
+    /** The evidence line of the priority check; "not checked" when the walk delivered nothing. */
+    static String priorityLine(final List<String> delivered, final List<String> violations) {
+        if (delivered.isEmpty()) {
+            return "Priority order: not checked (nothing delivered).";
+        }
+        return String.format("Priority order: %d pids out of order (a higher priority after a lower one, or equal "
+                        + "priorities not in ascending pid order)%s.", violations.size(),
+                violations.isEmpty() ? "" : " (first " + violations.subList(0, Math.min(20, violations.size())) + ")");
     }
 
     /** Nearest-rank percentile of sorted values. */

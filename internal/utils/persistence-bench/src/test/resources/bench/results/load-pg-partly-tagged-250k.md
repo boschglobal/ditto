@@ -1,6 +1,6 @@
 # Load evidence — PostgreSQL
 
-- generated: 2026-10-22T04:04:00.306080Z
+- generated: 2026-10-22T17:36:14.342223Z
 - corpus: count=250000 seed=42 pingTagMix=partly-tagged
 - backend(s): pg
 - containers: ditto-persistence-bench-pg: cpus=4, memory=8 GiB, postgres -c shared_buffers=4GB -c effective_cache_size=6144MB -c work_mem=64MB
@@ -11,7 +11,7 @@
 - journal rows: 35070304
 - journal_seq rows: 250000
 - snapshot rows: 44271
-- COPY: 210.8 s; constraints+indexes+ANALYZE: 218.2 s; total: 571.9 s
+- COPY: 213.7 s; constraints+indexes+ANALYZE: 236.2 s; total: 587.8 s
 
 ## Ping tag mix
 
@@ -38,7 +38,7 @@ Tags `always-alive` + `priority-<n>` (n = 0–9 per pid) on the tagged events; g
 
 | table | heap | indexes | total |
 |---|---|---|---|
-| things_journal | 36444.5 MB | 2020.4 MB | 38464.9 MB |
+| things_journal | 36444.4 MB | 2020.4 MB | 38464.8 MB |
 | things_journal_seq | 18.7 MB | 11.9 MB | 30.5 MB |
 | things_snaps | 291.4 MB | 2.9 MB | 294.3 MB |
 

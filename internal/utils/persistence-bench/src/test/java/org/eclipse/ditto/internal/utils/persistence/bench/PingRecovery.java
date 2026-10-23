@@ -12,7 +12,7 @@
  */
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -31,6 +31,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -119,10 +120,17 @@ final class PingRecovery {
             done.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (final ExecutionException e) {
             failure = Optional.of(e.getCause());
+        } catch (final TimeoutException e) {
+            failure = Optional.of(new TimeoutException("the walk did not end within " + timeout));
         }
         final long walkNanos = System.nanoTime() - start;
-        breaking.get(5, TimeUnit.MINUTES);
-        breaker.shutdownNow();
+        try {
+            breaking.get(5, TimeUnit.MINUTES);
+        } catch (final TimeoutException e) {
+            failure = failure.or(() -> Optional.of(new TimeoutException("the breaks did not finish within 5 minutes")));
+        } finally {
+            breaker.shutdownNow();
+        }
         final List<String> deliveredPids;
         final List<Long> deliveredNanos;
         synchronized (pids) {
@@ -268,11 +276,11 @@ final class PingRecovery {
     static Callable<String> restartContainer(final String container) {
         return () -> {
             final long start = System.nanoTime();
-            final Process process = new ProcessBuilder("docker", "restart", "-t", "60", container)
-                    .redirectErrorStream(true).start();
-            final String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
-            if (!process.waitFor(3, TimeUnit.MINUTES) || process.exitValue() != 0) {
-                throw new IllegalStateException("docker restart " + container + " failed: " + out);
+            final String out;
+            try {
+                out = BenchProcess.run(Duration.ofMinutes(3), "docker", "restart", "-t", "60", container).trim();
+            } catch (final IOException e) {
+                throw new IllegalStateException("docker restart " + container + " failed: " + e.getMessage(), e);
             }
             return String.format("`docker restart -t 60 %s` returned after %.1f s (%s)", container,
                     (System.nanoTime() - start) / 1e9, out);

@@ -45,6 +45,7 @@ final class PingActorRun {
     record ActorWalk(int number, Instant start, Instant end, boolean completed, String resumedAfter,
             List<String> pinged, String endLog) {}
 
+    /** {@code otherWarnings}: pings outside a walk, the actor's other WARNs and ERROR events of any class. */
     record Result(List<ActorWalk> walks, int skippedTicks, List<String> otherWarnings) {}
 
     /** Thrown by {@link #failingOnce} into the chosen walk's source. */
@@ -100,6 +101,7 @@ final class PingActorRun {
         final TestKit collector = new TestKit(system);
         system.getEventStream().subscribe(collector.getRef(), Logging.Info.class);
         system.getEventStream().subscribe(collector.getRef(), Logging.Warning.class);
+        system.getEventStream().subscribe(collector.getRef(), Logging.Error.class);
         final ActorRef ping = system.actorOf(PersistencePingActor.props(collector.getRef(), config, readJournal));
         final List<ActorWalk> walks = new ArrayList<>();
         final List<String> otherWarnings = new ArrayList<>();
@@ -114,7 +116,9 @@ final class PingActorRun {
                 if (message == null) {
                     break;
                 }
-                if (message instanceof PingCommand command) {
+                if (message instanceof Logging.Error error) {
+                    otherWarnings.add("ERROR from " + error.logClass().getSimpleName() + ": " + error.message());
+                } else if (message instanceof PingCommand command) {
                     final String pid = command.getEntityId().getEntityType() + ":" + command.getEntityId();
                     if (pinged != null) {
                         pinged.add(pid);
@@ -159,6 +163,12 @@ final class PingActorRun {
         expectWalk(problems, walks.get(0), expected);
         final ActorWalk failed = walks.get(1);
         final int k = failed.pinged().size();
+        if (k == 0) {
+            problems.add("walk 2 failed before it pinged a pid, so walk 3's resume point proves nothing");
+        }
+        if (!failed.endLog().contains("injected walk failure at <" + failAt + ">")) {
+            problems.add("walk 2 did not end with the injected failure at <" + failAt + ">: " + failed.endLog());
+        }
         if (failed.completed()) {
             problems.add("walk 2 completed although its source failed at <" + failAt + ">");
         }
@@ -180,6 +190,13 @@ final class PingActorRun {
         if (walks.get(3).resumedAfter() != null) {
             problems.add("walk 4 continued after <" + walks.get(3).resumedAfter() + "> instead of from the start");
         }
+        return problems;
+    }
+
+    /** {@link #verify(List, List, String)} plus every ping outside a walk, other actor WARN and ERROR of the run. */
+    static List<String> verify(final Result result, final List<String> expected, final String failAt) {
+        final List<String> problems = new ArrayList<>(verify(result.walks(), expected, failAt));
+        result.otherWarnings().forEach(w -> problems.add("unexpected during the run: " + w));
         return problems;
     }
 

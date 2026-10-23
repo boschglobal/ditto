@@ -54,9 +54,14 @@ public final class PersistencePingBench {
     private static final Duration WALK_TIMEOUT = Duration.ofHours(1);
     private static final int CONTROL_PIDS = 1_000_000;
     private static final int CONTROL_CHUNK = 100_000;
+    private static final String PRIORITY_LABEL = "priority order (TAGS): windows, sorted by priority";
 
     @Test
     public void walks() throws Exception {
+        if (PingWalks.BATCH != PostgresReadJournal.PRIORITY_WALK_WINDOW) {
+            throw new IllegalStateException("the priority walk's window (" + PostgresReadJournal.PRIORITY_WALK_WINDOW
+                    + ") must equal the bench window (" + PingWalks.BATCH + ") for the per-window figures");
+        }
         final Corpus corpus = Corpus.open();
         final ActorSystem system = ActorSystem.create("PersistencePingBench");
         final Materializer mat = SystemMaterializer.get(system).materializer();
@@ -88,33 +93,35 @@ public final class PersistencePingBench {
                     measure("ID order, newest event tagged", journal.getJournalPidsWithTag(
                             PingTagMix.TAG, PingWalks.BATCH, PingWalks.MAX_IDLE_TIME, mat, true),
                             newest, true, timer, mat),
-                    measure("priority order (TAGS), one statement", journal.getJournalPidsWithTagOrderedByPriorityTag(
+                    measure(PRIORITY_LABEL, journal.getJournalPidsWithTagOrderedByPriorityTag(
                             PingTagMix.TAG, PingWalks.MAX_IDLE_TIME), any, false, timer, mat));
             md.append("\n## Walks\n\nOrder: strictly ascending pid order for the ID walks (the priority order is ")
                     .append("checked below). Percentiles: nearest rank over the statements of a walk, the final empty ")
-                    .append("window excluded.\n\n")
+                    .append("window excluded. Every walk, the priority order included, reads windows of ")
+                    .append(PingWalks.BATCH).append(" pids; the priority order emits its pids only after its last ")
+                    .append("window.\n\n")
                     .append(walkTable(walks, statementTimeout, timeoutNanos)).append(tenthsTable(walks))
                     .append(slowestWindows(walks.get(0), corpus.mix()))
-                    .append(slowestWindows(walks.get(1), corpus.mix()));
+                    .append(slowestWindows(walks.get(1), corpus.mix()))
+                    .append(slowestWindows(walks.get(2), corpus.mix()));
             final List<String> priorityViolations =
                     PingWalks.priorityViolations(walks.get(2).walk().delivered(), corpus.mix().priorityByPid());
-            md.append(String.format("%nPriority order: %d pids delivered above a pid of lower priority%s.%n%n",
-                    priorityViolations.size(), priorityViolations.isEmpty() ? "" : " (first " +
-                            priorityViolations.subList(0, Math.min(20, priorityViolations.size())) + ")"));
+            md.append('\n').append(PingWalks.priorityLine(walks.get(2).walk().delivered(), priorityViolations))
+                    .append("\n\n");
             md.append(explains(observer, walks, corpus.mix()));
             md.append(sameRunControl(observer, timer, client, mat, timeoutNanos, failures));
             walks.forEach(w -> failures.addAll(PingWalks.offenders(w.walk(), w.check(), w.maxNanos(), timeoutNanos)));
             if (!priorityViolations.isEmpty()) {
-                failures.add("priority order: " + priorityViolations.size() + " violations");
+                failures.add(PRIORITY_LABEL + ": " + priorityViolations.size() + " pids out of priority order");
             }
         } catch (final Throwable t) {
             failures.add("the stage failed: " + StatementTimer.describe(t));
             throw t;
         } finally {
-            client.close();
-            TestKit.shutdownActorSystem(system);
             BenchProtocol.writeEvidence(BenchProtocol.evidenceName("ping-" + PingTagMix.EVIDENCE_SUFFIX + "-walks"),
                     md.append(verdictLine(failures)).toString());
+            client.close();
+            TestKit.shutdownActorSystem(system);
         }
         assertThat(failures).as("walk offenders (see the evidence)").isEmpty();
     }
@@ -153,11 +160,11 @@ public final class PersistencePingBench {
             failures.add("the stage failed: " + StatementTimer.describe(t));
             throw t;
         } finally {
+            BenchProtocol.writeEvidence(BenchProtocol.evidenceName("ping-" + PingTagMix.EVIDENCE_SUFFIX + "-recovery"),
+                    md.append(verdictLine(failures)).toString());
             client.close();
             PingRecovery.release(warnings);
             TestKit.shutdownActorSystem(system);
-            BenchProtocol.writeEvidence(BenchProtocol.evidenceName("ping-" + PingTagMix.EVIDENCE_SUFFIX + "-recovery"),
-                    md.append(verdictLine(failures)).toString());
         }
         assertThat(failures).as("recovery offenders (see the evidence)").isEmpty();
     }
@@ -179,16 +186,16 @@ public final class PersistencePingBench {
                     PingActorRun.failingOnce(PingWalks.readJournal(client, "things"), 2, failAt),
                     PingActorRun.pingConfig(interval, rate), 4, interval.multipliedBy(4).plusMinutes(15));
             final HostMemory.Sample after = HostMemory.sample();
-            failures.addAll(PingActorRun.verify(result.walks(), expected, failAt));
+            failures.addAll(PingActorRun.verify(result, expected, failAt));
             md.append(actorMarkdown(result, expected, failAt, interval, rate, before, after));
         } catch (final Throwable t) {
             failures.add("the stage failed: " + StatementTimer.describe(t));
             throw t;
         } finally {
-            client.close();
-            TestKit.shutdownActorSystem(system);
             BenchProtocol.writeEvidence(BenchProtocol.evidenceName("ping-" + PingTagMix.EVIDENCE_SUFFIX + "-actor"),
                     md.append(verdictLine(failures)).toString());
+            client.close();
+            TestKit.shutdownActorSystem(system);
         }
         assertThat(failures).as("actor offenders (see the evidence)").isEmpty();
     }
@@ -235,7 +242,7 @@ public final class PersistencePingBench {
         }
     }
 
-    private record Measured(PingWalks.Walk walk, PingWalks.Check check, HostMemory.Sample before,
+    private record Measured(PingWalks.Walk walk, PingWalks.Check check, boolean idOrder, HostMemory.Sample before,
             HostMemory.Sample after, List<Long> windowNanos, long maxNanos) {}
 
     private static Measured measure(final String label, final Source<String, NotUsed> source,
@@ -247,13 +254,15 @@ public final class PersistencePingBench {
         final HostMemory.Sample after = HostMemory.sample();
         final List<StatementTimer.Statement> statements = walk.statements();
         final int last = statements.size() - 1;
-        // as in the 1M evidence: the final empty window does not count in the per-statement figures
+        // every walk reads windows: the final empty window does not count in the per-statement figures (as in the 1M
+        // evidence)
         final List<Long> nanos = IntStream.range(0, statements.size())
-                .filter(i -> !(idOrder && i == last && statements.get(i).rows() == 0))
+                .filter(i -> !(i == last && statements.get(i).rows() == 0))
                 .mapToObj(i -> statements.get(i).nanos())
                 .toList();
         final long max = nanos.stream().mapToLong(Long::longValue).max().orElse(0L);
-        return new Measured(walk, PingWalks.check(walk.delivered(), expected, idOrder), before, after, nanos, max);
+        return new Measured(walk, PingWalks.check(walk.delivered(), expected, idOrder), idOrder, before, after, nanos,
+                max);
     }
 
     private static String verdictLine(final List<String> failures) {
@@ -285,7 +294,7 @@ public final class PersistencePingBench {
                     String.valueOf(m.check().missing().size()),
                     String.valueOf(m.check().extra().size()),
                     String.valueOf(m.check().duplicates().size()),
-                    m.check().ascending() ? "ok" : "NOT ascending",
+                    orderCell(m),
                     String.format("%.1f s", m.walk().nanos() / 1e9),
                     String.format("%.2f ms", PingWalks.ms(PingWalks.percentile(sorted, 50))),
                     String.format("%.2f ms", PingWalks.ms(PingWalks.percentile(sorted, 95))),
@@ -301,6 +310,16 @@ public final class PersistencePingBench {
                 "host memory (Δ swap-outs, free % before→after)", "verdict"), rows);
     }
 
+    private static String orderCell(final Measured m) {
+        if (m.check().delivered() == 0) {
+            return "not checked (nothing delivered)";
+        }
+        if (!m.idOrder()) {
+            return "by priority, see below";
+        }
+        return m.check().ascending() ? "ok" : "NOT ascending";
+    }
+
     private static String memory(final HostMemory.Sample before, final HostMemory.Sample after) {
         return before.available() && after.available()
                 ? String.format("%+d, %d → %d %%", after.swapouts() - before.swapouts(), before.freePercent(),
@@ -313,7 +332,8 @@ public final class PersistencePingBench {
         IntStream.rangeClosed(1, 10).forEach(tenth -> header.add("tenth " + tenth));
         final List<List<String>> rows = new ArrayList<>();
         for (final Measured m : walks) {
-            if (m.walk().statements().size() > 1) {     // the ID walks; the priority order is one statement
+            // every walk with more than one statement (all of them read windows)
+            if (m.walk().statements().size() > 1) {
                 final List<String> row = new ArrayList<>(List.of(m.walk().label()));
                 PingWalks.tenthMedians(m.windowNanos()).forEach(n -> row.add(String.format("%.2f", PingWalks.ms(n))));
                 rows.add(row);
@@ -358,7 +378,7 @@ public final class PersistencePingBench {
                 .append("`plan_cache_mode = force_custom_plan` and executed with the bind values of the window: ")
                 .append("window 0, the middle window, the first window of the clustered block and the window with ")
                 .append("the most journal rows (generator).\n");
-        for (final Measured m : walks.subList(0, 2)) {
+        for (final Measured m : walks) {
             final String sql = m.walk().statements().get(0).sql();
             for (final int k : picks) {
                 final String cursor = PingWalks.windowCursor(sorted, k, PingWalks.BATCH);
@@ -369,11 +389,6 @@ public final class PersistencePingBench {
                         .append("```\n");
             }
         }
-        final Measured priority = walks.get(2);
-        md.append(String.format("%n### %s%n%n```%n", priority.walk().label()))
-                .append(PingWalks.explain(observer, priority.walk().statements().get(0).sql(),
-                        PingWalks.PRIORITY_PARAMETER_TYPES, List.of(PingTagMix.TAG)))
-                .append("```\n");
         return md.toString();
     }
 
@@ -402,18 +417,25 @@ public final class PersistencePingBench {
         try {
             final List<String> expected = IntStream.rangeClosed(CONTROL_PIDS - CONTROL_PIDS / 100 + 1, CONTROL_PIDS)
                     .mapToObj(i -> String.format("policy:mio:%07d", i)).toList();
+            final PostgresReadJournal controlJournal = PingWalks.readJournal(client, "policies");
             final Measured control = measure("same-run control: 1,000,000 pids x 2 events, 1 % clustered at the end, "
-                            + "random heap", PingWalks.readJournal(client, "policies").getJournalPidsWithTag(
-                            PingTagMix.TAG, PingWalks.BATCH, PingWalks.MAX_IDLE_TIME, mat, false),
+                            + "random heap", controlJournal.getJournalPidsWithTag(PingTagMix.TAG, PingWalks.BATCH,
+                            PingWalks.MAX_IDLE_TIME, mat, false), expected, true, timer, mat);
+            // no priority tags in the control: every pid has priority 0, so its priority order is the pid order
+            final Measured controlPriority = measure("same-run control, priority order (TAGS)",
+                    controlJournal.getJournalPidsWithTagOrderedByPriorityTag(PingTagMix.TAG, PingWalks.MAX_IDLE_TIME),
                     expected, true, timer, mat);
-            failures.addAll(PingWalks.offenders(control.walk(), control.check(), control.maxNanos(), timeoutNanos));
+            for (final Measured m : List.of(control, controlPriority)) {
+                failures.addAll(PingWalks.offenders(m.walk(), m.check(), m.maxNanos(), timeoutNanos));
+            }
             return "\n## Same-run control (the clustered layout of the 1M evidence, this container)\n\n"
                     + String.format("Seeded in %.0f s into a production-DDL `policies_journal`, dropped "
                     + "afterwards.%n%n", (System.nanoTime() - seedStart) / 1e9)
-                    + walkTable(List.of(control), "", 0L)
+                    + walkTable(List.of(control, controlPriority), "", 0L)
                     + "\nFor comparison, `ping-keyset-paging-1m.md` (2026-10-02, Testcontainers defaults, "
                     + "shared_buffers 128MB, warm cache): 2,000 windows, 10,000 delivered, 3.0 s, p50 1.27 ms, "
-                    + "p95 2.06 ms, p99 3.50 ms, max 6.52 ms.\n\n";
+                    + "p95 2.06 ms, p99 3.50 ms, max 6.52 ms (the ID order only; the priority order was one statement "
+                    + "then).\n\n";
         } finally {
             try (Statement st = observer.createStatement()) {
                 st.execute("DROP TABLE IF EXISTS policies_journal");

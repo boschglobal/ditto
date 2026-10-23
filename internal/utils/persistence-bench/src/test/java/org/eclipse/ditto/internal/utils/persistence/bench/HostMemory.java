@@ -13,9 +13,8 @@
 package org.eclipse.ditto.internal.utils.persistence.bench;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -89,11 +88,6 @@ final class HostMemory {
     }
 
     private static String run(final String... command) throws IOException, InterruptedException {
-        final Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        final String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        if (!process.waitFor(10, TimeUnit.SECONDS) || process.exitValue() != 0) {
-            throw new IOException(String.join(" ", command) + " failed: " + out);
-        }
-        return out;
+        return BenchProcess.run(Duration.ofSeconds(10), command);
     }
 }
