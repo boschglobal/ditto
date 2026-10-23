@@ -261,8 +261,11 @@ PG C3 stage, and with it each PG configuration run, is marked unreliable (a repe
 lost 36,995 pages in two bursts, about 3 and 57 minutes in, and is marked unreliable as well; the C4 stage of
 the shipped configuration and the whole MongoDB run had no swap-outs. Treat the PG C3/C4 numbers as indicative. Their
 post-sweep settle times are in the History paragraph (unreliable); the settle row of the container-limited table has
-them under the limits, with the writes during the vacuum. C4's cost-limit decision rests on these runs; the limits
-re-run's write check reopens it (settle row).
+them under the limits, with the writes during the vacuum. C4's cost-limit decision (2000 on the pruned tables) rests
+on these runs and on that settle row: its write check showed the 2000 vacuum raising the snapshot-write p95 2–10×
+while it runs, and the value was kept because the settle time outweighs the write guard for this workload (about
+one minute of dead rows after a mass prune against 53 with the server default; 800 is no gentler on writes and only
+slower; at the production pace of ≤ 100 rows/s such a vacuum is rare and short).
 
 | scenario | PG p95 | Mongo p95 | verdict |
 |---|---|---|---|
