@@ -116,8 +116,9 @@ public final class SnapshotTieBreakIT {
         runDdl("INSERT INTO things_snaps (pid, sn, snapshot, lifecycle, written_at) VALUES ('" + pid
                 + "', 5, '{\"v\":\"newer\"}'::jsonb, NULL, TIMESTAMPTZ '2026-06-15 12:00:00+00')");
 
+        // request the field this test reads: a stream without fields carries no payload
         final List<SnapshotEntry> entries =
-                readJournal.getNewestSnapshotsAbove("thing:tiebreak:", 100, false, Duration.ZERO, mat)
+                readJournal.getNewestSnapshotsAbove("thing:tiebreak:", 100, false, Duration.ZERO, mat, "v")
                         .filter(e -> e.getPid().filter(pid::equals).isPresent())
                         .runWith(Sink.seq(), mat).toCompletableFuture().get(20, TimeUnit.SECONDS);
 

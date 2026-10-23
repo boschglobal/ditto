@@ -97,6 +97,13 @@ public final class PostgresPersistenceOperationsPageReadTest {
                 ops -> ops.getNewestSnapshotsAbove("", 10, Duration.ZERO, ""));
     }
 
+    @Test
+    public void newestSnapshotHeadPageIsCollectedBeforeItsRowsAreEmitted() throws Exception {
+        assertRowsOnlyAfterTheStatementCompleted("GROUP BY pid ORDER BY pid LIMIT $5", List.of(
+                        snapshotRow("thing:ns:a"), snapshotRow("thing:ns:b"), snapshotRow("thing:ns:c")),
+                ops -> ops.getNewestSnapshotHeadsAbove("", 10, Duration.ZERO, ""));
+    }
+
     private static <T> void assertRowsOnlyAfterTheStatementCompleted(final String sqlSubstring,
             final List<Map<String, Object>> rows,
             final Function<PostgresPersistenceOperations, Source<T, ?>> query) throws Exception {

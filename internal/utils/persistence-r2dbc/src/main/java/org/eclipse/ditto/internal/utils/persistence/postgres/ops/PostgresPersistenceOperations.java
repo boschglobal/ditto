@@ -562,6 +562,7 @@ public final class PostgresPersistenceOperations {
      * PK-index columns (index-only scan + LIMIT, early-stopping like Mongo's IXSCAN), phase 2
      * fetches exactly one row per winner via a backward PK scan ({@code ORDER BY sn DESC,
      * written_at DESC LIMIT 1}), so only the page's winning snapshot payloads are ever detoasted.
+     * Callers that need no payload use {@link #getNewestSnapshotHeadsAbove}, the same statement without it.
      * The former single-query {@code DISTINCT ON (pid)} shape seq-scanned and externally sorted
      * every payload above the lower bound per page (bench C1: 21× slower than Mongo at 250k pids).
      * <p>
@@ -581,29 +582,57 @@ public final class PostgresPersistenceOperations {
      */
     public Source<SnapshotRow, NotUsed> getNewestSnapshotsAbove(final String lowerBoundPid, final int batchSize,
             final java.time.Duration minAgeFromNow, final String pidFilterRegex) {
+        return pageQuerySource(newestSnapshotsPageSql(true),
+                newestSnapshotsPageBinds(lowerBoundPid, batchSize, minAgeFromNow, pidFilterRegex),
+                PostgresPersistenceOperations::mapSnapshotRow);
+    }
+
+    /**
+     * {@link #getNewestSnapshotsAbove} without the snapshot payload: the same statement minus the outer
+     * {@code s.snapshot} column and the lateral's {@code snapshot::text}, with the same binds {@code $1}…{@code $5},
+     * the same plan (phase 2 still reads {@code lifecycle} and {@code written_at} from the heap, but no TOAST block)
+     * and the same semantics (lower bound, pid regex, the age filter in both phases, DELETED filtering left to the
+     * caller). {@code PostgresReadJournal} runs it for every newest-snapshot stream that requests no snapshot fields:
+     * background cleanup ({@code Cleanup}, in the things, policies and connectivity services) and the connectivity
+     * service's retrieval of all connection ids ({@code ConnectionIdsRetrievalActor}).
+     *
+     * @param pidFilterRegex POSIX-ERE pid filter, or {@code ""} for no filter.
+     */
+    public Source<SnapshotHead, NotUsed> getNewestSnapshotHeadsAbove(final String lowerBoundPid, final int batchSize,
+            final java.time.Duration minAgeFromNow, final String pidFilterRegex) {
+        return pageQuerySource(newestSnapshotsPageSql(false),
+                newestSnapshotsPageBinds(lowerBoundPid, batchSize, minAgeFromNow, pidFilterRegex),
+                PostgresPersistenceOperations::mapSnapshotHead);
+    }
+
+    /** The newest-snapshot page of {@link #getNewestSnapshotsAbove}, with or without its two payload columns. */
+    private String newestSnapshotsPageSql(final boolean withPayload) {
+        return "SELECT p.pid, s.sn, " + (withPayload ? "s.snapshot, " : "") + "s.lifecycle, s.written_at FROM ("
+                + "SELECT pid FROM " + tables.snapsTable()
+                + " WHERE pid > $1"
+                + " AND ($2 = '' OR pid ~ $2)"
+                + " AND ($3 OR written_at < now() - $4::interval)"
+                + " GROUP BY pid ORDER BY pid LIMIT $5"
+                + ") p CROSS JOIN LATERAL ("
+                + "SELECT sn, " + (withPayload ? "snapshot::text AS snapshot, " : "") + "lifecycle, written_at FROM "
+                + tables.snapsTable()
+                + " WHERE pid = p.pid"
+                + " AND ($3 OR written_at < now() - $4::interval)"
+                + " ORDER BY sn DESC, written_at DESC LIMIT 1"
+                + ") s ORDER BY p.pid";
+    }
+
+    private static java.util.function.Consumer<Statement> newestSnapshotsPageBinds(final String lowerBoundPid,
+            final int batchSize, final java.time.Duration minAgeFromNow, final String pidFilterRegex) {
         final boolean noAgeFilter = minAgeFromNow.isZero();
         final String interval = minAgeFromNow.toSeconds() + " seconds";
-        return pageQuerySource("SELECT p.pid, s.sn, s.snapshot, s.lifecycle, s.written_at FROM ("
-                        + "SELECT pid FROM " + tables.snapsTable()
-                        + " WHERE pid > $1"
-                        + " AND ($2 = '' OR pid ~ $2)"
-                        + " AND ($3 OR written_at < now() - $4::interval)"
-                        + " GROUP BY pid ORDER BY pid LIMIT $5"
-                        + ") p CROSS JOIN LATERAL ("
-                        + "SELECT sn, snapshot::text AS snapshot, lifecycle, written_at FROM "
-                        + tables.snapsTable()
-                        + " WHERE pid = p.pid"
-                        + " AND ($3 OR written_at < now() - $4::interval)"
-                        + " ORDER BY sn DESC, written_at DESC LIMIT 1"
-                        + ") s ORDER BY p.pid",
-                stmt -> {
-                    stmt.bind(0, lowerBoundPid);
-                    stmt.bind(1, pidFilterRegex);
-                    stmt.bind(2, noAgeFilter);
-                    stmt.bind(3, interval);
-                    stmt.bind(4, batchSize);
-                },
-                PostgresPersistenceOperations::mapSnapshotRow);
+        return stmt -> {
+            stmt.bind(0, lowerBoundPid);
+            stmt.bind(1, pidFilterRegex);
+            stmt.bind(2, noAgeFilter);
+            stmt.bind(3, interval);
+            stmt.bind(4, batchSize);
+        };
     }
 
     /** Smallest journal sequence number for a pid (cleanup bound). */
@@ -847,6 +876,12 @@ public final class PostgresPersistenceOperations {
                 row.get("lifecycle", String.class),
                 row.get("written_at", Instant.class),
                 getString(row, "snapshot"));
+    }
+
+    private static SnapshotHead mapSnapshotHead(final Row row) {
+        return new SnapshotHead(getString(row, "pid"), getLong(row, "sn"),
+                row.get("lifecycle", String.class),
+                row.get("written_at", Instant.class));
     }
 
     private static String getString(final Row row, final String name) {

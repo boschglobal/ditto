@@ -14,8 +14,14 @@ package org.eclipse.ditto.internal.utils.persistence.postgres.readjournal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
@@ -34,8 +40,10 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.client.DittoPostgre
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.JournalRow;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.RecordingConnectionFactory;
+import org.eclipse.ditto.internal.utils.persistence.postgres.ops.SnapshotHead;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.SnapshotRow;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.StubClientSupport;
+import org.eclipse.ditto.json.JsonObject;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -172,26 +180,19 @@ public final class PostgresReadJournalContractTest {
     }
 
     @Test
-    public void getNewestSnapshotsAboveMapsRowToSnapshotEntry() {
-        // Stub a representative snapshot row on the MOCK operations and assert the mapped SnapshotEntry values:
-        // PostgresReadJournal.toSnapshotEntry copies pid/sn/lifecycle and parses the raw JSONB text to a JsonObject.
+    public void withoutFieldsTheStreamReadsTheSnapshotHeadsAndCarriesAnEmptyPayload() {
+        // a stream without snapshot fields (Cleanup, connection-id retrieval) runs the payload-free statement and
+        // builds its entries without a payload to parse
         final PostgresPersistenceOperations operations = mock(PostgresPersistenceOperations.class);
-        final String snapshotJson = "{\"attributes\":{\"location\":\"kitchen\"}}";
-        final SnapshotRow row = new SnapshotRow("thing:ns:id", 12L, "DELETED",
-                Instant.parse("2026-06-16T10:15:30Z"), snapshotJson);
-        // includeDeleted=true so the DELETED row survives PostgresReadJournal's post-DISTINCT lifecycle filter
-        // and this test can assert the row -> SnapshotEntry mapping shape (minAgeFromNow=Duration.ZERO,
-        // pidFilterRegex="" as ops.getNewestSnapshotsAbove's new (String, int, Duration, String) signature expects).
-        when(operations.getNewestSnapshotsAbove(eq(""), eq(10), eq(Duration.ZERO), eq("")))
-                .thenReturn(Source.single(row));
-        // Pagination seeds the next page from the last pid of the raw (pre-filter) page; stub that follow-up
-        // call to return an empty page so the unfold terminates.
-        when(operations.getNewestSnapshotsAbove(eq("thing:ns:id"), eq(10), eq(Duration.ZERO), eq("")))
+        final SnapshotHead head =
+                new SnapshotHead("thing:ns:id", 12L, "DELETED", Instant.parse("2026-06-16T10:15:30Z"));
+        when(operations.getNewestSnapshotHeadsAbove(eq(""), eq(10), eq(Duration.ZERO), eq("")))
+                .thenReturn(Source.single(head));
+        when(operations.getNewestSnapshotHeadsAbove(eq("thing:ns:id"), eq(10), eq(Duration.ZERO), eq("")))
                 .thenReturn(Source.empty());
 
-        final PostgresReadJournal journal = PostgresReadJournal.of(operations);
         final List<SnapshotEntry> entries =
-                collect(journal.getNewestSnapshotsAbove("", 10, true, Duration.ZERO, mat));
+                collect(PostgresReadJournal.of(operations).getNewestSnapshotsAbove("", 10, true, Duration.ZERO, mat));
 
         assertThat(entries).hasSize(1);
         final SnapshotEntry entry = entries.get(0);
@@ -199,8 +200,55 @@ public final class PostgresReadJournalContractTest {
         assertThat(entry.getSequenceNumber()).hasValue(12L);
         assertThat(entry.getLifecycle()).contains("DELETED");
         assertThat(entry.isDeleted()).isTrue();
-        assertThat(entry.getJson()).isEqualTo(
-                org.eclipse.ditto.json.JsonFactory.newObject(snapshotJson));
+        assertThat(entry.getJson()).isEqualTo(JsonObject.empty());
+        verify(operations, never()).getNewestSnapshotsAbove(anyString(), anyInt(), any(Duration.class), anyString());
+    }
+
+    @Test
+    public void withFieldsTheStreamReadsAndParsesThePayload() {
+        final PostgresPersistenceOperations operations = mock(PostgresPersistenceOperations.class);
+        final String snapshotJson = "{\"attributes\":{\"location\":\"kitchen\"}}";
+        final SnapshotRow row = new SnapshotRow("thing:ns:id", 12L, "DELETED",
+                Instant.parse("2026-06-16T10:15:30Z"), snapshotJson);
+        when(operations.getNewestSnapshotsAbove(eq(""), eq(10), eq(Duration.ZERO), eq("")))
+                .thenReturn(Source.single(row));
+        when(operations.getNewestSnapshotsAbove(eq("thing:ns:id"), eq(10), eq(Duration.ZERO), eq("")))
+                .thenReturn(Source.empty());
+
+        final List<SnapshotEntry> entries = collect(PostgresReadJournal.of(operations)
+                .getNewestSnapshotsAbove("", 10, true, Duration.ZERO, mat, "attributes"));
+
+        assertThat(entries).hasSize(1);
+        assertThat(entries.get(0).getSequenceNumber()).hasValue(12L);
+        assertThat(entries.get(0).isDeleted()).isTrue();
+        assertThat(entries.get(0).getJson()).isEqualTo(org.eclipse.ditto.json.JsonFactory.newObject(snapshotJson));
+        verify(operations, never()).getNewestSnapshotHeadsAbove(anyString(), anyInt(), any(Duration.class),
+                anyString());
+    }
+
+    @Test
+    public void everyOverloadRoutesOnItsSnapshotFields() {
+        final PostgresPersistenceOperations operations = mock(PostgresPersistenceOperations.class);
+        when(operations.getNewestSnapshotHeadsAbove(anyString(), anyInt(), any(Duration.class), anyString()))
+                .thenReturn(Source.empty());
+        when(operations.getNewestSnapshotsAbove(anyString(), anyInt(), any(Duration.class), anyString()))
+                .thenReturn(Source.empty());
+        final PostgresReadJournal journal = PostgresReadJournal.of(operations);
+
+        drain(journal.getNewestSnapshotsAbove("", 10, mat));
+        drain(journal.getNewestSnapshotsAbove("", 10, true, Duration.ofDays(3), mat));
+        drain(journal.getNewestSnapshotsAbove(SnapshotFilter.of("", "^thing:"), 10, mat));
+        drain(journal.getNewestSnapshotsAbove("", 10, false, Duration.ZERO, mat, (String[]) null));
+        verify(operations, times(4)).getNewestSnapshotHeadsAbove(anyString(), anyInt(), any(Duration.class),
+                anyString());
+        verify(operations, never()).getNewestSnapshotsAbove(anyString(), anyInt(), any(Duration.class), anyString());
+
+        drain(journal.getNewestSnapshotsAbove("", 10, mat, "_revision"));
+        drain(journal.getNewestSnapshotsAbove("", 10, true, Duration.ofDays(3), mat, "_revision"));
+        drain(journal.getNewestSnapshotsAbove(SnapshotFilter.of("", "^thing:"), 10, mat, "_revision", "policyId"));
+        verify(operations, times(3)).getNewestSnapshotsAbove(anyString(), anyInt(), any(Duration.class), anyString());
+        verify(operations, times(4)).getNewestSnapshotHeadsAbove(anyString(), anyInt(), any(Duration.class),
+                anyString());
     }
 
     @Test

@@ -36,6 +36,7 @@ import org.eclipse.ditto.internal.utils.persistence.postgres.ops.JournalRow;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations.PrioritizedPid;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.PostgresPersistenceOperations.WindowedPid;
+import org.eclipse.ditto.internal.utils.persistence.postgres.ops.SnapshotHead;
 import org.eclipse.ditto.internal.utils.persistence.postgres.ops.SnapshotRow;
 import org.eclipse.ditto.json.JsonFactory;
 import org.eclipse.ditto.json.JsonObject;
@@ -356,21 +357,21 @@ public final class PostgresReadJournal implements DittoReadJournal {
     @Override
     public Source<SnapshotEntry, NotUsed> getNewestSnapshotsAbove(final String lowerBoundPid, final int batchSize,
             final Materializer mat, final String... snapshotFields) {
-        return newestSnapshots(lowerBoundPid, "", batchSize, false, Duration.ZERO, mat);
+        return newestSnapshots(lowerBoundPid, "", batchSize, false, Duration.ZERO, mat, snapshotFields);
     }
 
     @Override
     public Source<SnapshotEntry, NotUsed> getNewestSnapshotsAbove(final String lowerBoundPid, final int batchSize,
             final boolean includeDeleted, final Duration minAgeFromNow, final Materializer mat,
             final String... snapshotFields) {
-        return newestSnapshots(lowerBoundPid, "", batchSize, includeDeleted, minAgeFromNow, mat);
+        return newestSnapshots(lowerBoundPid, "", batchSize, includeDeleted, minAgeFromNow, mat, snapshotFields);
     }
 
     @Override
     public Source<SnapshotEntry, NotUsed> getNewestSnapshotsAbove(final SnapshotFilter snapshotFilter,
             final int batchSize, final Materializer mat, final String... snapshotFields) {
         return newestSnapshots(snapshotFilter.lowerBoundPid(), snapshotFilter.pidFilter(), batchSize, false,
-                snapshotFilter.minAgeFromNow(), mat);
+                snapshotFilter.minAgeFromNow(), mat, snapshotFields);
     }
 
     /**
@@ -380,13 +381,28 @@ public final class PostgresReadJournal implements DittoReadJournal {
      * pagination seed is taken from the raw page before filtering, so a page whose trailing pids are all
      * DELETED still advances the cursor.
      * <p>
-     * Known limitation: {@code snapshotFields} projection is still not pushed into SQL (efficiency
-     * follow-up, out of scope); the pid regex uses POSIX ERE ({@code ~}), which covers the
-     * {@code ^…(a|b)…} patterns {@code SnapshotStreamingActor.getSnapshotFilterFromCommand} generates.
+     * The snapshot payload is fetched only when the caller requests snapshot fields. A stream without fields
+     * (background cleanup, the connectivity service's retrieval of all connection ids) runs
+     * {@link PostgresPersistenceOperations#getNewestSnapshotHeadsAbove}, which selects no payload, and its entries
+     * carry {@link JsonObject#empty()} as payload, where MongoDB returns {@code {sn, __lifecycle}}; no caller in this
+     * repository reads the payload of a stream without fields. Known limitation: with fields requested, the
+     * projection is still not pushed into SQL: the whole payload is fetched and parsed (efficiency follow-up, out of
+     * scope). The pid regex uses POSIX ERE ({@code ~}), which covers the {@code ^…(a|b)…} patterns
+     * {@code SnapshotStreamingActor.getSnapshotFilterFromCommand} generates.
      */
     private Source<SnapshotEntry, NotUsed> newestSnapshots(final String lowerBoundPid, final String pidFilterRegex,
             final int batchSize, final boolean includeDeleted, final Duration minAgeFromNow,
-            final Materializer mat) {
+            final Materializer mat, final String... snapshotFields) {
+        if (snapshotFields == null || snapshotFields.length == 0) {
+            return keysetPages("newest snapshot heads", lowerBoundPid,
+                    (String start) -> operations.getNewestSnapshotHeadsAbove(start, batchSize, minAgeFromNow,
+                            pidFilterRegex),
+                    SnapshotHead::pid, PageRetry.NONE)
+                    .mapConcat(page -> page.stream()
+                            .filter(head -> includeDeleted || !"DELETED".equals(head.lifecycle()))
+                            .map(PostgresReadJournal::toSnapshotEntryWithoutPayload)
+                            .collect(java.util.stream.Collectors.toList()));
+        }
         return keysetPages("newest snapshots", lowerBoundPid,
                 (String start) -> operations.getNewestSnapshotsAbove(start, batchSize, minAgeFromNow, pidFilterRegex),
                 SnapshotRow::pid, PageRetry.NONE)
@@ -495,6 +511,10 @@ public final class PostgresReadJournal implements DittoReadJournal {
 
     private static SnapshotEntry toSnapshotEntry(final SnapshotRow row) {
         return SnapshotEntry.of(row.pid(), row.sequenceNr(), row.lifecycle(), parse(row.snapshotJson()));
+    }
+
+    private static SnapshotEntry toSnapshotEntryWithoutPayload(final SnapshotHead head) {
+        return SnapshotEntry.of(head.pid(), head.sequenceNr(), head.lifecycle(), JsonObject.empty());
     }
 
     private static long toSeqOffset(final Offset offset) {

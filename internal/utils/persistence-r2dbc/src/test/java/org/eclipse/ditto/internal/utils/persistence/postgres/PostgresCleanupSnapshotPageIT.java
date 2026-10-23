@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
@@ -33,15 +34,18 @@ import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.pekko.NotUsed;
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.stream.Materializer;
 import org.apache.pekko.stream.SystemMaterializer;
+import org.apache.pekko.stream.javadsl.Source;
 import org.apache.pekko.testkit.javadsl.TestKit;
 
 /**
- * Real-PostgreSQL checks of the cleanup pid-stream page, {@link PostgresPersistenceOperations#getNewestSnapshotsAbove},
- * in the shape production issues: {@code Cleanup} passes {@code history-retention-duration} (things default 3d) as
- * the minimum age, so the age predicate is active in both steps of the loose index scan, and no pid regex.
+ * Real-PostgreSQL checks of the cleanup pid-stream page, the page {@code Cleanup} issues
+ * ({@link PostgresPersistenceOperations#getNewestSnapshotHeadsAbove}), in the shape production issues: {@code Cleanup}
+ * passes {@code history-retention-duration} (things default 3d) as the minimum age, so the age predicate is active in
+ * both steps of the loose index scan, and no pid regex.
  * <p>
  * The fixture holds {@value #PIDS} things pids with 1 to 4 snapshots each (sn 500, 1000, ...; a 2.5 KB payload,
  * stored out of line like real snapshots): 30 % are fresh-only (every snapshot younger than the retention), some are
@@ -55,6 +59,8 @@ import org.apache.pekko.testkit.javadsl.TestKit;
  *     sequential scans and sorts disabled (index eligibility).</li>
  *     <li>Result: paging through all pids returns, in pid order, the newest old-enough snapshot of every pid that
  *     has one, and no fresh-only pid.</li>
+ *     <li>Payload: the statement selects no snapshot column ({@code EXPLAIN VERBOSE} outputs none); a stream that
+ *     requests fields issues the same statement plus the two payload columns.</li>
  * </ul>
  */
 public final class PostgresCleanupSnapshotPageIT {
@@ -158,6 +164,35 @@ public final class PostgresCleanupSnapshotPageIT {
     }
 
     @Test
+    public void theCleanupPageSelectsNoSnapshotPayload() {
+        assertThat(productionPage.sql())
+                .as("the statement Cleanup's pid stream issues")
+                .doesNotContain("snapshot")
+                .contains("SELECT p.pid, s.sn, s.lifecycle, s.written_at FROM (")
+                .contains("SELECT sn, lifecycle, written_at FROM " + SNAPS + " WHERE pid = p.pid");
+        for (final String lowerBound : List.of("", NewestPerPidFixture.pid(PREFIX, PIDS / 2))) {
+            final String plan = fixture.explain("ANALYZE, BUFFERS, VERBOSE", productionPage.sql(), binds(lowerBound));
+            final List<String> outputs = plan.lines().map(String::trim).filter(l -> l.startsWith("Output:")).toList();
+            assertThat(outputs)
+                    .as("the plan's Output: lines, lower bound '%s', plan:%n%s", lowerBound, plan)
+                    .isNotEmpty()
+                    .noneMatch(line -> line.contains("snapshot"))
+                    .anyMatch(line -> line.contains(".lifecycle"));
+        }
+    }
+
+    @Test
+    public void aStreamThatRequestsFieldsStillSelectsTheSnapshotPayload() {
+        final RecordingConnectionFactory.Execution withFields = firstStatementOf(journal ->
+                journal.getNewestSnapshotsAbove("", PAGE, true, RETENTION, mat, "_revision"));
+        assertThat(withFields.sql()).contains("s.snapshot, ").contains("snapshot::text AS snapshot, ");
+        assertThat(withFields.sql().replace("s.snapshot, ", "").replace("snapshot::text AS snapshot, ", ""))
+                .as("the same statement as the cleanup page plus exactly the two payload columns")
+                .isEqualTo(productionPage.sql());
+        assertThat(withFields.binds()).isEqualTo(productionPage.binds());
+    }
+
+    @Test
     public void pagingWithTheProductionRetentionReturnsTheNewestOldEnoughSnapshotOfEveryPidThatHasOne() {
         final List<String> expectedWithRetention = new ArrayList<>();
         final List<String> expectedWithoutAgeFilter = new ArrayList<>();
@@ -250,11 +285,17 @@ public final class PostgresCleanupSnapshotPageIT {
 
     /** What Cleanup's pid stream issues first, captured offline with a recording stub. */
     private static RecordingConnectionFactory.Execution firstStatementOfTheCleanupPidStream() {
+        return firstStatementOf(journal -> journal.getNewestSnapshotsAbove("", PAGE, true, RETENTION, mat));
+    }
+
+    /** The first statement a read-journal stream issues, captured offline with a recording stub. */
+    private static RecordingConnectionFactory.Execution firstStatementOf(
+            final Function<PostgresReadJournal, Source<SnapshotEntry, NotUsed>> stream) {
         final RecordingConnectionFactory recorder = new RecordingConnectionFactory();
         final DittoPostgresClient recordingClient = StubClientSupport.clientFor(recorder);
         try {
-            PidStreamTestSupport.run(PostgresReadJournal.of(PostgresPersistenceOperations.of(recordingClient, ENTITY))
-                    .getNewestSnapshotsAbove("", PAGE, true, RETENTION, mat), mat, Duration.ofSeconds(30));
+            PidStreamTestSupport.run(stream.apply(PostgresReadJournal.of(
+                    PostgresPersistenceOperations.of(recordingClient, ENTITY))), mat, Duration.ofSeconds(30));
         } finally {
             recordingClient.close();
         }
