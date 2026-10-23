@@ -30,7 +30,8 @@ import com.mongodb.client.MongoDatabase;
 
 /**
  * Driver-level transcription of PersistenceCleanupActor's sweep: page the pid stream
- * (getNewestSnapshotsAbove, batch 100, lowerBound = last raw row's pid, until an empty page), and
+ * (getNewestSnapshotHeadsAbove's payload-free page since 2026-10-23, batch 100, lowerBound = last raw row's pid,
+ * until an empty page), and
  * per pid run the Cleanup.java delete plan (events tiling to snapshotSn-1, then snapshots keeping
  * the latest), one delete batch in flight at a time (the actor's inputBuffer(1,1)). Pacing:
  * unthrottled (default — measures backend capability) or credits (3 batches per 3 s — the

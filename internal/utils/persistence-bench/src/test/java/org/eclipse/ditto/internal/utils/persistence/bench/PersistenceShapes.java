@@ -91,12 +91,31 @@ public final class PersistenceShapes {
                     + "snapshot = excluded.snapshot, lifecycle = excluded.lifecycle";
 
     /**
-     * Cleanup pid-stream page — production shape of {@code getNewestSnapshotsAbove}: two-phase loose
-     * index scan. JDBC {@code ?} placeholders cannot be reused, so the R2DBC original's
-     * $1..$5-with-reuse becomes EIGHT positional binds: lowerBound, regexEmptyCheck, regex, ageFlag,
+     * Cleanup pid-stream page — production shape of {@code getNewestSnapshotHeadsAbove}, the page PostgresReadJournal
+     * issues for a stream that requests no snapshot fields (Cleanup, the connectivity service's connection-id
+     * retrieval): two-phase loose index scan without the snapshot payload; step 2 reads {@code lifecycle} and
+     * {@code written_at} from the heap and no TOAST block. JDBC {@code ?} placeholders cannot be reused, so the R2DBC
+     * original's $1..$5-with-reuse becomes EIGHT positional binds: lowerBound, regexEmptyCheck, regex, ageFlag,
      * interval, limit, ageFlag again, interval again.
      */
     public static final String PG_NEWEST_SNAPSHOTS_ABOVE =
+            "SELECT p.pid, s.sn, s.lifecycle, s.written_at FROM ("
+                    + "SELECT pid FROM things_snaps WHERE pid > ? AND (? = '' OR pid ~ ?) "
+                    + "AND (? OR written_at < now() - ?::interval) "
+                    + "GROUP BY pid ORDER BY pid LIMIT ?"
+                    + ") p CROSS JOIN LATERAL ("
+                    + "SELECT sn, lifecycle, written_at FROM things_snaps "
+                    + "WHERE pid = p.pid AND (? OR written_at < now() - ?::interval) "
+                    + "ORDER BY sn DESC, written_at DESC LIMIT 1"
+                    + ") s ORDER BY p.pid";
+
+    /**
+     * The cleanup page before the payload-free change (2026-10-23): {@link #PG_NEWEST_SNAPSHOTS_ABOVE} plus the outer
+     * {@code s.snapshot} and the lateral {@code snapshot::text AS snapshot} — production shape of
+     * {@code getNewestSnapshotsAbove}, which Cleanup issued until then and PostgresReadJournal still issues for a
+     * stream that requests snapshot fields (snapshot streaming). The same eight binds.
+     */
+    public static final String PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD =
             "SELECT p.pid, s.sn, s.snapshot, s.lifecycle, s.written_at FROM ("
                     + "SELECT pid FROM things_snaps WHERE pid > ? AND (? = '' OR pid ~ ?) "
                     + "AND (? OR written_at < now() - ?::interval) "

@@ -31,7 +31,7 @@ An unlabelled run overwrites its evidence file (`git diff` shows run-to-run move
   a `- containers:` line with what `docker inspect` reported for the running bench containers. A stage refuses a
   container that was created with other limits or server arguments; `relimit` recreates it with the requested ones on
   its data volumes, so a loaded corpus survives. `recreate` does the same unconditionally, with this run's limits
-  (pass the same `--cpus`/`--memory`): a server with empty caches on the loaded corpus, the C1 what-if's cold state.
+  (pass the same `--cpus`/`--memory`): a server with empty caches on the loaded corpus, the C1 cold state.
 - `postgres:16`: `shared_buffers=4GB`, `effective_cache_size` = ¾ of the memory limit (`6144MB` at 8 GiB: shared buffers
   plus the file cache the limit leaves; `12GB` without a limit), `work_mem=64MB` (host port 55433). All other settings
   are the image defaults (vacuum: `maintenance_work_mem` 64 MB, `autovacuum_vacuum_cost_limit` -1, 3 workers).
@@ -138,7 +138,8 @@ first call and had 0 pages swapped out between its before and after samples, wit
 stage was repeated and every number below is reliable. These numbers come from a different
 environment than every earlier run (limits; one store at a time), so movements against the History values are not
 attributable to either change alone. C1's former 21× flag was closed by the loose-index-scan rewrite; under the limits
-the PG page is flagged again, 15× Mongo's (row below)
+the page with its 100 snapshot payloads was flagged again, 15× Mongo's; since 2026-10-23 the cleanup page carries no
+payload (row below, re-measured on its own load)
 (see `docs/superpowers/specs/2026-07-13-cleanup-loose-index-scan-design.md`).
 
 | scenario | PG p50 / p95 | Mongo p50 / p95 | verdict |
@@ -150,8 +151,9 @@ the PG page is flagged again, 15× Mongo's (row below)
 | W1 single append | 2.37 / 2.90 (n=50) | 1.35 / 2.30 (n=50) | Mongo faster (1.3×) |
 | W2 snapshot write (fresh / overwrite) | 1.72 / 2.33; 1.34 / 1.89 (n=50) | 1.78 / 3.00; 1.35 / 1.54 (n=50) | PG faster (1.3×) / parity |
 | W3 sustained churn (achieved of 500/s) | 499.8/s; per-op window p50 4.11–4.93, p95 6.63–9.02 | 499.8/s; per-op window p50 1.85–2.80, p95 3.30–8.32 | both hold; per-op latency: see the W3 note below |
-| C1 cleanup pid-stream page, minAge 0 | 16.95 / 25.47 (n=50) | 1.06 / 1.66 (n=50) | FLAG: PG 15.3× slower (July: PG faster; the 2026-10-02 single-backend re-run: PG 2.5–2.8× slower at p50). The page's EXPLAIN ran 1.37 ms in the server on shared-buffer hits; the rest of PG's time was not isolated (the timed page also returns the 100 snapshot payloads, see the what-if below) |
-| ↳ C1 what-if under the limits, **NOT PRODUCTION** (the same corpus shape and limits, PG only, 2026-10-22, 3 runs, run 1 quoted) | cold (server recreated right before): production 4.07 / 4.48, payload-free 0.48 / 0.78; warm (after one pass over the pid stream): production 2.60 / 2.84, payload-free 0.33 / 0.39 (n=50, minAge 0) | 1.06 / 1.66 (the row above; not re-run) | payload share cold 88 % / 83 %, warm 87 % / 86 %; of the cold production page: 2.27 ms payload, 1.47 ms cold cache, 0.33 ms rest (p50); payload-free vs Mongo: at or below cold, at or below warm (§7.12) |
+| C1 cleanup pid-stream page, minAge 0 (the payload-free page production issues since 2026-10-23; PG re-run that day on a fresh load, the same limits, 3 runs, run 1 quoted) | cold (server recreated right before): 0.70 / 1.22; warm (after one pass over the pid stream): 0.39 / 0.51 (n=50) | 1.06 / 1.66 (n=50; not re-run) | PG at or below Mongo, cold and warm (runs 1–3: cold 0.52–0.70 / 0.85–1.22, warm 0.33–0.39 / 0.37–0.51; run 1 was repeated on a CPU-quiet host, §7.12). Before the change the page also returned the 100 snapshot payloads: 16.95 / 25.47 on the 2026-10-21 load (FLAG: PG 15.3× slower; July: PG faster; the 2026-10-02 single-backend re-run: PG 2.5–2.8× slower at p50), whose cold reads came from disk; that disk-class state is not re-measured (§7.12) |
+| ↳ C1 before vs after the payload-free change under the limits (PG only, 2026-10-23, the run above) | minAge 0 — cold: before 4.62 / 5.83, production 0.59 / 0.92; warm: before 2.80 / 3.14, production 0.39 / 0.51 (n=50); retention 3d — cold stage (its second pair: the blocks are warm by then) before 2.91 / 3.79, production 0.44 / 0.60; warm before 2.76 / 3.13, production 0.41 / 0.55 (on this backdated corpus the 3-day page is the minAge 0 page) | 1.06 / 1.66 (not re-run) | the change saves 87 % / 84 % cold and 86 % / 84 % warm (p50 / p95, minAge 0; runs: cold 87–89 % / 84–85 %, warm 86–87 % / 84–87 %); things_snaps blocks read during the cold pairs: 6,697 in 101.0 ms (0.015 ms per block: the VM's page cache; runs 82.4–101.0 ms) |
+| ↳ what the payload cost: C1 what-if under the limits before the change (NOT PRODUCTION then; the same corpus shape and limits, PG only, 2026-10-22, 3 runs, run 1 quoted) | cold (server recreated right before): page with payload 4.07 / 4.48, payload-free 0.48 / 0.78; warm (after one pass over the pid stream): page with payload 2.60 / 2.84, payload-free 0.33 / 0.39 (n=50, minAge 0) | 1.06 / 1.66 (the row above; not re-run) | payload share cold 88 % / 83 %, warm 87 % / 86 %; of the cold production page: 2.27 ms payload, 1.47 ms cold cache, 0.33 ms rest (p50); payload-free vs Mongo: at or below cold, at or below warm (§7.12) |
 | C2 single-pid cleanup (OUTLIER total per pid) | 987.45 / 1820.02 (n=20) | 502.13 / 632.84 (n=20) | FLAG: PG 2.9× slower (p50 2.0×; July: parity) |
 | C3 full sweep (22.13M rows, clean load) | 837.5 s (26,461 rows/s) | 297.6 s (74,460 rows/s) | Mongo 2.8× faster (durations); identical deletions both sides; the 2026-10-21 run without limits: 778 s / 292 s |
 | C4 post-sweep replay (tail P99 / full-scan OUTLIER / full-scan P99) | 4.33 / 8.56 (n=50); 1.25 / 1.92 (n=23); 1.27 / 1.62 (n=50); the post-sweep autovacuum of `things_journal` ended 36 s after the sweep | 2.87 / 4.62 (n=50); 1.65 / 2.00 (n=23); 1.62 / 1.99 (n=50) | parity on full-scan OUTLIER (1.0×) and full-scan P99 (0.8×) |
@@ -237,8 +239,9 @@ steady) — budget peak, not steady state; 500k needs ≳130–150 GB free.
 | W1 append / W2 snapshot / W3 churn | `w1-single-append.md`, `w2-snapshot-write.md`, `w3-sustained-churn.md` |
 | C1 pid stream / C2 single-pid / C3 sweep / C4 proof | `c1-*.md`, `c2-*.md`, `c3-*.md`, `c4-*.md` |
 | C1 with the production age filter | `../src/test/resources/bench/results/c1-pid-stream-page-retention3d-pg.md`, `../src/test/resources/bench/results/c1-pid-stream-page-retention3d-mongo.md`, `../src/test/resources/bench/results/load-pg-fresh-share-0.3.md`, `../src/test/resources/bench/results/load-mongo-fresh-share-0.3.md` |
-| C1 payload what-if (NOT PRODUCTION) | ../src/test/resources/bench/results/c1-payload-free-what-if-retention3d-pg-run1.md, …-run2.md, …-run3.md, ../src/test/resources/bench/results/load-pg-fresh-share-0.3-payload-whatif.md |
-| C1 payload what-if under the container limits (NOT PRODUCTION) | `c1-payload-free-what-if-retention3d-pg-cold-limits-whatif-run{1,2,3}.md`, `…-pg-warm-limits-whatif-run{1,2,3}.md`, `c1-pid-stream-page-limits-whatif-run{1,2,3}.md`, `load-pg-limits-whatif.md` |
+| C1 payload what-if (before the change) (NOT PRODUCTION) | ../src/test/resources/bench/results/c1-payload-free-what-if-retention3d-pg-run1.md, …-run2.md, …-run3.md, ../src/test/resources/bench/results/load-pg-fresh-share-0.3-payload-whatif.md |
+| C1 payload what-if (before the change) under the container limits (NOT PRODUCTION) | `c1-payload-free-what-if-retention3d-pg-cold-limits-whatif-run{1,2,3}.md`, `…-pg-warm-limits-whatif-run{1,2,3}.md`, `c1-pid-stream-page-limits-whatif-run{1,2,3}.md`, `load-pg-limits-whatif.md` |
+| C1 after the payload-free change, under the container limits (2026-10-23) | `c1-pid-stream-page-limits-p1-run{1-repeat,2,3}.md`, `c1-payload-pair-retention3d-pg-{cold,warm}-limits-p1-run{1-repeat,2,3}.md` (run 1 is quoted from the `…-run1-repeat.md` files; the `…-run1.md` files ran next to another job's CPU load, §7.12), `load-pg-limits-p1.md` |
 | C3 / W1 / W2 / C4 on schema v3 (2026-10-21; PG runs unreliable, §5) | `c3-full-sweep-<label>.md`, `w1-single-append-<label>.md`, `w2-snapshot-write-<label>.md`, `c4-before-after-<label>.md`, `load-pg-<label>.md` for `cl2000-pg` (cost limit 2000), `cldefault-pg` (v2 storage parameters), `cl800-pg` (800); `load-mongo-mongo-ref.md`, `c3-full-sweep-mongo-ref.md`, `c4-before-after-mongo-ref.md` |
 | C5 credit-paced window | `c5-credit-paced-window-credits-pg.md`, `load-pg-credits-pg.md` |
 | Container-limited run (all scenarios) | `<scenario>-limits-pg.md`, `<scenario>-limits-mongo.md`, `load-pg-limits-pg.md`, `load-mongo-limits-mongo.md` |
@@ -269,12 +272,13 @@ slower; at the production pace of ≤ 100 rows/s such a vacuum is rare and short
 
 | scenario | PG p95 | Mongo p95 | verdict |
 |---|---|---|---|
-| C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page — sized by the what-if note below; no production change |
+| C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); this row timed the page with the payload; the payload-free page is production since 2026-10-23 (§5 C1 row) |
 | C3 full sweep (22.13M rows; schema v3, single-backend 2026-10-21) | 778 s | 292 s | Mongo 2.7× faster (delete-batch bound); identical deletions both sides; PG run unreliable (host memory, above) |
 | **C4 post-sweep replay, schema v3** (distinct pids; the post-sweep settle times of these runs: History, unreliable; under the limits: the settle row of the table above; July: not within 900 s) | tail P99 4.74 p50 / 7.23 p95 (n=50); full-scan OUTLIER 1.23 / 1.94 (n=23); full-scan P99 1.22 / 1.60 (n=50) | tail P99 3.16 p50 / 5.09 p95 (n=50); full-scan OUTLIER 1.56 / 2.00 (n=23); full-scan P99 1.47 / 1.98 (n=50) | FLAG closed: PG ≤ 2× (1.0× / 0.8×); PG run unreliable (host memory, above) |
 | C5 credit-paced cleanup window (2 h at ≤ 100 rows/s, production order, shipped storage parameters) | 405,515 rows deleted (56 rows/s); dead tuples peak 348,401 (60 s samples) vs the 0.01 trigger 350,737; one autovacuum, 1 h 45 min into the window, cleared them; replay of swept pids as left 1.64 / 3.50 vs after VACUUM 1.57 / 3.18 (n=50), but both halves are pids that autovacuum had already cleaned (sweep positions 6–105 of 184; caveat 5) | — (MongoDB removes index keys in the delete itself) | replay slowdown of pids swept since the last autovacuum not measured (the 1.1× ratio is not a test of it); at credit pace ≈ 1 % of the journal turned dead before one autovacuum cleared it; run unreliable (host memory, above) |
 
-C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20, schema v3, the 2026-10-02
+What the payload cost, before the change: C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20,
+schema v3, the 2026-10-02
 fresh-share corpus mode; Ditto does not issue this statement): the C1 page SQL without
 `snapshot::text` takes 0.54 p50 / 0.80 p95 ms at the 3-day filter against 2.91 / 3.56 ms for the
 production page in the same run, interleaved, so the payload is 82 % (p50) / 78 % (p95) of the page
@@ -283,7 +287,8 @@ average. Against Mongo's 1.15 / 1.63 ms from the 2026-10-02 run (not re-run): be
 JSON-parsing the payloads as production does adds 2.71 ms p50 / 4.28 ms p95 on top (pgjdbc +
 ditto-json estimate; production reads through r2dbc). See caveat 12.
 
-C1 payload what-if under the container limits, **NOT PRODUCTION** (PG only, 2026-10-22, the plain 250k corpus of the
+What the payload cost, before the change: C1 payload what-if under the container limits, **NOT PRODUCTION** (PG only,
+2026-10-22, the plain 250k corpus of the
 C1 row above, 4 CPUs / 8 GiB, N = 50, 3 runs, run 1 quoted; the `c1` stage re-run in the same state: 4.11 / 4.80 ms
 against the row's 16.95 / 25.47). Right after the server was recreated (cold shared buffers; the VM's page cache is not
 dropped) the production page takes 4.07 / 4.48 and the payload-free page 0.48 / 0.78 ms at minAge 0, and `things_snaps`
@@ -296,8 +301,8 @@ the cold cache (cold − warm production page) and 0.33 ms the rest (the warm pa
 0.39 ms of 4.48. Payload share under the limits: cold 88 / 83 %, warm 87 / 86 % (p50 / p95; 3 runs: cold 88–89 /
 83–86 %, warm 87 / 86 %). Against Mongo's 1.06 / 1.66 ms from the limits run (not re-run): the payload-free page is at
 or below cold and at or below warm (every run). At the 3-day filter the pairs read 2.66 / 2.88 vs 0.37 / 0.44 ms (the
-cold run's second pair, warm by then) and 2.66 / 2.91 vs 0.38 / 0.43 ms (warm). A production change is decided on
-these numbers; none is made here. See caveat 12.
+cold run's second pair, warm by then) and 2.66 / 2.91 vs 0.38 / 0.43 ms (warm). On these numbers the payload-free
+page became production on 2026-10-23 (§5 C1 row). See caveat 12.
 
 ### Persistence ping on a partly tagged corpus
 
@@ -403,35 +408,39 @@ vacuumed since the load and no vacuum is in progress (after a 250k load the inse
 `things_journal` autovacuum runs for minutes up to half an hour), and record the vacuum state at
 timing start and end.
 
-The C1 payload what-if (`payload-whatif` stage, NOT PRODUCTION, PG only) runs on the same kind of PG
-load. It times the production page against the same SQL without `snapshot::text`, interleaved, at
-`--retention` and at 0, then the production page decoded and JSON-parsed as production's client
-does. `BENCH_EVIDENCE_LABEL` numbers the runs (`c1-payload-free-what-if-retention3d-pg-<label>.md`);
-a labelled load keeps the committed load evidence:
+The C1 payload pair (`payload-pair` stage, PG only; before the payload-free change the stage was `payload-whatif`
+and timed the same two statements) runs on the same kind of PG load. It times the page before the change (with
+`snapshot::text`) against the production page, interleaved, at `--retention` and at 0, then the page before the
+change decoded and JSON-parsed as production's client does for a stream with fields. `BENCH_EVIDENCE_LABEL` numbers
+the runs (`c1-payload-pair-retention3d-pg-<label>.md`; the runs before the change wrote
+`c1-payload-free-what-if-…`); a labelled load keeps the committed load evidence:
 
 ```
 BENCH_EVIDENCE_LABEL=payload-whatif benchmark/run-benchmark.sh up load --backend pg --count 250000 \
     --fresh-share 0.3 --fresh-base <T>
-for r in 1 2 3; do BENCH_EVIDENCE_LABEL=run$r benchmark/run-benchmark.sh payload-whatif --backend pg \
+for r in 1 2 3; do BENCH_EVIDENCE_LABEL=run$r benchmark/run-benchmark.sh payload-pair --backend pg \
     --count 250000 --fresh-share 0.3 --fresh-base <T> --retention 3d; done
 ```
 
-The what-if under the container limits (2026-10-22): the plain 250k corpus of the limits run, PG only; `recreate`
-gives the cold state (the server is recreated on its volume even when the limits already match) and
+The C1 page under the container limits, cold and warm (2026-10-22 as the what-if, label `limits-whatif`; 2026-10-23
+after the payload-free change, label `limits-p1`, after one untimed trial run with `BENCH_ITERATIONS=5
+BENCH_RESULTS_DIR=<outside the tree>` that primes the VM's page cache): the plain 250k corpus of the limits run, PG
+only; `recreate` gives the cold state (the server is recreated on its volume even when the limits already match) and
 `BENCH_C1_CACHE_STATE=warm` the warm one (one untimed pass over the whole pid stream first); a cold run that read no
-block fails its result check. `c1` ran in the same cold state to reproduce the C1 row.
+block fails its result check. `c1` ran in the same cold state (2026-10-22 to reproduce the C1 row; 2026-10-23 as the
+C1 row).
 
 ```
 export BENCH_ITERATIONS=50
-BENCH_EVIDENCE_LABEL=limits-whatif benchmark/run-benchmark.sh up load settle --backend pg --count 250000
+BENCH_EVIDENCE_LABEL=<label> benchmark/run-benchmark.sh up load settle --backend pg --count 250000
 for r in 1 2 3; do
     benchmark/run-benchmark.sh recreate --backend pg --count 250000
-    BENCH_EVIDENCE_LABEL=limits-whatif-run$r benchmark/run-benchmark.sh c1 --backend pg --count 250000
+    BENCH_EVIDENCE_LABEL=<label>-run$r benchmark/run-benchmark.sh c1 --backend pg --count 250000
     benchmark/run-benchmark.sh recreate --backend pg --count 250000
-    BENCH_C1_CACHE_STATE=cold BENCH_EVIDENCE_LABEL=limits-whatif-run$r \
-        benchmark/run-benchmark.sh payload-whatif --backend pg --count 250000
-    BENCH_C1_CACHE_STATE=warm BENCH_EVIDENCE_LABEL=limits-whatif-run$r \
-        benchmark/run-benchmark.sh payload-whatif --backend pg --count 250000
+    BENCH_C1_CACHE_STATE=cold BENCH_EVIDENCE_LABEL=<label>-run$r \
+        benchmark/run-benchmark.sh payload-pair --backend pg --count 250000
+    BENCH_C1_CACHE_STATE=warm BENCH_EVIDENCE_LABEL=<label>-run$r \
+        benchmark/run-benchmark.sh payload-pair --backend pg --count 250000
 done
 ```
 
@@ -552,20 +561,21 @@ a fresh one.
 9. At `--quick` scale the corpus has only ~6 OUTLIER-class pids, so class-scan disjointness
    between scenarios is not guaranteed (C2 cleans the same outlier pids R2 measured — reload
    before re-measuring recovery). Full-scale corpora have enough pids per class.
-10. C1's PG number is a lower bound on production's page cost. The bench reads only `pid` and
-    `sn`: pgjdbc transfers the 100 `snapshot::text` payloads of a page but the bench never decodes
-    them, while production decodes every payload to a string and JSON-parses it
-    (`PostgresPersistenceOperations.mapSnapshotRow`, `PostgresReadJournal.toSnapshotEntry`), only
-    for Cleanup to discard it. Mongo's cleanup pipeline projects the payload away on the server.
+10. Since 2026-10-23 Cleanup's page carries no payload on PostgreSQL either: the bench times the statement
+    production issues (transcribed in `PersistenceShapes`), reading `pid` and `sn` through pgjdbc, where production
+    reads pid, sn, lifecycle and write time through r2dbc and builds each entry with an empty payload (no parse). C1
+    numbers from before that date timed the page with the 100 `snapshot::text` payloads, which production also
+    decoded and JSON-parsed (`mapSnapshotRow`, `toSnapshotEntry`), so they were a lower bound; the C3/C5/M1 sweeps of
+    earlier runs also read that page. Mongo's cleanup pipeline projects the payload away on the server.
 11. C1 pages compare as measured, per page. The C1 corpus was never cleaned: it holds ~5.2
     snapshots per pid that has any, so a Mongo page (`$limit` counts snapshot rows) advances only
     ~22 pids while a PG page advances 100. That is a property of a first pass over an uncleaned
     backlog. Once Cleanup has run, a pid keeps about one old-enough snapshot (younger ones are
     excluded before `$limit`), so a Mongo page is ~100 pids too and per page is the equal-work
     comparison.
-12. The C1 payload what-if is not production. Ditto's `getNewestSnapshotsAbove` fetches the payload; the what-if
-    sizes what a payload-free cleanup page would save in TOAST reads, `jsonb_out`, transfer and pgjdbc row
-    handling. Production would also skip decoding and JSON-parsing the payloads; the evidence estimates that with
+12. The C1 payload what-ifs (2026-10-20, 2026-10-22) measured the payload-free page before production issued it;
+    since 2026-10-23 it is the production page and the `payload-pair` stage times it against the page before the
+    change. Production would also skip decoding and JSON-parsing the payloads; the evidence estimates that with
     pgjdbc and ditto-json, not through r2dbc. The comparison with Mongo uses the 2026-10-02 Mongo run (not
     re-run; one backend at a time; that PG anchor ran on schema v2, this run on v3). The 2026-10-22 what-if under
     the limits compares with the Mongo value of the limits run (one backend at a time, the same corpus shape). Its
@@ -574,7 +584,13 @@ a fresh one.
     time per block tells which: on this host about 0.01 ms per block is the page cache and about 0.1 ms the disk
     (the committed cold runs read at 0.012 ms per block, the uncommitted post-load trial at 0.095 ms); its warm
     state is after one untimed pass over the whole pid stream. `track_io_timing` is on in the what-if's session (one
-    clock read per block I/O).
+    clock read per block I/O). The 2026-10-23 run primed the page cache with an untimed trial (n = 5): its first cold
+    stages read from the disk (the `c1` stage records no read time; the cold pair after it read 1,898 blocks at
+    0.105 ms each, disk-class) and the production page took 1.25 / 3.26 ms there; the committed runs read 0.012–0.015
+    ms per block. Its first attempt at run 1 ran while another job held the host's CPUs (load average up to 106 on 12
+    cores): every statement took 2–4× as long with the same block counts, although the host-memory rule passed. Run 1
+    was repeated once, and runs 2 and 3 were started, only after the 1-minute load average had stayed below 6 for a
+    minute; the first attempt's files stay as `…-limits-p1-run1.md` and are not quoted.
 13. The 2026-10-21 C4 never re-reads a pid: at `--count 250000` only 26 OUTLIER-class pids exist, so its OUTLIER rows
     have n = 23 (26 minus 3 warm-ups) and the full-scan P99 row carries the 50-sample view of the same dead-space walk.
     C3/C5 sample tables have an `autovacuum in progress` column; C4 records the settle timeline with vacuum progress

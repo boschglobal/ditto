@@ -23,15 +23,18 @@ import org.junit.Test;
 public final class CleanupShapeBenchTest {
 
     @Test
-    public void thePayloadFreeWhatIfIsTheProductionPageWithoutItsTwoPayloadColumns() {
-        assertThat(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE
+    public void theProductionPageIsTheStatementBeforeTheChangeWithoutItsTwoPayloadColumns() {
+        assertThat(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD
                 .replace("s.snapshot, ", "")
                 .replace("snapshot::text AS snapshot, ", ""))
-                .isEqualTo(CleanupShapeBench.PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION);
-        assertThat(CleanupShapeBench.PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION)
+                .isEqualTo(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE);
+        assertThat(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE)
                 .doesNotContain("snapshot")
                 .contains("SELECT p.pid, s.sn, s.lifecycle, s.written_at FROM (")
                 .contains("SELECT sn, lifecycle, written_at FROM things_snaps ");
+        assertThat(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD)
+                .contains("SELECT p.pid, s.sn, s.snapshot, s.lifecycle, s.written_at FROM (")
+                .contains("SELECT sn, snapshot::text AS snapshot, lifecycle, written_at FROM things_snaps ");
     }
 
     @Test
@@ -43,15 +46,15 @@ public final class CleanupShapeBenchTest {
     }
 
     @Test
-    public void eachLabelledWhatIfRunWritesItsOwnEvidenceFileAndTheCacheStateComesBeforeTheLabel() {
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.ASIS, "run1"))
-                .isEqualTo("c1-payload-free-what-if-retention3d-pg-run1.md");
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.ASIS, ""))
-                .isEqualTo("c1-payload-free-what-if-retention3d-pg.md");
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.COLD, "limits-whatif-run1"))
-                .isEqualTo("c1-payload-free-what-if-retention3d-pg-cold-limits-whatif-run1.md");
-        assertThat(CleanupShapeBench.whatIfEvidenceName("3d", CleanupShapeBench.CacheState.WARM, ""))
-                .isEqualTo("c1-payload-free-what-if-retention3d-pg-warm.md");
+    public void eachLabelledPayloadPairRunWritesItsOwnEvidenceFileAndTheCacheStateComesBeforeTheLabel() {
+        assertThat(CleanupShapeBench.payloadPairEvidenceName("3d", CleanupShapeBench.CacheState.ASIS, "run1"))
+                .isEqualTo("c1-payload-pair-retention3d-pg-run1.md");
+        assertThat(CleanupShapeBench.payloadPairEvidenceName("3d", CleanupShapeBench.CacheState.ASIS, ""))
+                .isEqualTo("c1-payload-pair-retention3d-pg.md");
+        assertThat(CleanupShapeBench.payloadPairEvidenceName("3d", CleanupShapeBench.CacheState.COLD,
+                "limits-p1-run1")).isEqualTo("c1-payload-pair-retention3d-pg-cold-limits-p1-run1.md");
+        assertThat(CleanupShapeBench.payloadPairEvidenceName("3d", CleanupShapeBench.CacheState.WARM, ""))
+                .isEqualTo("c1-payload-pair-retention3d-pg-warm.md");
     }
 
     @Test

@@ -93,16 +93,17 @@ public final class RunBenchmarkScriptTest {
         assertThat(r.out()).contains("relimit").contains("recreate").contains("mixed-sweep").contains("settle")
                 .contains("--cpus N").contains("--memory G").contains("BENCH_RESULTS_DIR")
                 .contains("BENCH_PROBE_SUFFIX").contains("ping-recovery").contains("ping-actor")
-                .contains("BENCH_PING_TAG_MIX").contains("BENCH_C1_CACHE_STATE");
+                .contains("BENCH_PING_TAG_MIX").contains("BENCH_C1_CACHE_STATE")
+                .contains("payload-pair").doesNotContain("payload-whatif").doesNotContain("NOT PRODUCTION");
     }
 
     @Test
-    public void thePayloadWhatIfRefusesAnotherBackendOrAnUnknownCacheStateBeforeTouchingDocker() throws Exception {
-        final Result mongo = run("payload-whatif", "--backend", "mongo");
+    public void thePayloadPairRefusesAnotherBackendOrAnUnknownCacheStateBeforeTouchingDocker() throws Exception {
+        final Result mongo = run("payload-pair", "--backend", "mongo");
         assertThat(mongo.exit()).isNotZero();
         assertThat(mongo.out()).contains("PostgreSQL only")
                 .doesNotContain("creating").doesNotContain("already running").doesNotContain("starting");
-        final Result hot = run(Map.of("BENCH_C1_CACHE_STATE", "hot"), "payload-whatif", "--backend", "pg");
+        final Result hot = run(Map.of("BENCH_C1_CACHE_STATE", "hot"), "payload-pair", "--backend", "pg");
         assertThat(hot.exit()).isNotZero();
         assertThat(hot.out()).contains("BENCH_C1_CACHE_STATE must be asis, cold or warm")
                 .doesNotContain("creating").doesNotContain("already running").doesNotContain("starting");

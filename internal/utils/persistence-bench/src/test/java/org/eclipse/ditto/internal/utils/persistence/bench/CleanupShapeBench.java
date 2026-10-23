@@ -42,8 +42,8 @@ import com.mongodb.client.model.Filters;
  * MongoReadJournal aggregation), cleanup parameters (includeDeleted=true, no pid filter, batch 100)
  * with the bench's history-retention pin minAge=0; the C1 retention variant repeats it with the
  * production min age (things.conf history-retention-duration, default 3d) next to minAge=0. The C1
- * payload what-if (NOT PRODUCTION) times the same PG page without the snapshot payload, to size the
- * payload's share of it, in a chosen server cache state (as is, cold, warm).
+ * payload pair times the PG page before the payload-free change (with the snapshot payload) against the
+ * production page, to show what the change saves, in a chosen server cache state (as is, cold, warm).
  * C2: the full single-pid cleanup sequence Cleanup.java performs — min-event-sn, batched event
  * range deletes tiling to snapshotSn-1, min-snapshot-sn, batched snapshot range deletes keeping
  * the latest. NOTE (plan deviation 2): no journal_seq.deleted_to update — the real cleanup path
@@ -51,25 +51,7 @@ import com.mongodb.client.model.Filters;
  */
 public final class CleanupShapeBench {
 
-    /**
-     * NOT PRODUCTION — what-if only. {@link PersistenceShapes#PG_NEWEST_SNAPSHOTS_ABOVE} without the snapshot
-     * payload: the outer {@code s.snapshot} and the lateral {@code snapshot::text AS snapshot} are gone and nothing
-     * else differs (the same eight placeholders; step 2 still reads {@code lifecycle} and {@code written_at} from the
-     * heap). Ditto does not issue this statement; {@link #c1PayloadFreeWhatIf()} uses it to size the payload's share
-     * of the cleanup page.
-     */
-    static final String PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION =
-            "SELECT p.pid, s.sn, s.lifecycle, s.written_at FROM ("
-                    + "SELECT pid FROM things_snaps WHERE pid > ? AND (? = '' OR pid ~ ?) "
-                    + "AND (? OR written_at < now() - ?::interval) "
-                    + "GROUP BY pid ORDER BY pid LIMIT ?"
-                    + ") p CROSS JOIN LATERAL ("
-                    + "SELECT sn, lifecycle, written_at FROM things_snaps "
-                    + "WHERE pid = p.pid AND (? OR written_at < now() - ?::interval) "
-                    + "ORDER BY sn DESC, written_at DESC LIMIT 1"
-                    + ") s ORDER BY p.pid";
-
-    /** Server cache state the what-if establishes before timing ({@code bench.c1.cacheState}; NOT PRODUCTION). */
+    /** Server cache state the C1 payload pair establishes before timing ({@code bench.c1.cacheState}). */
     enum CacheState {
         /** No preparation: whatever the server held when the stage started (the 2026-10-20 runs). */
         ASIS("asis", "as is: no preparation, whatever the server held when the stage started"),
@@ -80,8 +62,12 @@ public final class CleanupShapeBench {
         COLD("cold", "cold: the server was recreated right before the stage (shared buffers started empty; the VM's "
                 + "page cache is not controlled, its hits show as reads too; the read time per block tells page-cache "
                 + "reads from disk reads)"),
-        /** One untimed pass over the whole pid stream with the production page first: every page in shared buffers. */
-        WARM("warm", "warm: one untimed pass over the whole pid stream with the production page before timing");
+        /**
+         * One untimed pass over the whole pid stream with the statement before the change (payload included: index,
+         * heap and TOAST blocks) before timing: every page in shared buffers.
+         */
+        WARM("warm", "warm: one untimed pass over the whole pid stream with the statement before the change "
+                + "(payload included: index, heap and TOAST blocks) before timing");
 
         final String word;
         final String description;
@@ -164,15 +150,16 @@ public final class CleanupShapeBench {
     record WarmPass(int pages, long pids, double seconds, PgIo blocks) {
 
         String line() {
-            return String.format(Locale.ROOT, "%d pages / %d pids with the production page at minAge 0 in %.1f s; "
-                    + "things_snaps blocks during the pass: %s", pages, pids, seconds, blocks.line());
+            return String.format(Locale.ROOT, "%d pages / %d pids with the statement before the change at minAge 0 "
+                    + "in %.1f s; things_snaps blocks during the pass: %s", pages, pids, seconds, blocks.line());
         }
     }
 
     /**
-     * One keyset pass over the whole pid stream with the production page (payload included) at minAge 0, as a sweep
-     * reads it: every index, heap and TOAST block a cleanup page touches is in shared buffers afterwards (the corpus's
-     * things_snaps is about 300 MB against 4 GB of shared buffers). Untimed: not part of any Timing.
+     * One keyset pass over the whole pid stream with the statement it is given at minAge 0; with the statement before
+     * the change (payload included) every index, heap and TOAST block either page touches is in shared buffers
+     * afterwards (the corpus's things_snaps is about 300 MB against 4 GB of shared buffers). Untimed: not part of any
+     * Timing.
      */
     static WarmPass pgWarmPass(final Connection c, final PreparedStatement withPayload, final int limit)
             throws SQLException {
@@ -213,7 +200,7 @@ public final class CleanupShapeBench {
     }
 
     /**
-     * The min ages of the what-if's two timed pairs, in order. Both pairs read the same lower bounds, so only the
+     * The min ages of the payload pair's two timed pairs, in order. Both pairs read the same lower bounds, so only the
      * first meets cold shared buffers: the cold state times minAge 0 (the C1 row's filter) first; the other states
      * keep the order of the 2026-10-20 runs (retention, then 0).
      */
@@ -292,7 +279,10 @@ public final class CleanupShapeBench {
                         + "\nCleanup parameters: includeDeleted=true (no DELETED filter stage on Mongo), "
                         + "minAge=0 (the bench's history-retention pin: age predicates disabled; production "
                         + "things cleanup passes history-retention-duration, default 3d — see the C1 retention "
-                        + "variant), pidFilter='' — what Cleanup.java passes with that pin.\n");
+                        + "variant), pidFilter='' — what Cleanup.java passes with that pin. PG statement: "
+                        + "PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE, the payload-free page production issues for "
+                        + "Cleanup since 2026-10-23; c1 evidence written before then timed the page with the "
+                        + "payload.\n");
     }
 
     /**
@@ -389,7 +379,8 @@ public final class CleanupShapeBench {
                         + body
                         + "What is compared: the binds Cleanup.java passes (includeDeleted=true, pidFilter='', "
                         + "minAgeFromNow = history-retention-duration). PG "
-                        + "(PostgresPersistenceOperations.getNewestSnapshotsAbove): a non-zero min age sets the "
+                        + "(PostgresPersistenceOperations.getNewestSnapshotHeadsAbove, the payload-free page): a "
+                        + "non-zero min age sets the "
                         + "no-age-filter flag to false, so 'written_at < now() - interval' filters rows in BOTH "
                         + "steps (step 1: a pid with no old-enough row takes no page slot; step 2: the newest "
                         + "old-enough row wins); the page is " + PersistenceShapes.READS_PER_QUERY
@@ -405,29 +396,30 @@ public final class CleanupShapeBench {
     }
 
     /**
-     * NOT PRODUCTION — what-if. Sizes the snapshot payload's share of the PG C1 cleanup page: the production page
-     * ({@link PersistenceShapes#PG_NEWEST_SNAPSHOTS_ABOVE}) against {@link #PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION},
-     * interleaved per lower bound ({@link BenchProtocol#measurePair}), first at the C1 retention
-     * ({@code bench.c1.retention}, default 3d), then at minAge 0. A third pair, at the retention, reads the
-     * production page as the bench client does (payload transferred, not decoded) and decoded and JSON-parsed as
-     * PostgresReadJournal does: a bench-side estimate of production's extra client cost. PostgreSQL only, on the
-     * fresh-share corpus of the retention stage; {@code bench.evidenceLabel} numbers the runs of a series. After
-     * timing, every page of both statements is checked against {@link NewestSnapshotOracle}; the run fails (after
-     * writing its evidence) if a page or the age mix differs, if the quiet-server gate timed out, or if a vacuum
-     * was running when timing started. The server cache state before timing follows {@code bench.c1.cacheState}
-     * ({@link CacheState}); the evidence records what the timed statements read into shared buffers and how long
-     * those reads took.
+     * Times the PG C1 cleanup page before the payload-free change
+     * ({@link PersistenceShapes#PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD}) against the production page
+     * ({@link PersistenceShapes#PG_NEWEST_SNAPSHOTS_ABOVE}), interleaved per lower bound
+     * ({@link BenchProtocol#measurePair}), at the C1 retention ({@code bench.c1.retention}, default 3d) and at minAge 0
+     * (in the order of {@link #pairOrder}): what the change saves. A third pair, at the retention, reads the statement
+     * before the change as the bench client does (payload transferred, not decoded) and decoded and JSON-parsed as
+     * PostgresReadJournal does for a stream with fields: a bench-side estimate of that client cost. PostgreSQL only;
+     * {@code bench.evidenceLabel} numbers the runs of a series. After timing, every page of both statements is checked
+     * against {@link NewestSnapshotOracle}; the run fails (after writing its evidence) if a page or the age mix
+     * differs, if the quiet-server gate timed out, or if a vacuum was running when timing started. The server cache
+     * state before timing follows {@code bench.c1.cacheState} ({@link CacheState}); the evidence records what the
+     * timed statements read into shared buffers and how long those reads took.
      */
     @Test
-    public void c1PayloadFreeWhatIf() throws Exception {
+    public void c1PayloadPair() throws Exception {
         if (!"pg".equals(BenchConfig.backend())) {
-            throw new IllegalStateException("the C1 payload what-if is PostgreSQL only: run it with --backend pg");
+            throw new IllegalStateException("the C1 payload pair is PostgreSQL only: run it with --backend pg");
         }
         final CorpusGenerator gen = BenchConfig.corpus();
         final Duration retention = BenchConfig.c1Retention();
         final String spec = BenchConfig.c1RetentionSpec();
         if (retention.isZero()) {
-            throw new IllegalArgumentException("the what-if compares a non-zero retention with minAge 0: " + spec);
+            throw new IllegalArgumentException("the payload pair compares a non-zero retention with minAge 0: "
+                    + spec);
         }
         final CacheState cacheState = BenchConfig.c1CacheState();
         final int limit = PersistenceShapes.READS_PER_QUERY;
@@ -439,8 +431,9 @@ public final class CleanupShapeBench {
         final StringBuilder body = new StringBuilder("## PostgreSQL\n\n");
 
         try (Connection c = BenchConfig.openPg();
-                PreparedStatement withPayload = c.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE);
-                PreparedStatement withoutPayload = c.prepareStatement(PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION)) {
+                PreparedStatement withPayload =
+                        c.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD);
+                PreparedStatement production = c.prepareStatement(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE)) {
             try (Statement st = c.createStatement()) {
                 st.execute("SET track_io_timing = on");   // this session only: blk_read_time and EXPLAIN I/O timings
             }
@@ -462,7 +455,7 @@ public final class CleanupShapeBench {
                 final BenchProtocol.Timing[] t = BenchProtocol.measurePair(
                         BenchConfig.warmups(), BenchConfig.iterations(),
                         iteration -> pgPage(withPayload, lbAt.apply(iteration), minAge, limit),
-                        iteration -> pgPage(withoutPayload, lbAt.apply(iteration), minAge, limit));
+                        iteration -> pgPage(production, lbAt.apply(iteration), minAge, limit));
                 rows.add(List.of(minAgeLabel(spec, minAge), t[0].cells(), t[1].cells(), payloadShare(t[0], t[1])));
             }
             final BenchProtocol.Timing[] decode = BenchProtocol.measurePair(
@@ -474,26 +467,26 @@ public final class CleanupShapeBench {
             cacheStateCheck(cacheState, ioDuring).ifPresent(failures::add);
             final long[] mix = pgAgeMix(c, retention);
 
-            final String pagesWith = checkPages("PG production page", lowerBounds, retention, failures,
+            final String pagesWith = checkPages("PG statement before the change", lowerBounds, retention, failures,
                     (lb, minAge) -> pgPage(withPayload, lb, minAge, limit),
                     (lb, ageFilter) -> oracle.pgPage(lb, ageFilter, limit));
-            final String pagesWithout = checkPages("PG payload-free what-if", lowerBounds, retention, failures,
-                    (lb, minAge) -> pgPage(withoutPayload, lb, minAge, limit),
+            final String pagesProduction = checkPages("PG production page", lowerBounds, retention, failures,
+                    (lb, minAge) -> pgPage(production, lb, minAge, limit),
                     (lb, ageFilter) -> oracle.pgPage(lb, ageFilter, limit));
             body.append(BenchProtocol.table(List.of("min age (one page, varying lower bound)",
-                            "production page, with payload: p50 | p95 | max (ms)",
-                            "payload-free what-if (NOT PRODUCTION): p50 | p95 | max (ms)",
-                            "payload share of the page: p50 / p95"), rows))
+                            "statement before the change, with payload: p50 | p95 | max (ms)",
+                            "production page, payload-free: p50 | p95 | max (ms)",
+                            "payload share of the page before the change: p50 / p95"), rows))
                     .append('\n')
-                    .append(BenchProtocol.table(List.of("production page at " + minAgeLabel(spec, retention)
-                                    + ", client handling", "p50 | p95 | max (ms)"),
+                    .append(BenchProtocol.table(List.of("statement before the change at "
+                                    + minAgeLabel(spec, retention) + ", client handling", "p50 | p95 | max (ms)"),
                             List.of(List.of("payload transferred, not decoded (the C1 bench client)",
                                             decode[0].cells()),
-                                    List.of("payload decoded and JSON-parsed as PostgresReadJournal does "
-                                            + "(pgjdbc estimate)", decode[1].cells()))))
+                                    List.of("payload decoded and JSON-parsed as PostgresReadJournal does for a "
+                                            + "stream with fields (pgjdbc estimate)", decode[1].cells()))))
                     .append('\n')
-                    .append(pagesWith.replace("- result check", "- production page: result check"))
-                    .append(pagesWithout.replace("- result check", "- payload-free what-if: result check"))
+                    .append(pagesWith.replace("- result check", "- statement before the change: result check"))
+                    .append(pagesProduction.replace("- result check", "- production page: result check"))
                     .append(payloadLines(c, lowerBounds, retention, spec, limit))
                     .append(ageMixLine("PG", spec, mix, oracle, failures,
                             "read after timing (its full scan of things_snaps would warm the heap before a cold run)"))
@@ -509,48 +502,51 @@ public final class CleanupShapeBench {
                     .append("- storage parameters: ").append(PgVacuumProbe.reloptions(c)).append("\n\n")
                     .append(PgLoadBench.sizesMarkdown(c));
             for (final Duration minAge : List.of(retention, Duration.ZERO)) {
-                body.append("\n### PG plan — production page, ").append(minAgeLabel(spec, minAge))
+                body.append("\n### PG plan — production page (payload-free), ").append(minAgeLabel(spec, minAge))
                         .append(" (mid-corpus lower bound)\n\n")
                         .append(BenchProtocol.pgExplain(c,
                                 pgPageLiterals(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE, mid, minAge)))
-                        .append("\n### PG plan — payload-free what-if (NOT PRODUCTION), ")
+                        .append("\n### PG plan — statement before the change (with payload), ")
                         .append(minAgeLabel(spec, minAge)).append(" (mid-corpus lower bound)\n\n")
                         .append(BenchProtocol.pgExplain(c,
-                                pgPageLiterals(PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION, mid, minAge)));
+                                pgPageLiterals(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD, mid,
+                                        minAge)));
             }
             body.append(literalStatements(spec, mid, retention));
         }
 
-        BenchProtocol.writeEvidence(whatIfEvidenceName(spec, cacheState, BenchConfig.evidenceLabel()),
-                BenchProtocol.runHeader("C1 what-if (NOT PRODUCTION) — the PG cleanup page with and without the "
-                        + "snapshot payload (retention " + spec + " and 0, batch 100)")
+        BenchProtocol.writeEvidence(payloadPairEvidenceName(spec, cacheState, BenchConfig.evidenceLabel()),
+                BenchProtocol.runHeader("C1 payload pair — the PG cleanup page before the payload-free change and "
+                        + "the production page (retention " + spec + " and 0, batch 100)")
                         + BenchProtocol.freshCorpusLine(gen)
                         + (failures.isEmpty() ? "" : "**RESULT CHECK FAILED — do not quote these numbers:**\n"
                         + failures.stream().map(f -> "- " + f + "\n").reduce("", String::concat) + "\n")
                         + body
-                        + "\nWhat is compared (NOT PRODUCTION what-if): the production page is the statement "
-                        + "PostgresPersistenceOperations.getNewestSnapshotsAbove issues for Cleanup "
-                        + "(includeDeleted=true, pidFilter='', minAgeFromNow = history-retention-duration), "
-                        + "transcribed as PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE. The payload-free what-if is "
-                        + "that SQL without the outer s.snapshot and the lateral snapshot::text: the same binds and "
-                        + "plan nodes, lifecycle and written_at still read from the heap; Ditto does not issue it. "
+                        + "\nWhat is compared: the production page is the statement "
+                        + "PostgresPersistenceOperations.getNewestSnapshotHeadsAbove issues for Cleanup "
+                        + "(includeDeleted=true, pidFilter='', minAgeFromNow = history-retention-duration; a stream "
+                        + "without snapshot fields), transcribed as PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE: no "
+                        + "snapshot column. The statement before the change, "
+                        + "PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD, is that SQL plus the outer "
+                        + "s.snapshot and the lateral snapshot::text (Cleanup issued it until 2026-10-23; production "
+                        + "still issues it for a stream with fields): the same binds and plan nodes. "
                         + "Both are read through pgjdbc taking pid and sn only; the decoded variant also reads "
-                        + "every payload as a String and parses it with JsonFactory.newObject, as "
-                        + "PostgresReadJournal.toSnapshotEntry does (production reads through r2dbc, so that row "
-                        + "is an estimate). Timing: each pair interleaved per lower bound, alternating which runs "
-                        + "first; pairs in the order retention, minAge 0, decode (cold: minAge 0, retention, decode, "
-                        + "as only the first pair meets cold shared buffers; the later pairs re-read the same lower "
-                        + "bounds); result checks, payload sizes, "
-                        + "plans and statements after timing. MongoDB is not run: its cleanup pipeline projects "
+                        + "every payload of the statement before the change as a String and parses it with "
+                        + "JsonFactory.newObject, as PostgresReadJournal.toSnapshotEntry does (an estimate: "
+                        + "production reads through r2dbc). Timing: each pair interleaved per lower bound, "
+                        + "alternating which runs first; pairs in the order retention, minAge 0, decode (cold: minAge "
+                        + "0, retention, decode, as only the first pair meets cold shared buffers; the later pairs "
+                        + "re-read the same lower bounds); result checks, payload sizes, plans and statements after "
+                        + "timing. MongoDB is not run: its cleanup pipeline projects "
                         + "the payload away (sn and lifecycle only). Cache state (bench.c1.cacheState): as is = no "
                         + "preparation; cold = the server was recreated right before the stage (run-benchmark.sh "
                         + "recreate), so shared buffers started empty while the VM's page cache is not controlled, "
                         + "and the run fails unless timing read blocks; warm = one untimed pass over the whole pid "
-                        + "stream with the production page first. The things_snaps block line counts what the timed "
-                        + "statements read into shared buffers (pg_statio_user_tables) and the time those reads took "
-                        + "(pg_stat_database.blk_read_time, track_io_timing on in this session).\n");
+                        + "stream with the statement before the change first. The things_snaps block line counts "
+                        + "what the timed statements read into shared buffers (pg_statio_user_tables) and the time "
+                        + "those reads took (pg_stat_database.blk_read_time, track_io_timing on in this session).\n");
         if (!failures.isEmpty()) {
-            throw new AssertionError("C1 payload what-if result check failed: " + failures);
+            throw new AssertionError("C1 payload pair result check failed: " + failures);
         }
     }
 
@@ -622,13 +618,16 @@ public final class CleanupShapeBench {
                 100.0 * (1.0 - withoutPayload.p95Ms() / withPayload.p95Ms()));
     }
 
-    /** The state word sits before the label; {@code asis} keeps the names of the 2026-10-20 runs. */
-    static String whatIfEvidenceName(final String retentionSpec, final CacheState state, final String label) {
-        final String base = "c1-payload-free-what-if-retention" + retentionSpec + "-pg";
+    /**
+     * The state word sits before the label (asis: none). Runs before the payload-free change wrote
+     * {@code c1-payload-free-…} files under the same rule.
+     */
+    static String payloadPairEvidenceName(final String retentionSpec, final CacheState state, final String label) {
+        final String base = "c1-payload-pair-retention" + retentionSpec + "-pg";
         return BenchProtocol.labelled(state == CacheState.ASIS ? base : base + "-" + state.word, label) + ".md";
     }
 
-    /** Untimed: payload kB per production page over all lower bounds, per min age. */
+    /** Untimed: payload kB per page of the statement before the change over all lower bounds, per min age. */
     private static String payloadLines(final Connection c, final List<String> lowerBounds, final Duration retention,
             final String spec, final int limit) throws SQLException {
         final StringBuilder sb = new StringBuilder();
@@ -638,8 +637,9 @@ public final class CleanupShapeBench {
                 bytes.add(pgPagePayloadBytes(c, lb, minAge, limit)[1]);
             }
             final LongSummaryStatistics s = bytes.stream().mapToLong(Long::longValue).summaryStatistics();
-            sb.append(String.format(Locale.ROOT, "- payload per production page (octet_length of snapshot::text, "
-                            + "untimed), %s: min/mean/max %.0f / %.0f / %.0f kB%n", minAgeLabel(spec, minAge),
+            sb.append(String.format(Locale.ROOT, "- payload per page of the statement before the change "
+                            + "(octet_length of snapshot::text, untimed), %s: min/mean/max %.0f / %.0f / %.0f kB%n",
+                    minAgeLabel(spec, minAge),
                     s.getMin() / 1024.0, s.getAverage() / 1024.0, s.getMax() / 1024.0));
         }
         return sb.toString();
@@ -652,15 +652,18 @@ public final class CleanupShapeBench {
             sb.append("\nproduction page, ").append(minAgeLabel(spec, minAge)).append(":\n\n```sql\n")
                     .append(pgPageLiterals(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE, mid, minAge))
                     .append(";\n```\n")
-                    .append("\npayload-free what-if (NOT PRODUCTION), ").append(minAgeLabel(spec, minAge))
+                    .append("\nstatement before the change, ").append(minAgeLabel(spec, minAge))
                     .append(":\n\n```sql\n")
-                    .append(pgPageLiterals(PG_PAGE_WITHOUT_PAYLOAD_NOT_PRODUCTION, mid, minAge))
+                    .append(pgPageLiterals(PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD, mid, minAge))
                     .append(";\n```\n");
         }
         return sb.toString();
     }
 
-    /** Binds Cleanup's page:PostgresPersistenceOperations.getNewestSnapshotsAbove's binds for this min age. */
+    /**
+     * Binds Cleanup's page: the binds of PostgresPersistenceOperations.getNewestSnapshotHeadsAbove (the same as
+     * getNewestSnapshotsAbove's) for this min age.
+     */
     static void bindPgPage(final PreparedStatement ps, final String lowerBound, final Duration minAge,
             final int limit) throws SQLException {
         final boolean noAgeFilter = minAge.isZero();
@@ -675,7 +678,10 @@ public final class CleanupShapeBench {
         ps.setString(8, interval);
     }
 
-    /** One PG cleanup page as (pid, sn); the payload columns are transferred as in production but, unlike production, never decoded or parsed. */
+    /**
+     * One PG cleanup page as (pid, sn); with the statement before the change the payload columns are transferred but
+     * never decoded or parsed.
+     */
     static List<NewestSnapshotOracle.PidSn> pgPage(final PreparedStatement ps, final String lowerBound,
             final Duration minAge, final int limit) throws SQLException {
         bindPgPage(ps, lowerBound, minAge, limit);
@@ -689,9 +695,10 @@ public final class CleanupShapeBench {
     }
 
     /**
-     * One PG cleanup page read as production's client reads it: every payload read as a String and parsed with
-     * {@code JsonFactory.newObject} (PostgresReadJournal.toSnapshotEntry). Through pgjdbc, not r2dbc: a bench-side
-     * estimate of production's extra client cost, not a production number.
+     * One PG cleanup page of the statement before the change read with its payload: every payload read as a String
+     * and parsed with {@code JsonFactory.newObject}, as PostgresReadJournal.toSnapshotEntry does for a stream with
+     * fields (and did for Cleanup before the payload-free change). Through pgjdbc, not r2dbc: a bench-side estimate of
+     * that client cost, not a production number.
      */
     static List<NewestSnapshotOracle.PidSn> pgPageDecoded(final PreparedStatement ps, final String lowerBound,
             final Duration minAge, final int limit) throws SQLException {
@@ -708,12 +715,15 @@ public final class CleanupShapeBench {
         return page;
     }
 
-    /** Untimed: [rows, payload bytes] of one production cleanup page (octet_length of snapshot::text). */
+    /**
+     * Untimed: [rows, payload bytes] of one page of the statement before the change (octet_length of
+     * snapshot::text).
+     */
     static long[] pgPagePayloadBytes(final Connection c, final String lowerBound, final Duration minAge,
             final int limit) throws SQLException {
         try (PreparedStatement ps = c.prepareStatement("SELECT count(*) AS n, "
                 + "coalesce(sum(octet_length(snapshot)), 0) AS bytes FROM ("
-                + PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE + ") page")) {
+                + PersistenceShapes.PG_NEWEST_SNAPSHOTS_ABOVE_WITH_PAYLOAD + ") page")) {
             bindPgPage(ps, lowerBound, minAge, limit);
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();

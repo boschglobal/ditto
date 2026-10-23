@@ -25,7 +25,7 @@
 #                volumes (keeps the loaded corpus); a container that already matches is left as it is
 #   recreate     stop, remove and run the containers of --backend again on their data volumes, with this run's
 #                limits and server arguments (pass the same --cpus/--memory; keeps the loaded corpus; the server
-#                starts with empty caches: the C1 what-if's cold state)
+#                starts with empty caches: the C1 cold state)
 #   build        mvn install -DskipTests the bench module + its reactor dependencies
 #   load         PgLoadBench + MongoLoadBench — generate + bulk-load the corpus, build indexes
 #   settle       PostgreSQL: wait until things_journal and things_snaps were vacuumed since the load and no vacuum
@@ -40,8 +40,8 @@
 #   c2           CleanupShapeBench#c2SinglePidCleanup only (DESTRUCTIVE for its 46 pids)
 #   retention    CleanupShapeBench  — C1 with the production min age (--retention, default 3d) vs 0;
 #                load with --fresh-share first: on the backdated corpus every row qualifies
-#   payload-whatif  CleanupShapeBench — NOT PRODUCTION what-if: the C1 page with vs without the snapshot
-#                payload, PG only (--backend pg), at --retention and 0, on the `retention` stage's corpus
+#   payload-pair CleanupShapeBench — the C1 page before the payload-free change (with the snapshot payload) vs
+#                the production page, interleaved, PG only (--backend pg), at --retention and 0
 #   sweep        CleanupSweepBench  — C3 full sweep (DESTRUCTIVE: empties cleanup backlog), C4 proof
 #   c3           CleanupSweepBench#c3FullSweep only (DESTRUCTIVE)
 #   c4           CleanupSweepBench#c4BeforeAfterProof only (run after c3)
@@ -101,7 +101,7 @@
 #   BENCH_C4_OFFLINE_RECLAIM  false: skip C4's VACUUM FULL / compact
 #   BENCH_SWEEP_MAX_SECONDS   bound of the window stage
 #   BENCH_C1_VACUUM_TIMEOUT   C1 stages: bound of the wait for a quiet PG server, seconds (default 3600)
-#   BENCH_C1_CACHE_STATE      payload-whatif: asis (default) | cold (run `recreate` right before; the stage fails unless
+#   BENCH_C1_CACHE_STATE      payload-pair: asis (default) | cold (run `recreate` right before; the stage fails unless
 #                             timing read blocks into shared buffers) | warm (an untimed pass over the pid stream first)
 #   BENCH_SETTLE_TIMEOUT      bound of the settle stage, seconds (default 3600)
 #   BENCH_PROBE_SUFFIX        appended to the W1/W2 probe pids, so wcheck can run again on one load (default: none)
@@ -430,17 +430,17 @@ stage_retention() {
     run_bench 'CleanupShapeBench#c1PidStreamPageWithRetention' $(quick_props)
 }
 
-stage_payload_whatif() {
-    [ "$BACKEND" = pg ] || die "payload-whatif is PostgreSQL only: pass --backend pg"
+stage_payload_pair() {
+    [ "$BACKEND" = pg ] || die "payload-pair is PostgreSQL only: pass --backend pg"
     case "${BENCH_C1_CACHE_STATE:-asis}" in
         asis|cold|warm) ;;
         *) die "BENCH_C1_CACHE_STATE must be asis, cold or warm, got '${BENCH_C1_CACHE_STATE}'" ;;
     esac
     stage_up
-    log "C1 payload what-if (NOT PRODUCTION): retention ${BENCH_C1_RETENTION:-3d} and 0;" \
+    log "C1 payload pair (before vs after the payload-free change): retention ${BENCH_C1_RETENTION:-3d} and 0;" \
         "cache state ${BENCH_C1_CACHE_STATE:-asis}"
     # shellcheck disable=SC2046
-    run_bench 'CleanupShapeBench#c1PayloadFreeWhatIf' $(quick_props)
+    run_bench 'CleanupShapeBench#c1PayloadPair' $(quick_props)
 }
 
 stage_sweep() {
@@ -613,7 +613,7 @@ for stage in "${STAGES[@]}"; do
         c1) stage_c1 ;;
         c2) stage_c2 ;;
         retention) stage_retention ;;
-        payload-whatif) stage_payload_whatif ;;
+        payload-pair) stage_payload_pair ;;
         sweep) stage_sweep ;;
         c3) stage_c3 ;;
         wcheck) stage_wcheck ;;
