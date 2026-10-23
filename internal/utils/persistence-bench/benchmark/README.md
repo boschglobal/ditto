@@ -155,6 +155,7 @@ the PG page is flagged again, 15× Mongo's (row below)
 | C2 single-pid cleanup (OUTLIER total per pid) | 987.45 / 1820.02 (n=20) | 502.13 / 632.84 (n=20) | FLAG: PG 2.9× slower (p50 2.0×; July: parity) |
 | C3 full sweep (22.13M rows, clean load) | 837.5 s (26,461 rows/s) | 297.6 s (74,460 rows/s) | Mongo 2.8× faster (durations); identical deletions both sides; the 2026-10-21 run without limits: 778 s / 292 s |
 | C4 post-sweep replay (tail P99 / full-scan OUTLIER / full-scan P99) | 4.33 / 8.56 (n=50); 1.25 / 1.92 (n=23); 1.27 / 1.62 (n=50); the post-sweep autovacuum of `things_journal` ended 36 s after the sweep | 2.87 / 4.62 (n=50); 1.65 / 2.00 (n=23); 1.62 / 1.99 (n=50) | parity on full-scan OUTLIER (1.0×) and full-scan P99 (0.8×) |
+| ↳ post-sweep settle and writes during the vacuum (PostgreSQL only, 2026-10-23; one load per storage-parameter set, the same limits; T = end of the last `things_journal` autovacuum after the sweep − end of the sweep) | T: cost limit 2000 (shipped) 70 s, scale factor only (server default 200) 3,172 s, 800 661 s. W1 append / W2 fresh / W2 overwrite p50 / p95 (n=50) while that vacuum ran: 2000 2.48 / 4.75, 2.58 / 23.45, 2.53 / 7.70; 200 2.20 / 3.27, 1.73 / 2.80, 2.01 / 2.42; 800 2.64 / 8.14, 4.44 / 23.39, 2.17 / 5.57; the same loads with no vacuum running: 2000 1.42 / 2.39, 2.07 / 2.34, 2.06 / 2.28; 200 1.54 / 2.78, 2.07 / 2.51, 1.76 / 2.18; 800 1.48 / 2.44, 1.86 / 2.32, 1.71 / 1.98 | — (not re-run) | 2000 settles 45× sooner than 200 (800: 4.8×); write p95 during its vacuum 2.0–10.0× the quiet value, during the default-speed vacuum 1.1–1.2× (800: 2.8–10.1×); write guard (p95 > 2× the control's during its vacuum): exceeded by 2000 on W2 fresh and W2 overwrite, by 800 on all three |
 | **M1 churn during the mass sweep** (21.05M rows, after recovery/write/cleanup on its load; achieved of 500/s over the windows that ended while the sweep was deleting) | 500.0/s over 20 of 20 windows; window p50 2.57–4.66, p95 12.30–36.72; mass sweep 21,054,465 event + 33,643 snapshot rows in 890.2 s (23,690 rows/s) | 500.3/s over 13 of 20 windows; window p50 1.92–3.30, p95 5.01–20.89; mass sweep the same rows in 404.1 s (52,188 rows/s) | both hold; window p95 vs the same backend's W3: PG 12.30–36.72 vs 6.63–9.02, Mongo 5.01–20.89 vs 3.30–8.32 |
 | M1b churn under the light post-reclamation sweep (2026-07-13, before the limits; `m1-cleanup-under-traffic.md`) | 499.8/s | 499.9/s | both hold; 296,576 rows swept live on each (the churn's own debris) |
 
@@ -171,6 +172,13 @@ The July C3/C4 runs (schema v2, co-resident, 20 iterations; `c3-full-sweep.md`, 
 488 s Mongo; C4 16.9 (tail) / 98.5 (full-scan; the 2nd-highest of 20 samples, max 366.7) ms PG vs 13.2 / 6.7 ms Mongo,
 the settle loop timing out at 900 s with dead tuples flat at 11.3M. The 2026-10-21 rows (runs without limits, below
 the table) supersede them.
+
+The 2026-10-21 post-sweep settle times (runs without limits, marked unreliable: macOS swapped out 12–19k pages during
+every PG sweep), two loads per storage-parameter set: the last `things_journal` autovacuum ended 17 / 52 s after the
+sweep with cost limit 2000, 722 / 403 s with 800 and 2,936 / 2,952 s with the v2 storage parameters. Their W-check ran
+after the sweep, so with 2000 it never overlapped the vacuum; during the 800 vacuum W1 append p95 was 12.62 ms and W2
+overwrite p95 32.77 ms, against 1.96 / 3.03 ms during the v2 vacuum. The settle row of the container-limited table,
+measured under the limits on 2026-10-23, supersedes them.
 
 W2 noise caveat: the v1 -> v2 W2 gain (4.31 -> 2.96 and 3.30 -> 2.33 ms, about 30 %) compares two
 separate runs, and the unchanged Mongo numbers moved between them as well (fresh 6.25 -> 4.79 ms,
@@ -235,6 +243,7 @@ steady) — budget peak, not steady state; 500k needs ≳130–150 GB free.
 | C5 credit-paced window | `c5-credit-paced-window-credits-pg.md`, `load-pg-credits-pg.md` |
 | Container-limited run (all scenarios) | `<scenario>-limits-pg.md`, `<scenario>-limits-mongo.md`, `load-pg-limits-pg.md`, `load-mongo-limits-mongo.md` |
 | M1 during the mass sweep | `m1-cleanup-during-mass-sweep-limits-pg.md`, `m1-cleanup-during-mass-sweep-limits-mongo.md` |
+| Post-sweep settle and W1/W2 during the vacuum under the container limits (2026-10-23, PostgreSQL only) | `c3-full-sweep-<label>.md`, `c4-before-after-<label>.md`, `autovacuum-log-<label>.md` (the server's autovacuum log), `w1-single-append-<label>-vac.md` / `w2-snapshot-write-<label>-vac.md` (W-check started as soon as a `things_journal` vacuum ran after the sweep; each overlapped it at both probes), `…-<label>-quiet.md` (the same load, no vacuum running) for `limits-cl2000` (shipped storage parameters; the corpus of `load-pg-limits-whatif.md`), `limits-cldefault` (scale factor only; `load-pg-limits-cldefault.md`) and `limits-cl800` (`load-pg-limits-cl800.md`) |
 | M1b mixed (2026-07) | `m1-cleanup-under-traffic.md` |
 
 ### Runs without container limits that this run does not repeat
@@ -250,16 +259,16 @@ executions on distinct pids, a manual `VACUUM (ANALYZE)` before the sweep, offli
 macOS swapped out 12–19k pages (16 KiB) during the sweep's first minutes while ≥ 81 % of memory stayed free, so each
 PG C3 stage, and with it each PG configuration run, is marked unreliable (a repeat showed the same); the 2 h C5 window
 lost 36,995 pages in two bursts, about 3 and 57 minutes in, and is marked unreliable as well; the C4 stage of
-the shipped configuration and the whole MongoDB run had no swap-outs. Treat the PG C3/C4 numbers as indicative. Across
-the two loads of each configuration the post-sweep autovacuum finished 17 / 52 s (cost limit 2000), 722 / 403 s (800)
-and 2,936 / 2,952 s (v2 storage parameters) after the sweep; the evidence files are the second loads'. C4's
-cost-limit decision rests on these runs.
+the shipped configuration and the whole MongoDB run had no swap-outs. Treat the PG C3/C4 numbers as indicative. Their
+post-sweep settle times are in the History paragraph (unreliable); the settle row of the container-limited table has
+them under the limits, with the writes during the vacuum. C4's cost-limit decision rests on these runs; the limits
+re-run's write check reopens it (settle row).
 
 | scenario | PG p95 | Mongo p95 | verdict |
 |---|---|---|---|
 | C1 cleanup page, production 3-day age filter (fresh share 0.3, single-backend run 2026-10-02) | 3.03 p50 / 3.39 p95 | 1.15 p50 / 1.63 p95 | FLAG: PG 2.6× (p50) / 2.1× (p95) slower per page (3 runs: 2.3–2.7× / 1.9–2.2×); the age filter itself costs ≈ 0 on both and keeps the plan (PK index-only + backward top-1, no Sort/spill). PG is a lower bound (§7.10); follow-up: payload-free cleanup page — sized by the what-if note below; no production change |
 | C3 full sweep (22.13M rows; schema v3, single-backend 2026-10-21) | 778 s | 292 s | Mongo 2.7× faster (delete-batch bound); identical deletions both sides; PG run unreliable (host memory, above) |
-| **C4 post-sweep replay, schema v3** (distinct pids; the autovacuum after the sweep finished 52 s after it with the shipped storage parameters — 52 s with cost limit 2000, 2,952 s with v2's, 403 s with 800; July: not within 900 s) | tail P99 4.74 p50 / 7.23 p95 (n=50); full-scan OUTLIER 1.23 / 1.94 (n=23); full-scan P99 1.22 / 1.60 (n=50) | tail P99 3.16 p50 / 5.09 p95 (n=50); full-scan OUTLIER 1.56 / 2.00 (n=23); full-scan P99 1.47 / 1.98 (n=50) | FLAG closed: PG ≤ 2× (1.0× / 0.8×); PG run unreliable (host memory, above) |
+| **C4 post-sweep replay, schema v3** (distinct pids; the post-sweep settle times of these runs: History, unreliable; under the limits: the settle row of the table above; July: not within 900 s) | tail P99 4.74 p50 / 7.23 p95 (n=50); full-scan OUTLIER 1.23 / 1.94 (n=23); full-scan P99 1.22 / 1.60 (n=50) | tail P99 3.16 p50 / 5.09 p95 (n=50); full-scan OUTLIER 1.56 / 2.00 (n=23); full-scan P99 1.47 / 1.98 (n=50) | FLAG closed: PG ≤ 2× (1.0× / 0.8×); PG run unreliable (host memory, above) |
 | C5 credit-paced cleanup window (2 h at ≤ 100 rows/s, production order, shipped storage parameters) | 405,515 rows deleted (56 rows/s); dead tuples peak 348,401 (60 s samples) vs the 0.01 trigger 350,737; one autovacuum, 1 h 45 min into the window, cleared them; replay of swept pids as left 1.64 / 3.50 vs after VACUUM 1.57 / 3.18 (n=50), but both halves are pids that autovacuum had already cleaned (sweep positions 6–105 of 184; caveat 5) | — (MongoDB removes index keys in the delete itself) | replay slowdown of pids swept since the last autovacuum not measured (the 1.1× ratio is not a test of it); at credit pace ≈ 1 % of the journal turned dead before one autovacuum cleared it; run unreliable (host memory, above) |
 
 C1 payload what-if, **NOT PRODUCTION** (single-backend PG run 2026-10-20, schema v3, the 2026-10-02
@@ -486,6 +495,30 @@ benchmark/run-benchmark.sh down --purge --backend pg
 Every measured stage was preceded by the host-memory gate of the 2026-10-21 runs (above) and had a sample right before
 and after it; no stage was repeated: every gate passed on its first call and no measured stage swapped out a page.
 
+The post-sweep settle and write-during-vacuum runs under the limits (2026-10-23, PostgreSQL only): one load per
+storage-parameter set (`limits-cl2000` used the corpus of `load-pg-limits-whatif.md`, loaded with the shipped storage
+parameters), the server logging every autovacuum (`ALTER SYSTEM SET log_autovacuum_min_duration = 0` and
+`SELECT pg_reload_conf()`; logging only), and for each, with `L` the label:
+
+```
+export BENCH_ITERATIONS=50 BENCH_C4_SETTLE_TIMEOUT=7200 BENCH_C3_VACUUM_FIRST=true BENCH_C4_OFFLINE_RECLAIM=false
+export BENCH_EVIDENCE_LABEL=$L                # limits-cldefault: load with BENCH_PG_RELOPTIONS='autovacuum_vacuum_scale_factor = 0.01'
+# limits-cl800: BENCH_PG_RELOPTIONS='autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_cost_limit = 800'
+benchmark/run-benchmark.sh up load --backend pg --count 250000
+benchmark/run-benchmark.sh settle --backend pg --count 250000
+benchmark/run-benchmark.sh c3 --backend pg --count 250000
+# at once, as soon as pg_stat_progress_vacuum shows things_journal (polled once a second, at most 120 s):
+BENCH_EVIDENCE_LABEL=$L-vac BENCH_PROBE_SUFFIX=-vac benchmark/run-benchmark.sh wcheck --backend pg --count 250000
+benchmark/run-benchmark.sh c4 --backend pg --count 250000
+benchmark/run-benchmark.sh settle --backend pg --count 250000
+BENCH_EVIDENCE_LABEL=$L-quiet BENCH_PROBE_SUFFIX=-quiet benchmark/run-benchmark.sh wcheck --backend pg --count 250000
+benchmark/run-benchmark.sh down --purge --backend pg
+```
+
+Every measured stage had the host-memory gate before it and a sample right before and after it, except the W-check
+during the vacuum, which cannot wait two minutes: its gate compared the minute timeline's sample 2–4 minutes old with
+a fresh one.
+
 ## 7. Caveats — read before quoting numbers
 
 1. Laptop-scale Docker; 10-minute windows — trends, not plateau claims.
@@ -551,6 +584,12 @@ and after it; no stage was repeated: every gate passed on its first call and no 
     in §5): quote M1 for throughput and its latency directionally. The sweep runs unthrottled (worst case; Ditto's
     credit pace is ≤ 100 rows/s). M1b is the 2026-07 M1, kept as a separately named row: it ran after C4's offline
     reclamation, so its sweep found only the churn's own debris (296,576 rows).
+15. The W-check during the vacuum times 53 operations per scenario (3 warm-ups + 50), about 0.1–0.5 s, a few seconds
+    after the vacuum was first seen: it samples the phase the vacuum was in at that moment (the evidence's
+    `autovacuum in progress at start / at end` line, which reports any vacuum, a manual one too), not the whole
+    vacuum: with 2000 its second heap pass (`vacuuming heap`), with 200 and 800 its first (`scanning heap`). T is the
+    end of the last `things_journal` autovacuum after the sweep minus the end of the sweep (C4's settle table, checked
+    against the server's autovacuum log); a W-check inside that window adds its own few hundred writes.
 
 ## 8. Presenting this
 
