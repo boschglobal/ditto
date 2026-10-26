@@ -225,6 +225,13 @@ global:
     #  policy can supply the required permission. The enforcement-side authorize-create-policy check already
     #  considers namespace-scoped root policies and is unaffected by this toggle.
     policyLockoutPreventionEnabled: true
+    # hideInaccessibleEntityExistenceEnabled controls whether the existence of things and policies is hidden from
+    #  requesters which were not granted any permission on them. When enabled (default), such requesters get the same
+    #  "not found" error (e.g. things:thing.notfound) for every rejected request, regardless of whether the entity
+    #  exists - so the error can't be used to enumerate entity IDs. Requesters with at least one permission on the
+    #  entity still get resource-specific errors (e.g. things:attributes.notfound, things:thing.notmodifiable with 403).
+    #  Set this to false to restore the legacy behaviour where all requesters get the resource-specific errors.
+    hideInaccessibleEntityExistenceEnabled: true
   # logging the logging configuration for Ditto
   logging:
     # sysout holds the logging to SYSOUT config
@@ -2839,6 +2846,15 @@ dittoui:
     # tag: 3.3.0
     # pullPolicy for the Ditto UI docker image
     pullPolicy: IfNotPresent
+  # environmentsURL configures from where the Ditto UI (and the Swagger UI) may load environments via the
+  #  "environmentsURL" query parameter. Environments contain the Ditto API URI and the OIDC provider configuration, so
+  #  whoever controls the loaded file can redirect the users' logins and receive their tokens and credentials.
+  #  By default, only files served from the UI's own origin are accepted (paths containing "/api/" or "/ws/" never).
+  environmentsURL:
+    # allowedOrigins additional origins (e.g. "https://config.example.com") to accept environments from.
+    #  SECURITY: only add origins whose content is fully trusted - anyone able to place a file there can take over the
+    #  sessions of users opening a crafted UI link. "*" accepts any origin and makes the UI vulnerable to that attack.
+    allowedOrigins: []
   # extraEnv to add arbitrary environment variable to Ditto UI container
   extraEnv: []
   # resources configures the resources available/to use for the Ditto UI container

@@ -15,7 +15,33 @@ sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
 
 ## [Unreleased]
 
-## [4.7.1]
+## [4.9.0]
+
+### Added
+- New `global.featureFlags.hideInaccessibleEntityExistenceEnabled` (default `true`), passed to the things and
+  policies services. When enabled, requesters without any permission on a thing or policy get the same "not found"
+  error for every rejected request, regardless of whether the entity exists. Set it to `false` to restore the
+  previous, resource-specific errors (e.g. `403 things:thing.notmodifiable`) which allow to determine whether an
+  entity exists.
+
+## [4.8.0]
+
+Bumped Ditto `appVersion` to `3.9.8`. Also contains the fix planned for the never released chart version `4.7.1`.
+
+### Added
+- New `dittoui.environmentsURL.allowedOrigins` (default `[]`), rendered into a new `<release>-ui-config` ConfigMap
+  which is mounted as `ui-config.json` into the Ditto UI and the Swagger UI. It lists additional origins from which
+  the UIs may load environments via the `environmentsURL` query parameter. Only add fully trusted origins - `"*"`
+  accepts any origin and makes the UIs vulnerable to session takeover via crafted links.
+
+### Security
+- The Ditto UI and the Swagger UI only load environments via the `environmentsURL` query parameter from their own
+  origin (or the configured `dittoui.environmentsURL.allowedOrigins`), and never from paths containing `/api/` or
+  `/ws/`. Previously, a crafted link could load environments with an attacker-controlled OIDC provider or Ditto API
+  URI, leaking the user's tokens and credentials.
+  Part of the fix for the vulnerability
+  [CVE-2026-107503](https://nvd.nist.gov/vuln/detail/CVE-2026-107503) /
+  [GHSA-8767-g5qv-9jcf](https://github.com/eclipse-ditto/ditto/security/advisories/GHSA-8767-g5qv-9jcf).
 
 ### Fixed
 - `thingsSearch.config.customIndexes` never reached Ditto: the template rendered the block under

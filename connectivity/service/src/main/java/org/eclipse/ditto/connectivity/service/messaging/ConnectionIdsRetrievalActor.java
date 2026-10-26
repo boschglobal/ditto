@@ -52,6 +52,7 @@ import org.eclipse.ditto.connectivity.service.messaging.persistence.ConnectionPe
 import org.eclipse.ditto.internal.utils.cluster.DistPubSubAccess;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoDiagnosticLoggingAdapter;
 import org.eclipse.ditto.internal.utils.pekko.logging.DittoLoggerFactory;
+import org.eclipse.ditto.internal.utils.pekko.logging.ThreadSafeDittoLoggingAdapter;
 import org.eclipse.ditto.internal.utils.persistence.api.DittoReadJournal;
 import org.eclipse.ditto.internal.utils.persistence.api.JournalEntry;
 import org.eclipse.ditto.internal.utils.persistence.api.SnapshotEntry;
@@ -67,6 +68,8 @@ public final class ConnectionIdsRetrievalActor extends AbstractActor {
     public static final String ACTOR_NAME = CONNECTION_ID_RETRIEVAL_ACTOR_NAME;
 
     private final DittoDiagnosticLoggingAdapter log = DittoLoggerFactory.getDiagnosticLoggingAdapter(this);
+    private final ThreadSafeDittoLoggingAdapter threadSafeLog =
+            DittoLoggerFactory.getThreadSafeDittoLoggingAdapter(this);
 
     private final Supplier<Source<JournalEntry, NotUsed>> persistenceIdsFromJournalSourceSupplier;
     private final Supplier<Source<SnapshotEntry, NotUsed>> persistenceIdsFromSnapshotSourceSupplier;
@@ -214,10 +217,15 @@ public final class ConnectionIdsRetrievalActor extends AbstractActor {
                     .thenApply(idList -> idList.stream().sorted().toList())
                     .thenApply(LinkedHashSet::new)
                     .thenApply(ids -> buildResponse(cmd, ids))
-                    .exceptionally(throwable -> buildErrorResponse(throwable, cmd.getDittoHeaders()));
+                    .exceptionally(throwable -> {
+                        // async callback, must not touch actor state
+                        threadSafeLog.withCorrelationId(cmd)
+                                .error(throwable, "Failed to load persistence ids from journal/snapshots.");
+                        return buildErrorResponse(throwable, cmd.getDittoHeaders());
+                    });
             Patterns.pipe(retrieveAllConnectionIdsResponse, getContext().dispatcher()).to(getSender());
         } catch (final Exception e) {
-            log.info("Failed to load persistence ids from journal/snapshots.", e);
+            logger.error(e, "Failed to load persistence ids from journal/snapshots.");
             getSender().tell(buildErrorResponse(e, cmd.getDittoHeaders()), getSelf());
         }
     }

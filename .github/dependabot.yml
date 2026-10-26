@@ -53,6 +53,11 @@ updates:
       # to 3.9.7, which breaks parent resolution for all 20 modules. Ditto's
       # internal versions are never dependency updates, so ignore them outright.
       - dependency-name: "org.eclipse.ditto:*"
+      # The MongoDB Java driver version is deliberately kept in lockstep with the
+      # driver version pekko-persistence-mongodb is built against (see the comment
+      # on <mongo-java-driver.version> in bom/pom.xml). It is bumped manually
+      # whenever pekko-persistence-mongodb updates, never independently.
+      - dependency-name: "org.mongodb:*"
     groups:
       # Dependabot reaches the root pom as the parent of bom/pom.xml, so its
       # <pluginManagement> versions are in scope too. Keep the build plugins in
@@ -89,6 +94,12 @@ updates:
     commit-message:
       prefix: ci
       include: scope
+    ignore:
+      # TypeScript 7 is the Go-native compiler rewrite; ts-jest only supports
+      # typescript ">=4.3 <7" as a peer, so a bump to 7.x fails npm install
+      # (see PR #2553). Lift this once ts-jest gained TypeScript 7 support.
+      - dependency-name: "typescript"
+        versions: [">=7"]
     groups:
       ui-npm:
         patterns:

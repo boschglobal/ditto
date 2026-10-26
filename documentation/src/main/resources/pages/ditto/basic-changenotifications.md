@@ -25,10 +25,14 @@ have the required [authorization](basic-auth.html):
 ## Filtering
 
 You can filter events on the Ditto backend before they reach your application. Each API provides
-its own mechanism for specifying filters, but all support the same filter types.
+its own mechanism for specifying filters. All of them support filtering by namespace and by RQL
+expression; [connections](basic-connections.html#filtering-with-placeholder-functions) additionally
+support filtering by placeholder pipeline.
 
 {% include note.html content="All filters are specified in URL query format, so their values should be URL-encoded.
-The equal sign (=) and ampersand (&) must be encoded in any RQL filter." %}
+The equal sign (=) and ampersand (&) must be encoded in any RQL filter. The target topics of
+[connections](basic-connections.html#target-topics-and-filtering) are an exception: there only `&`, `+` and `%`
+have to be encoded." %}
 
 ### Filter by namespace
 
@@ -79,6 +83,20 @@ filter=and(in(topic:action,'created','deleted'),eq(resource:path,'/'))
 ```
 
 See the full [RQL expression reference](basic-rql.html) for the complete query language.
+
+### Filter by placeholder pipeline (connections only)
+
+[Connections](basic-connections.html) additionally accept placeholder pipelines in separate, repeatable
+`fn-filter` parameters alongside (or instead of) the RQL `filter`. Each one starts with the placeholder to
+filter and ends with an `fn:filter(...)` stage; all given filters must match:
+
+```text
+fn-filter=topic:action|fn:filter('eq','modified')
+```
+
+Any placeholder available for the signal can be filtered that way, not only thing data -- see
+[Filtering with placeholder functions](basic-connections.html#filtering-with-placeholder-functions).
+This is not available for the WebSocket API or SSE, which only support the namespace and RQL filters.
 
 ## Further reading
 
