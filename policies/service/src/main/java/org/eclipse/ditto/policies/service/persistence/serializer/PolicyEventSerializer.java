@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Contributors to the Eclipse Foundation
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation
  *
  * See the NOTICE file(s) distributed with this work for additional
  * information regarding copyright ownership.
@@ -10,41 +10,34 @@
  *
  * SPDX-License-Identifier: EPL-2.0
  */
-
 package org.eclipse.ditto.policies.service.persistence.serializer;
 
 import java.util.Set;
 
-import org.eclipse.ditto.base.model.json.FieldType;
-import org.eclipse.ditto.base.model.json.JsonSchemaVersion;
+import javax.annotation.Nullable;
+
+import org.apache.pekko.actor.ExtendedActorSystem;
+import org.apache.pekko.persistence.journal.EventSeq;
 import org.eclipse.ditto.base.model.signals.events.GlobalEventRegistry;
 import org.eclipse.ditto.base.service.config.DittoServiceConfig;
 import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
-import org.eclipse.ditto.internal.utils.persistence.mongo.AbstractMongoEventAdapter;
-import org.eclipse.ditto.json.JsonFactory;
-import org.eclipse.ditto.json.JsonFieldDefinition;
+import org.eclipse.ditto.internal.utils.persistence.api.serializer.EventSerializer;
 import org.eclipse.ditto.json.JsonObject;
 import org.eclipse.ditto.policies.model.signals.events.PolicyEvent;
 import org.eclipse.ditto.policies.service.common.config.DefaultPolicyConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nullable;
-
-import org.apache.pekko.actor.ExtendedActorSystem;
-import org.apache.pekko.persistence.journal.EventSeq;
-
 /**
- * Abstract base EventAdapter for {@link PolicyEvent}s persisted into pekko-persistence event-journal.
- * Converts Events to MongoDB BSON objects and vice versa.
+ * Backend-neutral journal serializer for {@link PolicyEvent}s. Discards journal rows of removed legacy policy event
+ * types during recovery; the backend event adapters add only the storage envelope.
+ * <p>
+ * This class is the extension point for custom policy journal serialization: subclass it and write a one-line event
+ * adapter naming the subclass.
  */
-public abstract class AbstractPolicyMongoEventAdapter extends AbstractMongoEventAdapter<PolicyEvent<?>> {
+public class PolicyEventSerializer extends EventSerializer<PolicyEvent<?>> {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(AbstractPolicyMongoEventAdapter.class);
-
-    protected static final JsonFieldDefinition<JsonObject> POLICY_ENTRIES =
-            JsonFactory.newJsonObjectFieldDefinition("policy/entries", FieldType.SPECIAL,
-                    JsonSchemaVersion.V_2);
+    private static final Logger LOGGER = LoggerFactory.getLogger(PolicyEventSerializer.class);
 
     /**
      * Event types that existed prior to the policy-import-model simplification (commit 7dd7eb22fa,
@@ -69,7 +62,12 @@ public abstract class AbstractPolicyMongoEventAdapter extends AbstractMongoEvent
             "policies:policyImportEntryAdditionDeleted"
     );
 
-    protected AbstractPolicyMongoEventAdapter(final ExtendedActorSystem system) {
+    /**
+     * Constructs a new {@code PolicyEventSerializer}.
+     *
+     * @param system the actor system whose config provides the policies event config.
+     */
+    public PolicyEventSerializer(final ExtendedActorSystem system) {
         super(system, GlobalEventRegistry.getInstance(), DefaultPolicyConfig.of(
                         DittoServiceConfig.of(DefaultScopedConfig.dittoScoped(system.settings().config()), "policies"))
                 .getEventConfig());
@@ -91,4 +89,5 @@ public abstract class AbstractPolicyMongoEventAdapter extends AbstractMongoEvent
         }
         return super.fromJournalJson(jsonObject, manifest);
     }
+
 }

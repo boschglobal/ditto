@@ -17,7 +17,7 @@ import org.eclipse.ditto.base.model.signals.events.Event;
 import org.eclipse.ditto.base.model.signals.events.GlobalEventRegistry;
 import org.eclipse.ditto.base.service.config.DittoServiceConfig;
 import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
-import org.eclipse.ditto.internal.utils.persistence.serializer.AbstractPostgresEventAdapter;
+import org.eclipse.ditto.internal.utils.persistence.api.serializer.EventSerializer;
 import org.eclipse.ditto.json.JsonObject;
 import org.eclipse.ditto.json.JsonObjectBuilder;
 import org.eclipse.ditto.json.JsonPointer;
@@ -27,11 +27,10 @@ import org.eclipse.ditto.things.model.signals.events.ThingMerged;
 import org.eclipse.ditto.things.service.common.config.DefaultThingConfig;
 
 /**
- * PostgreSQL {@code EventAdapter} for {@link Event}s persisted into the pekko-persistence event-journal. The JSONB peer
- * of {@link ThingMongoEventAdapter}: it reuses the identical serializer/migration logic (including stripping the inlined
- * policy from the journal payload) and only differs in the storage envelope (JSONB text instead of BSON).
+ * Backend-neutral journal serializer for {@link ThingEvent}s. Strips the inlined policy from the journal payload; the
+ * backend event adapters add only the storage envelope.
  */
-public final class ThingPostgresEventAdapter extends AbstractPostgresEventAdapter<ThingEvent<?>> {
+public final class ThingEventSerializer extends EventSerializer<ThingEvent<?>> {
 
     private static final JsonPointer POLICY_IN_THING_EVENT_PAYLOAD = ThingEvent.JsonFields.THING.getPointer()
             .append(JsonPointer.of(Policy.INLINED_FIELD_NAME));
@@ -40,7 +39,12 @@ public final class ThingPostgresEventAdapter extends AbstractPostgresEventAdapte
             ThingMerged.JsonFields.JSON_VALUE.getPointer()
                     .append(JsonPointer.of(Policy.INLINED_FIELD_NAME));
 
-    public ThingPostgresEventAdapter(final ExtendedActorSystem system) {
+    /**
+     * Constructs a new {@code ThingEventSerializer}.
+     *
+     * @param system the actor system whose config provides the things event config.
+     */
+    public ThingEventSerializer(final ExtendedActorSystem system) {
         super(system, GlobalEventRegistry.getInstance(), DefaultThingConfig.of(
                 DittoServiceConfig.of(DefaultScopedConfig.dittoScoped(system.settings().config()), "things")
         ).getEventConfig());

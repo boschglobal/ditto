@@ -14,8 +14,11 @@ package org.eclipse.ditto.things.service.persistence.serializer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.List;
+import java.util.Set;
 
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.actor.ExtendedActorSystem;
@@ -25,6 +28,7 @@ import org.bson.BsonValue;
 import org.eclipse.ditto.base.model.entity.metadata.Metadata;
 import org.eclipse.ditto.base.model.entity.metadata.MetadataModelFactory;
 import org.eclipse.ditto.base.model.headers.DittoHeaders;
+import org.eclipse.ditto.internal.utils.persistence.mongo.adapters.WotValidationConfigMongoEventAdapter;
 import org.eclipse.ditto.things.model.devops.FeatureValidationEnforceConfig;
 import org.eclipse.ditto.things.model.devops.FeatureValidationForbidConfig;
 import org.eclipse.ditto.things.model.devops.ThingValidationEnforceConfig;
@@ -44,7 +48,13 @@ import org.junit.Test;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 
+import scala.jdk.javaapi.CollectionConverters;
+
 public class WotValidationConfigMongoEventAdapterTest {
+
+    private static final String GOLDEN_MANIFEST = "wot.validation.config.events:wotValidationConfigCreated";
+    private static final Set<String> GOLDEN_TAGS = Set.of("wot-validation-config");
+    private static final Instant GOLDEN_TIMESTAMP = Instant.parse("2026-11-19T00:00:00Z");
 
     private ExtendedActorSystem actorSystem;
     private WotValidationConfigMongoEventAdapter underTest;
@@ -214,4 +224,42 @@ public class WotValidationConfigMongoEventAdapterTest {
         final WotValidationConfigDeleted deleted = (WotValidationConfigDeleted) eventObj;
         assertThat((Object) deleted.getEntityId()).isEqualTo(configId);
     }
-} 
+
+    /**
+     * Replays the journal document {@code WotValidationConfigMongoEventAdapter} wrote before the serializer split
+     * ({@code golden/journal/wot-validation-config-mongo.json}) and pins the write path to the same document, manifest
+     * and tags.
+     */
+    @Test
+    public void goldenJournalDocumentWrittenBeforeTheSplitReplaysAndIsWrittenUnchanged() throws IOException {
+        final BsonDocument golden =
+                BsonDocument.parse(ThingMongoEventAdapterTest.readFixture("wot-validation-config-mongo.json"));
+        final WotValidationConfigId goldenId = WotValidationConfigId.of("golden:wot");
+        final WotValidationConfig goldenConfig = WotValidationConfig.of(goldenId, true, false,
+                ThingValidationConfig.of(ThingValidationEnforceConfig.of(true, true, true, true, true),
+                        ThingValidationForbidConfig.of(false, true, false, true)),
+                FeatureValidationConfig.of(
+                        FeatureValidationEnforceConfig.of(true, false, true, false, true, false, true),
+                        FeatureValidationForbidConfig.of(false, true, false, true, false, true)),
+                Collections.emptyList(), WotValidationConfigRevision.of(1L), GOLDEN_TIMESTAMP, GOLDEN_TIMESTAMP,
+                false, null);
+        final WotValidationConfigCreated written = WotValidationConfigCreated.of(goldenId, goldenConfig, 1L,
+                GOLDEN_TIMESTAMP, DittoHeaders.newBuilder().correlationId("golden-wot")
+                        .journalTags(Set.of("always-alive", "priority-3")).build(), null);
+        // recovery resets the revision to the default and restores only the persisted historical headers; the
+        // stored "_metadata": null parses to null metadata, not to absent metadata
+        final WotValidationConfigCreated recovered = WotValidationConfigCreated.of(goldenId, goldenConfig, 0L,
+                GOLDEN_TIMESTAMP, DittoHeaders.newBuilder().correlationId("golden-wot").build(),
+                MetadataModelFactory.nullMetadata());
+
+        final List<Object> events =
+                CollectionConverters.asJava(underTest.fromJournal(golden, GOLDEN_MANIFEST).events());
+        assertThat(events).containsExactly(recovered);
+        assertThat(underTest.manifest(written)).isEqualTo(GOLDEN_MANIFEST);
+        final org.apache.pekko.persistence.journal.Tagged tagged =
+                (org.apache.pekko.persistence.journal.Tagged) underTest.toJournal(written);
+        assertThat(CollectionConverters.asJava(tagged.tags())).isEqualTo(GOLDEN_TAGS);
+        assertThat(tagged.payload()).isEqualTo(golden);
+    }
+
+}

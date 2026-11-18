@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 Contributors to the Eclipse Foundation
+ * Copyright (c) 2026 Contributors to the Eclipse Foundation
  *
  * See the NOTICE file(s) distributed with this work for additional
  * information regarding copyright ownership.
@@ -20,17 +20,17 @@ import org.eclipse.ditto.base.model.signals.events.Event;
 import org.eclipse.ditto.base.model.signals.events.GlobalEventRegistry;
 import org.eclipse.ditto.base.service.config.DittoServiceConfig;
 import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
-import org.eclipse.ditto.internal.utils.persistence.mongo.AbstractMongoEventAdapter;
+import org.eclipse.ditto.internal.utils.persistence.api.serializer.EventSerializer;
 import org.eclipse.ditto.json.JsonObject;
 import org.eclipse.ditto.json.JsonObjectBuilder;
 import org.eclipse.ditto.things.model.devops.events.WotValidationConfigEvent;
 import org.eclipse.ditto.things.service.common.config.DefaultThingConfig;
 
 /**
- * EventAdapter for {@link WotValidationConfigEvent}s persisted into pekko-persistence event-journal.
- * Converts Event to MongoDB BSON objects and vice versa.
+ * Backend-neutral journal serializer for {@link WotValidationConfigEvent}s. Derives the journal tags from the event
+ * type; the backend event adapters add only the storage envelope.
  */
-public final class WotValidationConfigMongoEventAdapter extends AbstractMongoEventAdapter<WotValidationConfigEvent<?>> {
+public final class WotValidationConfigEventSerializer extends EventSerializer<WotValidationConfigEvent<?>> {
 
     private static final String JOURNAL_TAG_PREFIX = "wot-validation-config";
     private static final String JOURNAL_TAG_CREATED = JOURNAL_TAG_PREFIX + "-created";
@@ -38,11 +38,11 @@ public final class WotValidationConfigMongoEventAdapter extends AbstractMongoEve
     private static final String JOURNAL_TAG_DELETED = JOURNAL_TAG_PREFIX + "-deleted";
 
     /**
-     * Constructs a new {@code WotValidationConfigMongoEventAdapter}.
+     * Constructs a new {@code WotValidationConfigEventSerializer}.
      *
-     * @param system the actor system in which to load the extension.
+     * @param system the actor system whose config provides the things event config.
      */
-    public WotValidationConfigMongoEventAdapter(final ExtendedActorSystem system) {
+    public WotValidationConfigEventSerializer(final ExtendedActorSystem system) {
         super(system, GlobalEventRegistry.getInstance(), DefaultThingConfig.of(
                 DittoServiceConfig.of(DefaultScopedConfig.dittoScoped(system.settings().config()), "things")
         ).getEventConfig());
@@ -78,4 +78,5 @@ public final class WotValidationConfigMongoEventAdapter extends AbstractMongoEve
         // Currently no custom migration needed for WoT validation config events
         return super.performToJournalMigration(event, jsonObject);
     }
-} 
+
+}

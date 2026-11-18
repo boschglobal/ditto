@@ -29,31 +29,35 @@ import org.eclipse.ditto.connectivity.model.signals.events.ConnectionCreated;
 import org.eclipse.ditto.connectivity.model.signals.events.ConnectionModified;
 import org.eclipse.ditto.connectivity.model.signals.events.ConnectivityEvent;
 import org.eclipse.ditto.connectivity.service.config.DefaultConnectionConfig;
-import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
-import org.eclipse.ditto.internal.utils.persistence.serializer.AbstractPostgresEventAdapter;
 import org.eclipse.ditto.connectivity.service.config.DittoConnectivityConfig;
 import org.eclipse.ditto.connectivity.service.config.FieldsEncryptionConfig;
+import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
+import org.eclipse.ditto.internal.utils.persistence.api.serializer.EventSerializer;
 import org.eclipse.ditto.json.JsonObject;
 import org.eclipse.ditto.json.JsonObjectBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * PostgreSQL {@code EventAdapter} for {@link ConnectivityEvent}s persisted into the pekko-persistence event-journal. The
- * JSONB peer of {@link ConnectivityMongoEventAdapter}: it reuses the identical serializer logic, the same optional
- * field-level encryption/decryption migration and the connection-migration parse strategies, differing only in the
- * storage envelope (JSONB text instead of BSON).
+ * Backend-neutral journal serializer for {@link ConnectivityEvent}s. Encrypts the configured connection fields on
+ * write, decrypts them with the current or the old key on read, and migrates persisted connection JSON through
+ * {@link ConnectionMigrationUtil}; the backend event adapters add only the storage envelope.
  */
-public final class ConnectivityPostgresEventAdapter extends AbstractPostgresEventAdapter<ConnectivityEvent<?>> {
+public final class ConnectivityEventSerializer extends EventSerializer<ConnectivityEvent<?>> {
 
     private final FieldsEncryptionConfig encryptionConfig;
     private final Logger logger;
 
-    public ConnectivityPostgresEventAdapter(final ExtendedActorSystem system) {
+    /**
+     * Constructs a new {@code ConnectivityEventSerializer}.
+     *
+     * @param system the actor system whose config provides the connectivity event and encryption config.
+     */
+    public ConnectivityEventSerializer(final ExtendedActorSystem system) {
         super(system, createEventRegistry(), DefaultConnectionConfig.of(
                         DittoServiceConfig.of(DefaultScopedConfig.dittoScoped(system.settings().config()), "connectivity"))
                 .getEventConfig());
-        logger = LoggerFactory.getLogger(ConnectivityPostgresEventAdapter.class);
+        logger = LoggerFactory.getLogger(ConnectivityEventSerializer.class);
         final DittoConnectivityConfig connectivityConfig = DittoConnectivityConfig.of(
                 DefaultScopedConfig.dittoScoped(system.settings().config()));
         encryptionConfig = connectivityConfig.getConnectionConfig().getFieldsEncryptionConfig();
