@@ -40,8 +40,8 @@ import com.typesafe.config.ConfigUtil;
  * </p>
  * <h3>Config loading — real files, not copies</h3>
  * {@code postgres-search-lint-test.conf} (this module's test resources) is the only test-owned file, and it contains
- * nothing but two {@code include classpath(...)} directives, in the SAME order (later wins) a real
- * {@code search-pg-dev.conf} will use (Phase H):
+ * nothing but two {@code include classpath(...)} directives, in the SAME order (later wins) as a search service
+ * whose fixed-name {@code ditto-search-backend} include resolves to the PostgreSQL search profile:
  * <ol>
  *     <li>{@code include classpath("search")} — the REAL {@code thingsearch/service/src/main/resources/search.conf}
  *     (on this module's test classpath via the {@code ditto-thingsearch-service} test-scope dependency), carrying the
