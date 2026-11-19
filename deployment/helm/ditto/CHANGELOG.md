@@ -15,6 +15,28 @@ sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
 
 ## [Unreleased]
 
+## [4.12.0]
+
+Selects the persistence backend by name: the Ditto images ship both backends, so PostgreSQL needs one value instead of
+staged extension JARs.
+
+### Added
+- New `global.persistenceBackend` (default `mongodb`, alternative `postgresql`). It is rendered as the
+  `DITTO_PERSISTENCE_BACKEND` env var, the first entry of the container `env`, into the policies, things,
+  connectivity and things-search deployments, and selects the image folder `/opt/ditto/backends/<value>/`. The
+  gateway is not changed. A `<service>.extraEnv` entry with the same name overrides it for that service.
+
+### Changed
+- The PostgreSQL backend needs no staging: the images carry both backends in `/opt/ditto/backends/`.
+- A deployment that stages the PostgreSQL JARs into `/opt/ditto/extensions/` (an `extraInitContainers` entry plus a
+  `ditto-extensions` volume) must remove that init container and volume and set
+  `global.persistenceBackend: postgresql`. A deployment that keeps the staging with the default value refuses to
+  boot, because the services find two backends on the classpath (the `mongodb` folder and the staged JARs).
+- The commented `values.yaml` examples of the four services were rewritten: the extension-JAR staging example
+  (init container, `ditto-extensions` volume and mount) is removed.
+- The default search-provider, event-adapter and metrics-builder class names changed. Only deployments that pinned
+  them, for example through `systemProps` or extension confs, are affected.
+
 ## [4.11.0]
 
 Adds the Helm side of the opt-in PostgreSQL persistence and search backends. Everything is off by default: a
