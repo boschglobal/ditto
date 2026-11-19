@@ -19,7 +19,6 @@ import java.util.Set;
 
 import javax.annotation.Nullable;
 
-import org.bson.BsonDocument;
 import org.eclipse.ditto.json.JsonObject;
 import org.eclipse.ditto.policies.api.PolicyTag;
 import org.eclipse.ditto.policies.model.Policy;
@@ -35,8 +34,8 @@ import org.eclipse.ditto.thingsearch.persistence.api.model.ThingWriteModel;
  * Map Thing with Enforcer to Document.
  * <p>
  * The mapping first produces a backend-neutral {@link org.eclipse.ditto.thingsearch.persistence.api.model.SearchIndexDocument}
- * via {@link SearchIndexDocumentFactory} and then encodes it into the Mongo {@link BsonDocument} via
- * {@link SearchIndexDocumentMongoEncoder}. The neutral document is the shared source of truth for all
+ * via {@link SearchIndexDocumentFactory} and then encodes it into the Mongo {@code BsonDocument} via
+ * {@code SearchIndexDocumentMongoEncoder}. The neutral document is the shared source of truth for all
  * persistence backends; the Mongo encoder reproduces the exact historical BSON wire format.
  */
 public final class EnforcedThingMapper {
@@ -95,17 +94,6 @@ public final class EnforcedThingMapper {
                 );
 
         return ThingWriteModel.of(metadata,
-                SearchIndexDocumentFactory.create(thing, policy, metadata, maxArraySize));
-    }
-
-    static BsonDocument toBsonDocument(final JsonObject thing, final Policy policy, final Metadata metadata) {
-        return toBsonDocument(thing, policy, metadata, -1);
-    }
-
-    static BsonDocument toBsonDocument(final JsonObject thing, final Policy policy, final Metadata metadata,
-            final int maxArraySize) {
-
-        return SearchIndexDocumentMongoEncoder.encode(
                 SearchIndexDocumentFactory.create(thing, policy, metadata, maxArraySize));
     }
 
